@@ -1,8 +1,26 @@
 # Python SDK v4
 
+Last verified against official Langfuse Python SDK documentation on 2026-06-18.
+
+## Mental Model
+
 The current Langfuse Python SDK is v4. Import from `langfuse`, not from the legacy `langfuse.decorators` module.
 
 Use the SDK when you are writing Python LLM application code and want Langfuse-specific features such as observations, generations, scores, prompt management, datasets, and experiments.
+
+The SDK is a thin LLM-aware layer over OpenTelemetry:
+
+```text
+your Python code
+  -> Langfuse context managers/decorators/manual observations
+  -> OpenTelemetry spans in the active context
+  -> Langfuse exporter batches spans asynchronously
+  -> Langfuse UI/API receives traces, observations, generations, scores
+```
+
+It solves application-level trace shape: what the workflow did, which model calls happened, what inputs/outputs were safe to record, and how feedback/scores attach later. It does not replace provider SDKs, authorization, redaction policy, general logs, or infrastructure metrics.
+
+Use the SDK when you can edit the Python code. Use [03_otel_ingestion_and_mapping.md](03_otel_ingestion_and_mapping.md) when the service is not Python/JS, when a platform team requires raw OTLP, or when a Collector owns routing.
 
 ## Install
 
@@ -41,6 +59,14 @@ Common environment variables:
 | `LANGFUSE_TIMEOUT` | HTTP timeout in seconds |
 | `LANGFUSE_RELEASE` | Release identifier when not passed in code |
 | `LANGFUSE_TRACING_ENVIRONMENT` | Environment name when not passed in code |
+
+Production setup rules:
+
+- Load keys from secret management, not source code.
+- Use the Langfuse Cloud region or self-hosted URL that matches the project.
+- Keep `LANGFUSE_DEBUG` off outside troubleshooting.
+- Set `LANGFUSE_RELEASE` to the deployed artifact and `LANGFUSE_TRACING_ENVIRONMENT` to `prod`, `staging`, or `dev`.
+- Treat `LANGFUSE_TRACING_ENABLED=false` as a temporary kill switch, not a permanent privacy control.
 
 ## Initialize
 
@@ -149,6 +175,13 @@ def answer_question(question: str, user_id: str, session_id: str) -> str:
 
 For new code, set trace input and output on the root observation. Langfuse keeps legacy trace input/output helpers for migration cases, but root observation input/output is the current default pattern.
 
+Layered explanation:
+
+- Beginner intuition: `with start_as_current_observation(...)` opens a timed block; nested blocks become children.
+- Technical mechanics: the SDK sets the observation as the active OpenTelemetry span, and child SDK/framework/OTel spans inherit the active context.
+- Production implications: wrap the product workflow first, then add retrieval, tool, generation, guardrail, and persistence observations underneath.
+- Common mistakes: starting only a generation span, forgetting root output, or creating spans outside the active context in worker threads without context propagation.
+
 ## Decorator Instrumentation
 
 Use `@observe()` for stable functions where function boundaries match observation boundaries.
@@ -178,6 +211,13 @@ def payment_lookup(account_id: str) -> dict:
     return payment_service.lookup(account_id)
 ```
 
+Layered explanation:
+
+- Beginner intuition: `@observe()` turns a function call into an observation.
+- Technical mechanics: the decorator captures timing and, by default, inputs/outputs unless disabled.
+- Production implications: decorators work best for stable, reusable boundaries like retrievers, tools, guards, and evaluators.
+- Common mistakes: decorating sensitive functions without disabling capture, using decorators on huge low-value helpers, or mixing old `langfuse.decorators` imports with v4 imports.
+
 ## Manual Observations
 
 Manual observations are useful for background tasks or lifecycles that do not fit a `with` block. End them explicitly.
@@ -197,6 +237,40 @@ finally:
 ```
 
 If you need nested children under a manual observation, create them from that observation object so the hierarchy remains correct.
+
+Layered explanation:
+
+- Beginner intuition: manual observations are "start now, end later" spans.
+- Technical mechanics: `start_observation()` creates an observation but does not manage a `with` scope for you.
+- Production implications: use them for batch jobs, queues, and callback-style lifecycles where a context manager is awkward.
+- Common mistakes: forgetting `.end()`, losing parent-child links, or using manual spans where a context manager would be clearer.
+
+## Trace and Observation IDs
+
+Store trace IDs when another system must attach data later: user feedback, human review, async evaluation, support tickets, or incident links.
+
+```python
+from langfuse import get_client
+
+langfuse = get_client()
+
+
+def answer_for_ui(question: str) -> dict:
+    with langfuse.start_as_current_observation(
+        as_type="span",
+        name="chat.answer",
+        input={"question": question},
+    ) as root:
+        trace_id = langfuse.get_current_trace_id()
+        answer = run_chat(question)
+        root.update(output={"answer": answer})
+        return {
+            "answer": answer,
+            "langfuse_trace_id": trace_id,
+        }
+```
+
+Use `get_current_observation_id()` when an evaluator or feedback item should attach to a specific generation, retriever, tool, or guardrail observation. Use `get_trace_url()` in internal logs or incident comments when people need a direct Langfuse link.
 
 ## Cross-Service Attribute Propagation
 
@@ -236,6 +310,15 @@ Rules for baggage:
 - Prefer internal IDs over email addresses, names, or full account data.
 
 For propagated Langfuse attributes, keep values as short strings. Metadata keys should be alphanumeric; use names like `tenantTier` or `retrievalStrategy` instead of keys with spaces or punctuation.
+
+Important mechanics:
+
+- W3C trace context links spans across services.
+- Baggage carries selected Langfuse trace attributes that downstream spans should also set.
+- HTTP propagation requires an instrumented HTTP client/server or explicit header injection/extraction in raw OpenTelemetry code.
+- Baggage is observability context, not an authorization source.
+
+See [03_otel_ingestion_and_mapping.md](03_otel_ingestion_and_mapping.md) for the raw OpenTelemetry version of this pattern and [examples/02_multi_service_agent.md](../examples/02_multi_service_agent.md) for a gateway/agent example.
 
 ## Custom Trace IDs
 
@@ -279,7 +362,69 @@ def validate_answer(answer: str) -> bool:
     return passed
 ```
 
-For active generation observations, use `update_current_generation()` when you need generation-specific fields.
+Use `update_current_generation()` from code that runs inside an active generation and needs generation-specific fields such as usage, cost, model, or completion start time.
+
+## Capture, Redaction, and Filtering
+
+The SDK can capture inputs and outputs, but your application owns the privacy decision. Decide capture policy before rollout:
+
+| Data | Typical policy |
+| --- | --- |
+| User prompt | Capture if allowed; redact secrets and regulated data. |
+| Retrieved document IDs | Capture. |
+| Retrieved document bodies | Usually suppress or capture short approved snippets only. |
+| Tool request/response | Capture IDs/statuses; suppress secrets and high-risk data. |
+| Payment, auth, medical, legal, or credentials data | Disable capture unless governance explicitly allows it. |
+
+Use per-observation capture controls for sensitive functions, and use export-stage masking for data created by third-party instrumentation.
+
+```python
+import re
+from typing import Optional
+
+from langfuse import Langfuse
+from langfuse.types import MaskOtelSpansParams, MaskOtelSpansResult, OtelSpanPatch
+
+email_pattern = re.compile(r"\b[\w.-]+?@[\w.-]+?\.\w+?\b")
+
+
+def mask_otel_spans(*, params: MaskOtelSpansParams) -> Optional[MaskOtelSpansResult]:
+    patches = {}
+    for identifier, span in params.spans.items():
+        replacements = {}
+        for key, value in span.attributes.items():
+            if isinstance(value, str):
+                masked = email_pattern.sub("[EMAIL_REDACTED]", value)
+                if masked != value:
+                    replacements[key] = masked
+        if replacements:
+            patches[identifier] = OtelSpanPatch(set_attributes=replacements)
+    return MaskOtelSpansResult(span_patches=patches)
+
+
+langfuse = Langfuse(mask_otel_spans=mask_otel_spans)
+```
+
+Keep masking fast. It runs during export and can delay flushing if it does heavy work.
+
+By default, the current SDK exports Langfuse SDK spans, GenAI spans, and known LLM instrumentation spans. If you need other spans, use `should_export_span`; if you need only Langfuse-created spans, filter explicitly.
+
+```python
+from langfuse import Langfuse
+from langfuse.span_filter import is_default_export_span
+
+langfuse = Langfuse(
+    should_export_span=lambda span: (
+        is_default_export_span(span)
+        or (
+            span.instrumentation_scope is not None
+            and span.instrumentation_scope.name.startswith("my_llm_framework")
+        )
+    )
+)
+```
+
+Filtering is powerful but dangerous. Dropping a parent span can create orphaned observations, and dropping non-LLM business spans can remove the context that explains a generation.
 
 ## Scores in Application Code
 
@@ -334,6 +479,14 @@ finally:
 
 Use `shutdown()` when the process is ending and you want to close resources after flushing.
 
+Short-lived process checklist:
+
+- Initialize the client once.
+- Run the traced work.
+- Attach any scores.
+- Call `flush()` before exit.
+- Call `shutdown()` when the process is truly ending and the client should close resources.
+
 ## Debugging and Sampling
 
 Enable debug logs only while troubleshooting:
@@ -364,6 +517,36 @@ Disable tracing without removing instrumentation:
 export LANGFUSE_TRACING_ENABLED=false
 ```
 
+Sampling implications:
+
+- Unsampled traces do not send observations or associated scores.
+- Sampling at the SDK is simple, but application-aware retention is better when rare failures matter.
+- If you sample in the Collector, preserve complete traces. Partial traces are hard to debug.
+- Consider separate policies for production burn-in, high-value tenants, errors, and safety failures.
+
+## Production Architecture Patterns
+
+| Pattern | Shape | Notes |
+| --- | --- | --- |
+| Web API | FastAPI/Flask request span -> Langfuse root observation -> retrieval/tool/generation children | Add user/session/release/version early; export metrics separately. |
+| Worker | Queue job -> root observation -> batch item spans -> evaluator scores | Flush before worker shutdown; keep job IDs in metadata, not metric labels. |
+| Serverless | Handler -> root observation -> generation/tool children -> flush | Keep flush time in latency budget; consider immediate export only after testing. |
+| Multi-service | Gateway root -> HTTP trace context/baggage -> downstream child observations | Requires HTTP instrumentation or manual W3C propagation. |
+| Experiment runner | Dataset item -> task trace -> evaluator scores -> dataset run | Use deterministic score IDs and stable run names. |
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| No traces appear | Missing credentials, wrong `LANGFUSE_BASE_URL`, tracing disabled, or process exits before flush | Run `auth_check()`, enable `LANGFUSE_DEBUG`, verify base URL/keys, call `flush()` in scripts. |
+| Only some spans appear | Default span filter drops non-LLM spans | Add `should_export_span` logic or create important business spans with the Langfuse SDK. |
+| Trace tree is broken | Parent span filtered out or context lost across threads/tasks/services | Preserve parent spans; instrument HTTP/threading; propagate W3C context and allowlisted baggage. |
+| Feedback cannot attach | UI response did not store trace ID | Return/store `get_current_trace_id()` with the user-visible message. |
+| Scores duplicated | Evaluator retries without stable score IDs | Use deterministic `score_id`, for example `<trace_id>:<score_name>:<evaluator_version>`. |
+| Sensitive data appears | Capture policy or masking is incomplete | Disable capture on sensitive observations; add export-stage masking; review third-party instrumentation. |
+| Token/cost charts missing | Generation usage was not recorded | Add `usage_details` or use an integration that captures provider usage. |
+| Debug logging is too noisy | `LANGFUSE_DEBUG` left on | Disable it after troubleshooting. |
+
 ## Production Checklist
 
 - Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` from secret management.
@@ -376,3 +559,14 @@ export LANGFUSE_TRACING_ENABLED=false
 - Add user feedback and evaluator results as scores.
 - Flush in short-lived processes.
 - Avoid mixing old SDK v3 patterns with v4 imports in the same codebase.
+- Return or persist trace IDs for later feedback and review.
+- Add redaction/masking tests for representative sensitive inputs.
+- Verify default span filtering keeps the parent spans needed to understand traces.
+- Keep operational metrics and logs in their own telemetry stack.
+
+## Official References
+
+- SDK overview: <https://langfuse.com/docs/observability/sdk/overview>
+- SDK instrumentation: <https://langfuse.com/docs/observability/sdk/instrumentation>
+- SDK advanced features: <https://langfuse.com/docs/observability/sdk/advanced-features>
+- Python SDK reference: <https://python.reference.langfuse.com/langfuse>

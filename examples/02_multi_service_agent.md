@@ -1,5 +1,7 @@
 # Example: Multi-Service Agent
 
+Last checked against the Langfuse guide and official docs on 2026-06-18.
+
 This example shows:
 
 - a gateway service receiving user requests;
@@ -65,6 +67,7 @@ def answer(payload: dict) -> dict:
         name="gateway.answer",
         input={"question": question},
     ) as span:
+        trace_id = langfuse.get_current_trace_id()
         with propagate_attributes(
             trace_name="agent.answer",
             user_id=user_id,
@@ -84,6 +87,7 @@ def answer(payload: dict) -> dict:
             response.raise_for_status()
             result = response.json()
             span.update(output={"answer": result["answer"]})
+            result["langfuse_trace_id"] = trace_id
             return result
 ```
 
@@ -174,10 +178,15 @@ def run_agent(payload: dict) -> dict:
             tool_calls.add(1, {"tool.name": "lookup_account", "status": "ok"})
             tool.update(output=account)
 
+        tool_context = "\n".join(
+            f"[{doc['id']}] {doc['snippet']}" for doc in docs
+        )
         messages = [
             {"role": "system", "content": "Answer using tool results. Cite document IDs."},
-            {"role": "user", "content": question},
-            {"role": "tool", "content": str(docs)},
+            {
+                "role": "user",
+                "content": f"Question: {question}\n\nTool results:\n{tool_context}",
+            },
         ]
 
         start = time.perf_counter()

@@ -1,8 +1,24 @@
 # Production Observability Workflows
 
+Last verified against official Langfuse observability documentation on 2026-06-18.
+
+## Mental Model
+
 Production Langfuse instrumentation should make real incidents and product questions easier to answer.
 
 Good traces are not just pretty trees. They connect user impact, model behavior, cost, quality, and deploy history.
+
+Use Langfuse as the AI workflow layer in a broader observability system:
+
+```text
+user impact / alert / feedback
+  -> metrics identify unhealthy service, route, model, release, or score
+  -> Langfuse traces explain prompt/retrieval/tool/model behavior
+  -> logs provide exact exceptions and audit evidence
+  -> datasets and experiments verify the fix
+```
+
+Langfuse solves "what happened inside the LLM workflow and was it good?" It does not replace metrics for paging, logs for forensic detail, or privacy controls that decide what is allowed to leave the application.
 
 ## What to Capture
 
@@ -20,6 +36,13 @@ Capture enough to debug and evaluate the workflow:
 - scores and user feedback
 
 Do not capture secrets, credentials, payment data, raw medical data, or sensitive documents unless your legal, security, and compliance model explicitly allows it.
+
+Layered capture guidance:
+
+- Beginner intuition: capture the decision trail, not every byte.
+- Technical mechanics: root observations hold workflow input/output; child observations hold step-specific input/output, metadata, status, and timing.
+- Production implications: capture policy affects privacy, retention, dashboard value, and whether traces can be shared in incidents.
+- Common mistakes: recording huge documents in metadata, disabling all capture and losing debuggability, or assuming provider SDK inputs are automatically safe.
 
 ## Trace Design by Workflow
 
@@ -44,6 +67,12 @@ Useful dimensions:
 - `tenant_tier`
 - `conversation_mode`
 
+Tradeoffs:
+
+- Capture conversation memory IDs by default; capture full memory content only with a privacy decision.
+- Add user feedback scores to the trace the user saw, not the next request.
+- Use sessions for multi-turn chat so reviewers can inspect context across traces.
+
 ### RAG
 
 ```text
@@ -67,6 +96,12 @@ Useful retrieval metadata:
 
 Keep retrieved document text out of metadata. Store small snippets only when allowed and useful.
 
+Tradeoffs:
+
+- Document IDs and scores are usually enough for debugging retrieval ranking.
+- Snippets help explain bad answers but increase privacy and retention risk.
+- Empty retrieval rate belongs in metrics; representative empty-retrieval traces belong in Langfuse.
+
 ### Agent
 
 ```text
@@ -88,6 +123,12 @@ Useful agent metadata:
 - stop reason
 - planner version
 - policy version
+
+Tradeoffs:
+
+- Record each meaningful tool call; do not hide the entire loop inside one generation.
+- Use a max-steps value and stop reason so loops and early exits are obvious.
+- Record tool failures as both Langfuse observation errors and low-cardinality OTel metrics.
 
 ## Environments, Releases, and Versions
 
@@ -125,6 +166,16 @@ def run_workflow(user_id: str, session_id: str) -> None:
 
 Keep release and environment values low-cardinality and stable.
 
+Production convention:
+
+| Field | Recommended value | Do not use |
+| --- | --- | --- |
+| Environment | `prod`, `staging`, `dev` | Per-developer names in production dashboards |
+| Release | Git SHA, image tag, build ID | Prompt version or request ID |
+| Version | Prompt/workflow/agent/evaluator version | Git SHA unless it is truly the logical workflow version |
+| Tags | Feature/workflow labels | Quality judgments or user-specific values |
+| Metadata | Low-cardinality segment fields | Secrets, raw docs, unbounded unique keys |
+
 ## Privacy and Data Minimization
 
 Production LLM traces can contain sensitive content. Decide what to capture before broad rollout.
@@ -155,6 +206,16 @@ def get_payment_status(account_id: str) -> dict:
     return billing_api.payment_status(account_id)
 ```
 
+Privacy review questions:
+
+- Which fields can leave the application boundary?
+- Which fields may be stored in a third-party SaaS or self-hosted Langfuse instance?
+- Which identifiers must be hashed or tokenized?
+- How long should production traces and datasets be retained?
+- Can traces be shared through public links, and who can enable that?
+- Which traces can be promoted into reusable datasets?
+- Are masking tests part of CI or staging validation?
+
 ## Sampling Strategy
 
 Sampling is a tradeoff. For LLM systems, the rare traces are often the most valuable.
@@ -170,6 +231,15 @@ Common strategy:
 
 If sampling outside Langfuse with the Collector, make sure complete traces reach Langfuse. Dropping key spans can make agent and RAG workflows hard to debug.
 
+Sampling decision points:
+
+| Goal | Strategy | Risk |
+| --- | --- | --- |
+| Reduce routine volume | Sample successful traces by workflow/model/tenant tier | May miss slow-burn quality regressions. |
+| Protect high-risk visibility | Always keep errors, safety failures, thumbs-down, new-release burn-in | Requires application or Collector logic beyond simple random sampling. |
+| Control cost centrally | Collector tail/head sampling and routing | Incomplete traces if filters are span-level and too aggressive. |
+| Debug a rollout | Temporarily raise sample rate for one release/version | Must remember to return to normal after burn-in. |
+
 ## Operational Triage
 
 When an incident happens, move from metrics to Langfuse traces:
@@ -181,6 +251,15 @@ When an incident happens, move from metrics to Langfuse traces:
 5. Look at scores and feedback distribution.
 6. Turn representative failures into dataset items.
 7. Run an experiment before shipping the fix.
+
+Incident metadata to preserve:
+
+- alert name and time window
+- service, route, model, release, environment
+- affected trace names and score names
+- representative Langfuse trace URLs or trace IDs
+- suspected category: retrieval, prompt, model, tool, guardrail, provider, infrastructure
+- dataset items created from the incident
 
 ## Quality Triage
 
@@ -194,6 +273,17 @@ For a drop in answer quality:
 6. Run experiments across candidate prompts or models.
 7. Promote the change only after offline and online metrics improve.
 
+Quality failure categories:
+
+| Category | Evidence to inspect |
+| --- | --- |
+| Retrieval | Empty results, low scores, wrong corpus/index, stale document IDs |
+| Prompt | Prompt version, missing instructions, overly long context, bad examples |
+| Model | Model name, parameters, provider errors, refusal/drift pattern |
+| Tool | Tool inputs/outputs, exceptions, latency, permissions, stale schema |
+| Guardrail | Policy version, false positive/negative, blocked output |
+| UX/product | User asked unsupported task, missing clarification flow, bad handoff |
+
 ## Cost Triage
 
 For a token or cost spike:
@@ -204,6 +294,14 @@ For a token or cost spike:
 4. Check whether agent max steps or retry logic changed.
 5. Add OpenTelemetry metrics for tokens per request and agent step count if not already present.
 6. Alert on sustained spikes, not one-off large requests.
+
+Cost controls:
+
+- Store prompt/workflow version on every trace.
+- Track input and output tokens by model and workflow.
+- Cap retrieval top-k and agent max steps.
+- Add budget tests for prompts and context builders.
+- Watch model migrations with side-by-side Langfuse dashboards.
 
 ## Multi-Service Production Pattern
 
@@ -217,6 +315,17 @@ For a gateway calling downstream LLM services:
 - OpenTelemetry metrics are exported to the metrics backend for SLO alerts.
 
 The gateway should not need to know every downstream LLM detail. It should only establish request identity and trace continuity.
+
+Responsibilities:
+
+| Component | Owns |
+| --- | --- |
+| Gateway | User/session identity, public route, request validation, trace root, W3C propagation. |
+| Agent/RAG service | Agent loop, retrieval, tool calls, generations, guardrails, LLM-specific scores. |
+| Collector | Redaction, batching, routing, resource attributes, backend-specific exporters. |
+| Metrics backend | SLO alerts, saturation, provider error rate, latency, queue health. |
+| Langfuse | Trace inspection, quality/cost analytics, score workflows, datasets, experiments. |
+| Logs backend | Exceptions, stack traces, audit events, operational details. |
 
 ## What to Put in Langfuse vs Metrics vs Logs
 
@@ -242,3 +351,57 @@ The gateway should not need to know every downstream LLM detail. It should only 
 - Sampling away failure traces.
 - Sending only LLM leaf spans to Langfuse while losing the request context.
 - Treating Langfuse dashboards as the only alerting mechanism.
+
+## Testing and Operational Checks
+
+Before production:
+
+- Run one known chat/RAG/agent request in staging and confirm the trace tree is complete.
+- Confirm user/session/release/version/environment filters work in Langfuse.
+- Verify token usage appears on generations.
+- Submit sample feedback and confirm it attaches to the correct trace.
+- Trigger a representative tool failure and confirm both Langfuse and metrics record it.
+- Run redaction tests against prompts, retrieved docs, tool outputs, headers, and exceptions.
+- Validate Collector config and confirm no root spans are dropped.
+- Confirm short-lived workers call `flush()` before exit.
+
+After production rollout:
+
+- Compare the new release/version to the previous one for quality, latency, cost, and error traces.
+- Review low-score traces daily during burn-in.
+- Promote representative failures into datasets.
+- Revisit sampling and capture policy after traffic volume is known.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Incident alert fires but Langfuse has no useful trace | Workflow not instrumented or traces sampled/dropped | Add root/product spans, preserve failure traces, validate exporter/Collector path. |
+| Quality regression cannot be isolated | Missing release/version/prompt metadata | Add release and workflow/prompt version to all traces; update rollout checklist. |
+| RAG failures are opaque | Retriever output lacks document IDs/scores/index metadata | Record safe retrieval evidence and empty-retrieval metrics. |
+| Agent loops are hard to diagnose | Steps/tools not represented as observations | Record agent, tool, generation, stop reason, max steps, and tool failures. |
+| Privacy issue found in traces | Capture policy too broad or masking failed | Disable capture on sensitive paths, add masking tests, purge/handle affected data per policy. |
+| High-cardinality dashboards are unusable | Request/user-specific values used as names/tags/metric labels | Move variable values to safe metadata/input/output; keep names and labels stable. |
+| Scores do not align with user complaints | Feedback attached to wrong trace or score semantics changed | Store trace ID with UI response; define score configs and evaluator versions. |
+| Datasets do not catch regressions | Dataset has easy/stale examples only | Add production failures, edge cases, and reviewed expected outputs continuously. |
+
+## Production Checklist
+
+- Define trace designs for chat, RAG, agent, guardrail, and evaluator workflows.
+- Decide capture, masking, retention, and access policy before broad rollout.
+- Set environment, release, version, user/session, tags, and metadata consistently.
+- Use Langfuse for LLM trace/quality/cost workflows and a metrics backend for paging.
+- Preserve complete traces for errors, safety failures, negative feedback, and new releases.
+- Record token usage and model parameters on generations.
+- Record retriever IDs/scores/index metadata and tool input/output status.
+- Attach user feedback, guardrail outcomes, and evaluator results as scores.
+- Turn representative production failures into dataset items.
+- Validate staging traces, dashboards, alerts, redaction, and Collector filters before production.
+
+## Official References
+
+- Langfuse concepts: <https://langfuse.com/docs/observability/data-model>
+- SDK instrumentation: <https://langfuse.com/docs/observability/sdk/instrumentation>
+- SDK advanced features: <https://langfuse.com/docs/observability/sdk/advanced-features>
+- OpenTelemetry ingestion: <https://langfuse.com/integrations/native/opentelemetry>
+- Metrics overview: <https://langfuse.com/docs/metrics/overview>

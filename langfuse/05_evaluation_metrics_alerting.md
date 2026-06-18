@@ -1,5 +1,9 @@
 # Evaluation, Metrics, and Alerting
 
+Last verified against official Langfuse evaluation and metrics documentation on 2026-06-18.
+
+## Mental Model
+
 Langfuse turns traces into AI engineering feedback loops. The loop is:
 
 1. Observe production behavior.
@@ -8,6 +12,19 @@ Langfuse turns traces into AI engineering feedback loops. The loop is:
 4. Run experiments against candidate changes.
 5. Promote the best version.
 6. Watch quality, latency, cost, and volume after release.
+
+The mental model is "observe, judge, preserve, compare, release, monitor":
+
+```text
+production trace
+  -> score from user, code, human, or judge
+  -> representative trace becomes dataset item
+  -> experiment compares candidate versions
+  -> release gate decides whether to ship
+  -> Langfuse metrics and external alerts watch production
+```
+
+Langfuse evaluation solves quality measurement and iteration for LLM workflows. It does not make judges automatically correct, replace human review for high-stakes domains, or provide continuous paging by itself. Use external metrics/incident systems for operational alerts and use Langfuse as the quality and trace investigation system.
 
 ## Scores
 
@@ -58,6 +75,13 @@ Use deterministic score IDs for idempotency. A good pattern is:
 <trace_id>:<score_name>:<evaluator_version>
 ```
 
+Layered explanation:
+
+- Beginner intuition: a score is a judgment attached to a trace, observation, session, or dataset run.
+- Technical mechanics: a score has a name, value, data type, optional comment, optional metadata, and an attachment target.
+- Production implications: score names and rubrics become dashboard and release-gate contracts.
+- Common mistakes: changing score semantics without versioning, duplicating scores on retries, and mixing feedback, labels, and measurements under one name.
+
 ## Choosing Score Types
 
 | Need | Score type | Example |
@@ -67,7 +91,17 @@ Use deterministic score IDs for idempotency. A good pattern is:
 | Discrete label | `CATEGORICAL` | `"correct"`, `"partial"`, `"incorrect"` |
 | Reviewer note | `TEXT` | `"cites stale source"` |
 
-Use `BOOLEAN` values as `0` or `1`.
+Use `BOOLEAN` values as `0` or `1`. Use `TEXT` for qualitative notes, not aggregate metrics; free-form text is not useful for score analytics or experiment comparisons in the same way numeric, boolean, and categorical scores are.
+
+Decision points:
+
+| Need | Use | Avoid |
+| --- | --- | --- |
+| Aggregate a trend | `NUMERIC` or `BOOLEAN` | `TEXT` |
+| Enforce a rubric | Score config | Ad hoc value names |
+| Explain a score | `comment` or score metadata | New score names for every explanation |
+| Classify failure cause | `CATEGORICAL` score | Tags added after the fact |
+| Capture open-ended review | `TEXT` score | Cramming prose into categorical values |
 
 ## Score Configs
 
@@ -92,6 +126,13 @@ Practical score config examples:
 | `failure_category` | `CATEGORICAL` | `"retrieval"`, `"prompt"`, `"tool"`, `"policy"`, `"provider"` |
 | `review_notes` | `TEXT` | free-form reviewer comment |
 
+Layered explanation:
+
+- Beginner intuition: score configs are rubrics with guardrails.
+- Technical mechanics: configs define data type and constraints; they are required for annotation workflows and optional for SDK/API scoring.
+- Production implications: configs prevent dashboards from comparing incompatible values.
+- Common mistakes: creating a config after scores already diverged, archiving without documenting migration, and using one generic `quality` score for unrelated workflows.
+
 ## User Feedback
 
 User feedback should land on the trace the user actually saw.
@@ -114,6 +155,20 @@ def submit_feedback(trace_id: str, thumbs_up: bool, comment: str | None = None) 
 
 Store the Langfuse trace ID with the response payload or conversation message so the feedback endpoint can attach the score later.
 
+Feedback lifecycle:
+
+1. Root trace starts while generating the answer.
+2. Application returns the answer and stores/returns `langfuse_trace_id`.
+3. User submits thumbs up/down, rating, or comment later.
+4. Feedback endpoint creates a score on that exact trace.
+5. Low feedback traces feed annotation queues, dashboards, and datasets.
+
+Common mistakes:
+
+- Attaching feedback to the current request instead of the original answer trace.
+- Storing raw user email as score metadata.
+- Treating one negative answer as a page instead of alerting on sustained trends.
+
 ## Code Evaluators
 
 Use deterministic code for checks that do not require judgment:
@@ -126,6 +181,8 @@ Use deterministic code for checks that do not require judgment:
 - grounded citation IDs exist in retrieved documents
 
 ```python
+import json
+
 from langfuse import get_client
 
 langfuse = get_client()
@@ -149,6 +206,13 @@ def score_json_validity(trace_id: str, output: str) -> None:
         comment=comment,
     )
 ```
+
+Layered explanation:
+
+- Beginner intuition: code evaluators are reliable checks for rules a program can verify.
+- Technical mechanics: they run in your app, worker, Langfuse evaluator, or experiment process and create scores.
+- Production implications: use them for CI gates, safety checks, schema checks, citation checks, and regression tests.
+- Common mistakes: using an LLM judge for deterministic checks, not versioning evaluator logic, and failing to make evaluator retries idempotent.
 
 ## LLM-as-Judge
 
@@ -203,6 +267,15 @@ Production targeting guidance:
 
 Observation-level evaluators are usually faster and cheaper for production monitoring because they avoid judging entire traces when only one operation matters.
 
+Judge quality controls:
+
+- Keep a human-reviewed calibration set.
+- Track judge prompt version, model, temperature, and rubric in metadata.
+- Measure disagreement with humans and review drift after model changes.
+- Avoid using the same model/prompt family as both answerer and judge when independence matters.
+- Prefer categorical rubrics for failure class and numeric rubrics for quality trend.
+- Budget judge cost separately from production answer cost.
+
 ## Human Annotation
 
 Human review is still the anchor for high-stakes quality work. Use it to calibrate LLM-as-judge prompts, review edge cases, and build gold datasets.
@@ -228,6 +301,13 @@ Recommended workflow:
 6. Promote representative reviewed traces into datasets.
 
 Track inter-rater reliability when more than one reviewer scores the same examples. For categorical labels, compare agreement rates. For numeric scores, track average disagreement and review outliers. Reconcile unclear rubric language before using the scores as a release gate.
+
+Layered explanation:
+
+- Beginner intuition: human annotation is the source of truth for nuanced quality.
+- Technical mechanics: reviewers use annotation queues and score configs to score traces, observations, or sessions.
+- Production implications: human labels calibrate judges, define gold datasets, and make release gates credible.
+- Common mistakes: unclear rubrics, unbalanced samples, no second-review process, and reviewing only failures without common successful cases.
 
 ## Datasets
 
@@ -271,12 +351,19 @@ Dataset best practices:
 - Add newly discovered failure modes continuously.
 - Keep personally identifiable or sensitive data out of reusable datasets unless your governance model explicitly allows it.
 
+Layered explanation:
+
+- Beginner intuition: a dataset is your memory of examples the system must handle.
+- Technical mechanics: dataset items have input, optional expected output, metadata, optional schema validation, and optional source trace/observation links.
+- Production implications: datasets let you compare changes before rollout and reproduce historical failures.
+- Common mistakes: using raw production dumps, leaving expected outputs vague, forgetting source trace IDs, and not versioning the dataset state used for a release decision.
+
 ## Experiments
 
 Use experiments to compare prompt, model, retrieval, or agent changes before production rollout.
 
 ```python
-from langfuse import get_client
+from langfuse import Evaluation, get_client
 
 langfuse = get_client()
 dataset = langfuse.get_dataset("support-rag-regression")
@@ -289,11 +376,11 @@ def task(*, item, **kwargs):
 def evaluator(*, input, output, expected_output, metadata=None):
     cited = set(output.get("citations", []))
     expected = set(expected_output.get("must_cite", []))
-    return {
-        "name": "required_citations_present",
-        "value": 1 if expected.issubset(cited) else 0,
-        "data_type": "BOOLEAN",
-    }
+    return Evaluation(
+        name="required_citations_present",
+        value=1 if expected.issubset(cited) else 0,
+        data_type="BOOLEAN",
+    )
 
 
 result = langfuse.run_experiment(
@@ -334,6 +421,22 @@ Experiment runner capabilities to rely on in production:
 - error isolation so one failed item does not stop the full run;
 - dataset-run comparison in the Langfuse UI for hosted datasets.
 
+Layered explanation:
+
+- Beginner intuition: an experiment is a batch test of a candidate system.
+- Technical mechanics: a task function runs on each dataset item; evaluators return scores; hosted datasets create dataset runs for UI comparison.
+- Production implications: experiments are release-gate evidence, not just notebooks.
+- Common mistakes: evaluating on latest mutable data without recording version context, comparing runs with different datasets, and using average quality only while hiding critical failures.
+
+Experiment design checklist:
+
+- Define the baseline release/version and the candidate release/version.
+- Use the same dataset version or record the dataset state.
+- Include both common traffic and high-risk failures.
+- Use deterministic evaluators where possible and calibrated judges where needed.
+- Track latency, token usage, cost, safety, and quality.
+- Inspect failures manually before promotion.
+
 ## Langfuse Metrics
 
 Langfuse metrics derive from traces and scores. Use them for:
@@ -353,6 +456,13 @@ Common dashboards:
 | Prompt rollout | score distributions by prompt version |
 | RAG health | empty retrieval rate, groundedness, citation validity |
 | Agent health | tool failure rate, step count, loop stops, final answer quality |
+
+Layered explanation:
+
+- Beginner intuition: metrics summarize many traces and scores.
+- Technical mechanics: Langfuse derives quality, cost, latency, and volume dimensions from ingested trace/evaluation data.
+- Production implications: Langfuse metrics are excellent for LLM/product analytics, while infrastructure SLOs still belong in your metrics backend.
+- Common mistakes: using Langfuse as the only alert engine, not exporting quality signals to paging systems when needed, and grouping by high-cardinality metadata.
 
 ## Alerting Philosophy
 
@@ -386,6 +496,7 @@ One production pattern is a scheduled job that queries Langfuse metrics or score
 
 ```python
 from dataclasses import dataclass
+from typing import Protocol
 
 
 @dataclass
@@ -396,7 +507,12 @@ class QualityWindow:
     count: int
 
 
-def publish_quality_metrics(windows: list[QualityWindow]) -> None:
+class MetricsClient(Protocol):
+    def gauge(self, name: str, value: float, tags: dict[str, str]) -> None:
+        ...
+
+
+def publish_quality_metrics(windows: list[QualityWindow], metrics: MetricsClient) -> None:
     for window in windows:
         metrics.gauge(
             "llm_quality_score",
@@ -447,10 +563,22 @@ Gate on:
 Example shape:
 
 ```python
-def assert_release_gate(result) -> None:
-    scores = result.run_evaluations
-    average_relevance = next(s.value for s in scores if s.name == "average_relevance")
-    safety_pass_rate = next(s.value for s in scores if s.name == "safety_pass_rate")
+from dataclasses import dataclass
+
+
+@dataclass
+class GateScore:
+    name: str
+    value: float
+
+
+def score_value(scores: list[GateScore], name: str) -> float:
+    return next(score.value for score in scores if score.name == name)
+
+
+def assert_release_gate(run_scores: list[GateScore]) -> None:
+    average_relevance = score_value(run_scores, "average_relevance")
+    safety_pass_rate = score_value(run_scores, "safety_pass_rate")
 
     if average_relevance < 0.82:
         raise SystemExit("release gate failed: relevance below threshold")
@@ -460,3 +588,38 @@ def assert_release_gate(result) -> None:
 ```
 
 CI gates should be conservative and stable. Use them to block obvious regressions, then use production Langfuse dashboards and alerts to monitor the long tail.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| User feedback is missing from traces | Response did not persist the Langfuse trace ID | Store `get_current_trace_id()` with the message and use `create_score()` later. |
+| Scores are duplicated after retries | No idempotent score ID | Use deterministic IDs such as `<trace_id>:<score_name>:<evaluator_version>`. |
+| Dashboard averages look meaningless | Mixed score scales or semantics under one name | Define score configs and version evaluator/rubric changes. |
+| LLM judge disagrees with humans | Poor rubric, judge drift, or biased context | Calibrate on human-reviewed data and track disagreement. |
+| Experiment passes but production fails | Dataset misses real traffic segments or hard failures | Add production failures, edge cases, and important tenant workflows to the dataset. |
+| CI gates are flaky | Non-deterministic task, unstable judge, small dataset, or live provider variance | Use deterministic checks where possible, larger representative samples, and tolerance bands. |
+| Alerts are noisy | Alerting on individual bad answers or low sample counts | Require sustained windows and minimum counts. |
+| Quality drop is hard to investigate | Scores not tied to release/version/model/prompt dimensions | Add release/version/model metadata to traces and score metadata. |
+
+## Evaluation Checklist
+
+- Define the quality questions each workflow must answer.
+- Choose score names, data types, constraints, and score configs before broad rollout.
+- Store trace IDs with user-visible outputs so feedback can attach later.
+- Use deterministic code evaluators for schema, citation, safety, and business-rule checks.
+- Calibrate LLM judges against human-reviewed examples and version judge prompts.
+- Build datasets from common paths, high-risk cases, and production failures.
+- Run experiments before prompt, model, retrieval, or agent changes ship.
+- Compare candidates against a stable baseline with quality, safety, latency, token, and cost dimensions.
+- Export compact quality metrics to your alerting stack when sustained quality drops should create incidents.
+- Keep examples, rubrics, and release gates under review as the product changes.
+
+## Official References
+
+- Scores overview: <https://langfuse.com/docs/evaluation/scores/overview>
+- Scores data model: <https://langfuse.com/docs/evaluation/scores/data-model>
+- Score configs FAQ: <https://langfuse.com/faq/all/manage-score-configs>
+- Datasets: <https://langfuse.com/docs/evaluation/experiments/datasets>
+- Experiments via SDK: <https://langfuse.com/docs/evaluation/experiments/experiments-via-sdk>
+- Metrics overview: <https://langfuse.com/docs/metrics/overview>

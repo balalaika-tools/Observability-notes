@@ -1,5 +1,7 @@
 # Example: RAG with OpenTelemetry and Langfuse
 
+Last checked against the Langfuse guide and official docs on 2026-06-18.
+
 This example shows a single Python service that:
 
 - records a RAG trace in Langfuse;
@@ -86,6 +88,7 @@ def answer_question(question: str, *, user_id: str, session_id: str) -> dict:
         name="rag.answer",
         input={"question": question},
     ) as root:
+        trace_id = langfuse.get_current_trace_id()
         with propagate_attributes(
             trace_name="rag.answer",
             user_id=user_id,
@@ -190,6 +193,7 @@ def answer_question(question: str, *, user_id: str, session_id: str) -> dict:
             result = {
                 "answer": answer,
                 "citations_present": bool(citations_present),
+                "langfuse_trace_id": trace_id,
             }
             root.update(output=result)
             return result

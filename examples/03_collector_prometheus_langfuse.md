@@ -1,5 +1,7 @@
 # Example: Collector, Prometheus, Langfuse, and Alerts
 
+Last checked against the Langfuse guide and official docs on 2026-06-18.
+
 This example uses the OpenTelemetry Collector as a production routing layer:
 
 - traces go to a general tracing backend;
@@ -102,6 +104,19 @@ export OTEL_SERVICE_NAME="agent-service"
 export OTEL_RESOURCE_ATTRIBUTES="service.version=${RELEASE},deployment.environment.name=prod"
 export OTEL_EXPORTER_OTLP_ENDPOINT="http://otel-collector:4317"
 export OTEL_EXPORTER_OTLP_PROTOCOL="grpc"
+```
+
+The Collector filter above keeps spans that have GenAI attributes, Langfuse observation attributes, or a workflow marker. Set the marker on the root workflow span when a whole trace should be routed to Langfuse:
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer(__name__)
+
+with tracer.start_as_current_span("rag.answer") as span:
+    span.set_attribute("llm.workflow", True)
+    span.set_attribute("langfuse.trace.name", "rag.answer")
+    run_rag_workflow()
 ```
 
 If a Python service uses the Langfuse SDK directly, it can still export Langfuse traces itself. Choose one path per service to avoid duplicate spans:
@@ -252,4 +267,3 @@ When an alert fires:
 - Avoid routing duplicate traces to Langfuse from both SDK and Collector.
 - Keep metric labels low-cardinality.
 - Validate dashboards and alerts in staging before paging production teams.
-

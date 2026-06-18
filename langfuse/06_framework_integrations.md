@@ -1,8 +1,21 @@
 # Framework Integrations
 
-Last verified against official Langfuse integration docs on 2026-06-17.
+Last verified against official Langfuse integration docs on 2026-06-18.
+
+## Mental Model
 
 Use framework integrations when your application already relies on an LLM framework, model SDK, gateway, or auto-instrumentation layer. Use manual SDK instrumentation when you need exact trace shape and business-specific observations.
+
+Framework integrations are adapters. They listen to events from LangChain, LangGraph, OpenAI SDK, LiteLLM, or OpenTelemetry-native libraries and turn those events into Langfuse observations.
+
+```text
+framework/model gateway event
+  -> Langfuse integration callback/wrapper/OTel span
+  -> Langfuse observation
+  -> optional manual root span adds product context
+```
+
+They solve "capture the internals I already delegated to this framework." They do not know your product workflow, privacy policy, release strategy, feedback model, or which business decisions deserve spans. In production, the best pattern is often a manual root observation plus integration-generated children.
 
 ## Integration Decision Table
 
@@ -14,6 +27,14 @@ Use framework integrations when your application already relies on an LLM framew
 | LiteLLM SDK | Langfuse LiteLLM SDK integration or OpenAI-compatible wrapper path |
 | Existing OpenTelemetry instrumentation | OTLP/HTTP to Langfuse, preferably through the Collector |
 | Mixed custom code plus framework calls | Wrap the workflow with Langfuse SDK spans and pass the integration callback inside the active context |
+
+Decision points:
+
+- Prefer the integration closest to the model call when you mainly need provider prompt/output/usage/cost.
+- Prefer manual SDK spans when you need business-specific workflow shape, capture policy, scores, or product metadata.
+- Prefer gateway instrumentation when many services share one model gateway and application changes are expensive.
+- Prefer raw OTel when platform teams need runtime-neutral routing and Collector controls.
+- Avoid double-instrumenting the same model call unless you intentionally want both views and know how to de-duplicate analysis.
 
 ## LangChain and LangGraph
 
@@ -52,6 +73,21 @@ agent.invoke(
     config={"callbacks": [langfuse_handler]},
 )
 ```
+
+Lifecycle:
+
+1. Application creates or receives a LangChain/LangGraph run.
+2. `CallbackHandler` listens to framework events.
+3. The callback creates observations for chains, retrievers, tools, and LLM calls.
+4. If an active Langfuse root observation exists, callback observations nest under it.
+5. `propagate_attributes()` or invocation metadata adds trace-level user/session/tags.
+
+Layered explanation:
+
+- Beginner intuition: the callback traces what LangChain does for you.
+- Technical mechanics: LangChain invokes callbacks around chain, model, retriever, tool, and graph events.
+- Production implications: create a product-level root span when one user request contains custom app logic plus framework calls.
+- Common mistakes: passing a handler without user/session/version context, reusing handler state unsafely in concurrent flows, and relying on deprecated trace I/O helpers in new code.
 
 ### Nest Framework Calls in a Product Trace
 
@@ -178,6 +214,21 @@ get_client().flush()
 
 The OpenAI wrapper is best for client-side OpenAI SDK calls. Langfuse notes that tracing the OpenAI Assistants API is not supported by this integration because Assistants have server-side state that cannot be captured completely without additional API requests. For agentic systems, prefer explicit agent/tool/generation observations or a framework integration that exposes the workflow steps.
 
+Lifecycle:
+
+1. Replace OpenAI imports with the Langfuse OpenAI wrapper.
+2. Calls to supported stable OpenAI SDK APIs create Langfuse generation observations.
+3. Metadata and active Langfuse context attach calls to the right trace/session/user.
+4. Streaming calls can capture usage when the provider returns usage data, such as final chunks with included usage.
+5. Scripts and serverless functions flush before exit.
+
+Layered explanation:
+
+- Beginner intuition: use the OpenAI client as usual, but calls appear in Langfuse.
+- Technical mechanics: the wrapper intercepts supported OpenAI SDK calls and records generation fields.
+- Production implications: wrappers are fast to adopt, but they only see model calls; add manual spans for retrieval, policy, routing, and persistence.
+- Common mistakes: forgetting to handle empty streaming chunks that carry usage, assuming beta APIs are fully supported, and using the wrapper plus manual generation spans for the same call.
+
 ## LiteLLM Proxy
 
 LiteLLM Proxy can log all model calls through a central gateway to Langfuse using the `langfuse_otel` callback.
@@ -216,6 +267,21 @@ Use this path when:
 
 If the application already uses the Langfuse SDK or OpenTelemetry exporter directly, avoid double-instrumenting the same model call through both the app and the proxy unless you intentionally want both views.
 
+Lifecycle:
+
+1. Application calls the LiteLLM Proxy instead of providers directly.
+2. Proxy routes/authenticates/load-balances provider requests.
+3. LiteLLM callback emits Langfuse OTEL data for model calls.
+4. Application should still pass trace attributes such as user, session, tags, and workflow where supported.
+5. Langfuse shows provider-level generations; application spans still explain business workflow if instrumented.
+
+Layered explanation:
+
+- Beginner intuition: the gateway records all model traffic in one place.
+- Technical mechanics: LiteLLM emits OpenTelemetry/Langfuse-compatible callback data from the proxy.
+- Production implications: this is strong for centralized model observability, weaker for business context unless applications pass attributes.
+- Common mistakes: losing user/session context at the gateway, duplicating traces with SDK instrumentation, and treating gateway traces as a substitute for RAG/tool/agent spans.
+
 ## OpenTelemetry-Native Libraries
 
 For OpenTelemetry-native or third-party auto-instrumentation libraries:
@@ -228,6 +294,13 @@ For OpenTelemetry-native or third-party auto-instrumentation libraries:
 See [03_otel_ingestion_and_mapping.md](03_otel_ingestion_and_mapping.md) and [../opentelemetry/06_genai_and_llm_observability.md](../opentelemetry/06_genai_and_llm_observability.md).
 
 Legacy notes in this repo previously included OpenLLMetry and OpenLIT examples. Treat these as OpenTelemetry-native instrumentation choices: if they emit current OTel spans, route them to Langfuse via OTLP/HTTP and add Langfuse attributes where needed. Use the current project documentation for those packages before copying setup code, because auto-instrumentation package APIs change faster than the OTLP and Langfuse mapping layer.
+
+Layered explanation:
+
+- Beginner intuition: if a library emits OTel GenAI spans, Langfuse can often ingest them.
+- Technical mechanics: Langfuse maps GenAI and `langfuse.*` span attributes into its data model.
+- Production implications: standard OTel gives portability, but Langfuse-specific attributes are still needed for first-class filtering, sessions, versions, and metadata.
+- Common mistakes: assuming all third-party spans are mapped perfectly, not preserving root spans through Collector filters, and missing provider/model/usage attributes.
 
 ## Mixing Auto and Manual Instrumentation
 
@@ -249,3 +322,46 @@ Rules:
 - Add manual spans for business decisions the framework cannot know about.
 - Score the trace or important observations after the framework run finishes.
 - Do not use deprecated trace input/output helpers for new code; set input/output on the root observation.
+
+## Architecture Patterns
+
+| Pattern | Use when | Trace shape |
+| --- | --- | --- |
+| Manual root + LangChain callback | Product workflow includes custom preprocessing, retrieval, and LangChain execution | `support.answer` root with callback-created chain/tool/generation children. |
+| Manual root + OpenAI wrapper | You call OpenAI directly but need product context | Root span for request plus wrapper-created generation children. |
+| LiteLLM-only | You mainly need central model call logs across many apps | Proxy generations with app-provided user/session/tags where possible. |
+| LiteLLM + app spans | You need both central provider observability and business workflow traces | App root/tool/retriever spans plus gateway model spans; watch for duplication. |
+| Raw OTel integration | Existing library emits GenAI spans or app is non-Python/JS | OTel spans routed through Collector with Langfuse mapping attributes. |
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| LangChain run appears without user/session | No trace attributes passed or propagated | Wrap the run in SDK context and call `propagate_attributes()`, or pass supported metadata fields. |
+| Framework spans are not nested under product trace | Callback invoked outside active Langfuse/OTel context | Create the root observation around the framework call and instantiate/use the handler inside that flow. |
+| Duplicate generations | Same model call captured by wrapper, manual generation span, and/or gateway | Pick one primary capture path per model call or document how to reconcile both. |
+| OpenAI streaming usage missing | Usage not requested/handled for stream, or final empty choices chunk mishandled | Request usage where provider supports it and handle chunks with empty `choices`. |
+| Azure/OpenAI model names look wrong | Deployment name recorded without model name | Pass model metadata where the provider/framework supports it. |
+| LiteLLM traces lack product workflow | Gateway sees provider request but not application steps | Add manual app spans and pass user/session/tags through gateway metadata. |
+| OTel-native library spans are absent | SDK default filtering or Collector filter drops them | Add/extend `should_export_span` or Collector routing and preserve parent spans. |
+| Sensitive data captured by integration | Wrapper/callback captured provider inputs/outputs | Disable capture where supported, add SDK masking, or redact before model calls. |
+
+## Integration Checklist
+
+- Choose one primary capture path per model call.
+- Add a manual product-level root span when framework traces alone do not explain the workflow.
+- Propagate user, session, tags, release, version, environment, and safe metadata.
+- Confirm trace trees are nested correctly in staging.
+- Verify token usage, model names, streaming behavior, and errors are captured.
+- Add manual spans for business decisions the framework cannot know: routing, retrieval policy, guardrails, persistence, fallbacks.
+- Attach scores after the framework run or from async feedback/evaluator workers.
+- Test privacy controls against wrapper/callback-captured payloads.
+- Flush or shut down clients/handlers in scripts, workers, and serverless environments.
+
+## Official References
+
+- Langfuse integrations index: <https://langfuse.com/integrations>
+- LangChain and LangGraph integration: <https://langfuse.com/integrations/frameworks/langchain>
+- OpenAI Python integration: <https://langfuse.com/integrations/model-providers/openai-py>
+- LiteLLM Proxy integration: <https://langfuse.com/integrations/gateways/litellm>
+- OpenTelemetry integration: <https://langfuse.com/integrations/native/opentelemetry>
