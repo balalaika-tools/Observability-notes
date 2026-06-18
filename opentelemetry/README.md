@@ -8,7 +8,7 @@ This section is a beginner-to-production guide. It starts with the mental model,
 
 | File | Purpose |
 | --- | --- |
-| [01_concepts.md](01_concepts.md) | What OpenTelemetry is, why it matters, and the core vocabulary. |
+| [01_concepts.md](01_concepts.md) | The full OTel mental model: signals, context, SDKs, exporters, Collector pipelines, backends, and common pitfalls. |
 | [02_python_instrumentation.md](02_python_instrumentation.md) | Practical Python setup for traces, metrics, logs, exporters, and auto-instrumentation. |
 | [03_production_architecture.md](03_production_architecture.md) | Collector topologies, deployment patterns, sampling, security, and operations. |
 | [04_multi_service_examples.md](04_multi_service_examples.md) | Gateway-to-service tracing, W3C Trace Context, baggage, and signal correlation. |
@@ -47,17 +47,30 @@ OpenTelemetry Collector
 
 ## Official References Used
 
-This guide was checked on June 16, 2026 against:
+This guide was checked on June 18, 2026 against:
 
 - [OpenTelemetry overview](https://opentelemetry.io/docs/what-is-opentelemetry/)
+- [OpenTelemetry components](https://opentelemetry.io/docs/concepts/components/)
 - [OpenTelemetry traces](https://opentelemetry.io/docs/concepts/signals/traces/)
 - [OpenTelemetry metrics](https://opentelemetry.io/docs/concepts/signals/metrics/)
 - [OpenTelemetry logs](https://opentelemetry.io/docs/concepts/signals/logs/)
 - [OpenTelemetry context propagation](https://opentelemetry.io/docs/concepts/context-propagation/)
 - [OpenTelemetry baggage](https://opentelemetry.io/docs/concepts/signals/baggage/)
+- [OpenTelemetry resources](https://opentelemetry.io/docs/concepts/resources/)
+- [OpenTelemetry instrumentation scope](https://opentelemetry.io/docs/concepts/instrumentation-scope/)
+- [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/concepts/semantic-conventions/)
 - [OpenTelemetry Python instrumentation](https://opentelemetry.io/docs/languages/python/instrumentation/)
 - [OpenTelemetry Python exporters](https://opentelemetry.io/docs/languages/python/exporters/)
+- [OpenTelemetry Python propagation](https://opentelemetry.io/docs/languages/python/propagation/)
+- [OpenTelemetry zero-code Python instrumentation](https://opentelemetry.io/docs/zero-code/python/)
 - [OpenTelemetry Collector configuration](https://opentelemetry.io/docs/collector/configuration/)
+- [OpenTelemetry Collector deployment](https://opentelemetry.io/docs/collector/deploy/)
+- [OpenTelemetry Collector scaling](https://opentelemetry.io/docs/collector/scaling/)
+- [OpenTelemetry Collector internal telemetry](https://opentelemetry.io/docs/collector/internal-telemetry/)
+- [OpenTelemetry security configuration best practices](https://opentelemetry.io/docs/security/config-best-practices/)
 - [OpenTelemetry sampling](https://opentelemetry.io/docs/concepts/sampling/)
 - [OpenTelemetry GenAI semantic conventions repository](https://github.com/open-telemetry/semantic-conventions-genai)
-
+- [OpenTelemetry GenAI spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md)
+- [OpenTelemetry GenAI metrics](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-metrics.md)
+- [OpenTelemetry GenAI agent spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md)
+- [Langfuse OpenTelemetry integration](https://langfuse.com/integrations/native/opentelemetry)

@@ -1,42 +1,104 @@
 # Multi-Service Examples
 
-This page shows practical propagation patterns for a gateway service calling internal services. The examples use Python and HTTP, but the same concepts apply to queues and gRPC.
+Distributed tracing only becomes useful when spans from different processes are
+connected. This chapter shows how that connection works in practice for Python
+services, HTTP calls, queues, baggage, logs, and metrics.
 
-## Architecture
+The core mechanism is context propagation:
+
+```text
+service A has active span
+  -> inject trace context into outbound carrier
+  -> service B extracts context from inbound carrier
+  -> service B starts a span with service A as remote parent
+```
+
+For HTTP, the carrier is usually request headers. For queues, it is usually
+message metadata. For gRPC, it is metadata. For custom transports, you choose a
+place to carry the context.
+
+## Target Architecture
+
+Example application:
 
 ```text
 client
   |
   v
 gateway service
-  |-- sets user/session baggage
-  |-- starts root server span
+  |-- receives POST /chat
+  |-- starts gateway server span
+  |-- attaches safe baggage
   |-- calls retrieval service
   |-- calls agent service
        |
        v
 retrieval service
 agent service
-  |-- extracts trace context
-  |-- copies allowlisted baggage to span attributes
-  |-- emits logs and metrics with the same context
+  |-- extract trace context
+  |-- create child server spans
+  |-- add manual business spans
+  |-- copy allowlisted baggage into attributes
+  |-- emit correlated logs and metrics
 ```
 
-The goal is one trace across all services:
+The desired trace:
 
 ```text
-gateway /chat
-  http POST retrieval /search
-    retrieval.search
-  http POST agent /run
-    agent.plan
-    gen_ai.chat
-    agent.tool.execute
+POST /chat                         gateway SERVER span
+  gateway.chat                     gateway INTERNAL span
+    POST retrieval /search         gateway CLIENT span
+      POST /search                 retrieval SERVER span
+        retrieval.search           retrieval INTERNAL span
+        vector_db.query            retrieval CLIENT span
+    POST agent /run                gateway CLIENT span
+      POST /run                    agent SERVER span
+        agent.invoke               agent INTERNAL span
+          agent.plan               agent INTERNAL span
+          chat gpt-4o-mini         model CLIENT span
+          execute_tool search_docs tool INTERNAL span
 ```
+
+The point is not the exact span names. The point is one `trace_id`, clear
+service boundaries, and enough business spans to explain the request.
+
+## Context vs Baggage
+
+Trace context and baggage travel together, but they mean different things.
+
+| Mechanism | Carries | Used for |
+| --- | --- | --- |
+| Trace context | `trace_id`, parent span ID, sampled flag, vendor trace state | Connecting spans into one trace. |
+| Baggage | Small key-value request facts | Making selected context available downstream. |
+
+Trace context is required for distributed tracing. Baggage is optional.
+
+Good baggage:
+
+- tenant tier;
+- experiment variant;
+- opaque session ID;
+- request class;
+- region;
+- plan name from a small enum.
+
+Bad baggage:
+
+- email address;
+- access token;
+- API key;
+- raw prompt;
+- retrieved document text;
+- full request body;
+- anything that should not be sent to an external downstream service.
+
+Baggage does not automatically become span attributes. You must explicitly copy
+allowlisted baggage keys into spans, metrics, or logs.
 
 ## Shared Baggage Span Processor
 
-Baggage travels across services, but it does not automatically become span attributes. Add a small span processor to copy allowlisted baggage keys onto each span.
+A span processor can copy allowlisted baggage values onto spans as they start.
+Register this in each service that wants those values to appear in traces.
 
 ```python
 # baggage_span_processor.py
@@ -50,10 +112,10 @@ class AllowlistedBaggageSpanProcessor(SpanProcessor):
     """Copy selected baggage values into span attributes at span start."""
 
     BAGGAGE_KEYS = {
-        "app.user.id",
         "app.session.id",
         "app.tenant.tier",
         "app.experiment.variant",
+        "app.request.class",
     }
 
     def on_start(self, span, parent_context=None) -> None:
@@ -82,9 +144,16 @@ provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
 trace.set_tracer_provider(provider)
 ```
 
-Use an application namespace (`app.*`) for business context. Use `langfuse.*` keys only when you are explicitly targeting Langfuse trace fields.
+Do not copy every baggage key. Treat baggage from external callers as untrusted.
+Use an application namespace such as `app.*`. Use `langfuse.*` only when you
+are intentionally setting Langfuse trace or observation fields.
 
-## Gateway: Set Baggage And Inject Headers
+## Gateway With Manual Propagation
+
+This example shows manual injection so the mechanics are visible. If FastAPI and
+HTTPX instrumentations are active, they usually create server/client spans and
+inject/extract automatically. Do not add manual propagation everywhere unless
+you need explicit control.
 
 ```python
 import httpx
@@ -99,12 +168,14 @@ tracer = trace.get_tracer(__name__)
 @app.post("/chat")
 async def chat(request: Request) -> dict:
     body = await request.json()
-    user_id = request.headers.get("x-user-id", "anonymous")
     session_id = body["session_id"]
+    tenant_tier = body.get("tenant_tier", "free")
+    experiment = body.get("experiment_variant", "control")
 
-    ctx = baggage.set_baggage("app.user.id", user_id)
-    ctx = baggage.set_baggage("app.session.id", session_id, context=ctx)
-    ctx = baggage.set_baggage("app.tenant.tier", body.get("tier", "free"), context=ctx)
+    ctx = baggage.set_baggage("app.session.id", session_id)
+    ctx = baggage.set_baggage("app.tenant.tier", tenant_tier, context=ctx)
+    ctx = baggage.set_baggage("app.experiment.variant", experiment, context=ctx)
+    ctx = baggage.set_baggage("app.request.class", "interactive", context=ctx)
 
     token = context.attach(ctx)
     try:
@@ -114,6 +185,7 @@ async def chat(request: Request) -> dict:
 
             retrieval_headers: dict[str, str] = {}
             inject(retrieval_headers)
+
             async with httpx.AsyncClient(timeout=10) as client:
                 retrieval_response = await client.post(
                     "http://retrieval:8080/search",
@@ -125,6 +197,7 @@ async def chat(request: Request) -> dict:
 
             agent_headers: dict[str, str] = {}
             inject(agent_headers)
+
             async with httpx.AsyncClient(timeout=30) as client:
                 agent_response = await client.post(
                     "http://agent:8080/run",
@@ -140,9 +213,17 @@ async def chat(request: Request) -> dict:
         context.detach(token)
 ```
 
-Auto-instrumentation for FastAPI and HTTPX can inject/extract automatically. Manual `inject()` is useful when you need explicit control or are using a transport that is not instrumented.
+Important details:
 
-## Downstream Service: Extract Headers
+- Baggage is attached to the current context before child spans and outbound calls.
+- `inject(headers)` serializes trace context and baggage into HTTP headers.
+- The request body does not carry tracing metadata.
+- `context.detach(token)` prevents baggage from leaking into unrelated requests.
+- Baggage values are safe categories or opaque IDs, not raw user content.
+
+## Downstream Service With Manual Extraction
+
+Manual extraction:
 
 ```python
 from fastapi import FastAPI, Request
@@ -155,23 +236,97 @@ tracer = trace.get_tracer(__name__)
 
 @app.post("/search")
 async def search(request: Request) -> dict:
-    ctx = extract(dict(request.headers))
+    parent_ctx = extract(dict(request.headers))
     body = await request.json()
 
-    with tracer.start_as_current_span("retrieval.search", context=ctx) as span:
+    with tracer.start_as_current_span("retrieval.search", context=parent_ctx) as span:
         span.set_attribute("http.route", "/search")
         span.set_attribute("rag.top_k", body["top_k"])
+        span.set_attribute("rag.retrieval.strategy", "hybrid")
 
         documents = vector_store.search(body["query"], top_k=body["top_k"])
         span.set_attribute("rag.retrieved_documents", len(documents))
         return {"documents": documents}
 ```
 
-If the FastAPI instrumentation is active, extraction and server-span creation are usually automatic. You still add manual spans for business steps.
+If FastAPI instrumentation is active, inbound extraction and the HTTP server
+span are usually automatic. In that case, prefer this shape:
+
+```python
+@app.post("/search")
+async def search(request: Request) -> dict:
+    body = await request.json()
+
+    with tracer.start_as_current_span("retrieval.search") as span:
+        span.set_attribute("rag.top_k", body["top_k"])
+        documents = vector_store.search(body["query"], top_k=body["top_k"])
+        span.set_attribute("rag.retrieved_documents", len(documents))
+        return {"documents": documents}
+```
+
+Avoid creating a manual server span if the framework instrumentation already
+created one. Add internal business spans under the active server span instead.
+
+## Automatic Propagation
+
+With FastAPI and HTTPX instrumentation enabled:
+
+```text
+incoming request
+  -> FastAPI instrumentation extracts traceparent and baggage
+  -> FastAPI creates SERVER span
+  -> your handler runs with that span active
+  -> HTTPX instrumentation creates CLIENT span
+  -> HTTPX injects traceparent and baggage into outbound headers
+```
+
+Your application code only adds business spans and attributes:
+
+```python
+with tracer.start_as_current_span("prompt.build") as span:
+    span.set_attribute("rag.retrieved_documents", len(docs))
+    prompt = render_prompt(message=message, docs=docs)
+```
+
+This is the usual production shape. Manual `inject()` and `extract()` are for
+custom transports, queues, or tests.
+
+## What Headers Look Like
+
+For HTTP, W3C Trace Context uses `traceparent`:
+
+```text
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+```
+
+Parts:
+
+```text
+version: 00
+trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+span_id: 00f067aa0ba902b7
+trace_flags: 01
+```
+
+`tracestate` carries vendor-specific trace state:
+
+```text
+tracestate: vendor1=value1,vendor2=value2
+```
+
+`baggage` carries request context:
+
+```text
+baggage: app.tenant.tier=enterprise,app.experiment.variant=reranker_b
+```
+
+Do not log full inbound headers unless you redact first. Headers may contain
+credentials and baggage.
 
 ## Correlate Traces, Logs, And Metrics
 
-Inside any service, the active trace context can be used by logs and metrics.
+Inside any service, traces, metrics, and logs should share enough context to
+move between them during incidents.
 
 ```python
 import logging
@@ -197,19 +352,28 @@ def rerank(query: str, documents: list[dict]) -> list[dict]:
         span.set_attribute("rag.returned_documents", len(ranked))
         retrieval_results.record(len(ranked), attrs)
 
-        logger.info("reranked documents", extra={"returned_documents": len(ranked)})
+        logger.info(
+            "reranked documents",
+            extra={
+                "candidate_documents": len(documents),
+                "returned_documents": len(ranked),
+            },
+        )
         return ranked
 ```
 
-This gives you:
+This gives:
 
 - trace detail for one request;
 - metric trends for all requests;
-- logs that include the current trace ID and span ID.
+- logs with the active trace and span IDs.
+
+Metric attributes should remain low-cardinality. Do not add trace IDs, user IDs,
+prompts, or full queries to metric attributes.
 
 ## Propagation Through Queues
 
-For a queue, inject context into message headers before publish and extract it in the consumer.
+Queue propagation uses message headers or metadata:
 
 ```python
 from opentelemetry.propagate import extract, inject
@@ -222,32 +386,221 @@ def publish_job(queue, payload: dict) -> None:
 
 
 def consume_job(message) -> None:
-    ctx = extract(message.headers)
-    with tracer.start_as_current_span("worker.process_job", context=ctx):
+    parent_ctx = extract(message.headers)
+    with tracer.start_as_current_span("worker.process_job", context=parent_ctx):
         process(message.payload)
 ```
 
-Use span links instead of parent-child relationships when the queued work is intentionally decoupled or may start long after the original request completes.
+This creates a parent-child relationship:
 
-## Baggage Guidelines
+```text
+POST /chat
+  queue publish
+    worker.process_job
+```
 
-Good baggage values:
+Use this when the worker job is causally part of the same request.
 
-- opaque user ID;
-- session ID;
-- tenant tier;
-- experiment variant;
-- region;
-- request class.
+## Span Links For Decoupled Work
 
-Bad baggage values:
+Sometimes a queued job is related but not a direct child:
 
-- email address;
-- access token;
-- prompt text;
-- retrieved document content;
-- raw request body;
-- anything a downstream third-party API should not see.
+- the job may run much later;
+- one batch consumes many messages;
+- one message triggers many independent jobs;
+- several upstream events contribute to one downstream operation.
 
-Keep baggage small. Many proxies and servers enforce header size limits.
+Use span links.
 
+```python
+from opentelemetry import trace
+from opentelemetry.propagate import extract
+from opentelemetry.trace import Link
+
+
+def process_batch(messages: list) -> None:
+    links: list[Link] = []
+
+    for message in messages:
+        message_ctx = extract(message.headers)
+        span_context = trace.get_current_span(message_ctx).get_span_context()
+        if span_context.is_valid:
+            links.append(Link(span_context))
+
+    with tracer.start_as_current_span("worker.process_batch", links=links) as span:
+        span.set_attribute("messaging.batch.message_count", len(messages))
+        process_messages(messages)
+```
+
+Links say "related to these contexts" without pretending there is one parent.
+
+## Async Tasks And Threads
+
+Context usually flows through normal async call paths, but it can be lost when
+work moves into background tasks, thread pools, subprocesses, or custom
+schedulers.
+
+Pattern for explicit context capture:
+
+```python
+from opentelemetry import context
+
+
+def submit_background_work(executor, payload: dict) -> None:
+    current_ctx = context.get_current()
+    executor.submit(run_with_context, current_ctx, payload)
+
+
+def run_with_context(parent_ctx, payload: dict) -> None:
+    token = context.attach(parent_ctx)
+    try:
+        with tracer.start_as_current_span("background.process"):
+            process(payload)
+    finally:
+        context.detach(token)
+```
+
+If spans suddenly become roots when work leaves the request handler, suspect
+context loss.
+
+## Propagation Through gRPC And Custom Transports
+
+For gRPC, use gRPC instrumentation where available. It should handle metadata
+injection and extraction.
+
+For custom transports, define a carrier:
+
+```python
+metadata: dict[str, str] = {}
+inject(metadata)
+send_message(payload, metadata=metadata)
+```
+
+On receive:
+
+```python
+parent_ctx = extract(received_metadata)
+with tracer.start_as_current_span("custom_transport.handle", context=parent_ctx):
+    handle(payload)
+```
+
+Requirements for a custom carrier:
+
+- it must preserve `traceparent`;
+- it should preserve `tracestate`;
+- it should preserve `baggage` only if baggage is safe for that boundary;
+- it must not expose tracing metadata to user-visible payloads;
+- it should survive serialization and broker hops.
+
+## Propagator Configuration
+
+All services should agree on propagators. Common setting:
+
+```bash
+export OTEL_PROPAGATORS=tracecontext,baggage
+```
+
+If one service uses W3C Trace Context and another only understands a different
+format, traces will break at that boundary.
+
+During migrations, some teams configure multiple propagators. Be explicit and
+document the compatibility period.
+
+## Baggage And Langfuse Context
+
+For LLM applications, you often need user, session, release, prompt, or
+experiment context across spans.
+
+General OTel baggage keys:
+
+```text
+app.session.id
+app.tenant.tier
+app.experiment.variant
+app.request.class
+```
+
+Langfuse-specific trace fields:
+
+```text
+langfuse.user.id
+langfuse.session.id
+langfuse.release
+langfuse.trace.metadata.customer_tier
+langfuse.observation.metadata.tool_family
+```
+
+Use `app.*` when the context is generally useful. Use `langfuse.*` when you are
+intentionally mapping fields into Langfuse. Do not put raw prompts or documents
+in baggage.
+
+## End-To-End Local Test
+
+To verify propagation locally:
+
+1. Start a Collector with a debug or console exporter.
+2. Run gateway, retrieval, and agent services with the same OTLP endpoint.
+3. Send one request with a known `session_id`.
+4. Inspect the exported spans.
+
+Expected:
+
+- all service spans share one `trace_id`;
+- gateway client spans have matching downstream server spans;
+- `service.name` differs by service;
+- `app.session.id` appears only if copied from baggage;
+- logs inside the request include the same trace ID;
+- metrics have route/model/outcome labels but not trace ID or user email.
+
+## Troubleshooting Broken Traces
+
+Every service starts a new trace:
+
+- inbound extraction is missing;
+- outgoing injection is missing;
+- services use incompatible propagators;
+- proxies strip `traceparent`;
+- manual extraction happens too late.
+
+Client span has no matching server span:
+
+- downstream service is not instrumented;
+- request went through a proxy that dropped headers;
+- service exports to a different backend;
+- sampling dropped one side;
+- route handler starts a new root span manually.
+
+Baggage missing:
+
+- `OTEL_PROPAGATORS` does not include `baggage`;
+- baggage was set after headers were injected;
+- context was not attached;
+- downstream service did not copy baggage to span attributes;
+- baggage key was filtered or too large for headers.
+
+Logs do not correlate:
+
+- logging instrumentation is missing;
+- log formatter does not include trace/span IDs;
+- logs are emitted outside the active span;
+- background worker lost context.
+
+Queue jobs become root traces:
+
+- producer did not inject context into message metadata;
+- consumer did not extract metadata;
+- broker stripped metadata;
+- job is intentionally decoupled and should use span links instead.
+
+## Design Checklist
+
+- Use auto-instrumentation for standard HTTP/gRPC/database/queue clients.
+- Add manual spans around business operations.
+- Use manual `inject()` and `extract()` only where auto-instrumentation does not apply.
+- Keep baggage small, safe, and allowlisted.
+- Copy baggage into span attributes only when needed.
+- Use span links for decoupled or batch work.
+- Keep metrics independent from traces.
+- Confirm trace IDs match across services in a local or staging trace.
+- Confirm logs include trace IDs for request-scoped messages.
+- Confirm downstream third-party calls do not receive unsafe baggage.
