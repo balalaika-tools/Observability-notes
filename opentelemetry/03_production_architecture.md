@@ -476,6 +476,11 @@ processors:
           sampling_percentage: 5
 ```
 
+For a fuller Collector-side example that samples on exact attribute values,
+error types, token and cost thresholds, release burn-in, tenant tiers, and
+guardrail outcomes, see
+[../examples/03_collector_prometheus_langfuse.md](../examples/03_collector_prometheus_langfuse.md).
+
 Tail sampling requirements:
 
 - all spans for a trace must reach the same sampling decision point;
