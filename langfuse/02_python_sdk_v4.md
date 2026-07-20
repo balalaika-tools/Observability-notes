@@ -1,6 +1,6 @@
 # Python SDK v4
 
-Last verified against official Langfuse Python SDK documentation on 2026-06-18.
+Last verified against official Langfuse Python SDK documentation on 2026-07-20.
 
 ## Mental Model
 
@@ -27,6 +27,8 @@ Use the SDK when you can edit the Python code. Use [03_otel_ingestion_and_mappin
 ```bash
 pip install langfuse
 ```
+
+Use `langfuse>=4.14.0,<5` when the application uses propagated prompt linking shown below. Earlier v4 releases can use explicit observation-level `prompt=prompt` linking but do not support `propagate_attributes(prompt=...)`.
 
 For a typical LLM service you may also install provider clients and OpenTelemetry instrumentations:
 
@@ -117,6 +119,36 @@ project_b = get_client(public_key="pk-lf-project-b")
 
 Prefer separate processes or services for separate tenants/projects unless there is a strong operational reason to multiplex.
 
+The difficult case is third-party OpenTelemetry instrumentation. Those spans do not carry the Langfuse public-key routing attribute, so any span that passes the filter can be processed by every configured project's span processor and sent to every project.
+
+This is unsafe because the integration call has no project key:
+
+```python
+from langfuse import Langfuse
+from langfuse.openai import OpenAI
+
+Langfuse(public_key="pk-lf-project-a", secret_key="sk-a")
+Langfuse(public_key="pk-lf-project-b", secret_key="sk-b")
+
+client = OpenAI()
+client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "project-specific data"}],
+)  # Missing langfuse_public_key: routing is ambiguous.
+```
+
+Carry the intended key on every top-level SDK/integration execution:
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "project A data"}],
+    langfuse_public_key="pk-lf-project-a",
+)
+```
+
+For decorators, pass `langfuse_public_key=` to the top-level observed function call. For LangChain, create `CallbackHandler(public_key="pk-lf-project-a")`. Test a deliberately missing-key call and assert it is rejected or absent from every project. If an instrumentation cannot carry the key, isolate projects in separate processes instead of relying on filters to prevent cross-project disclosure.
+
 ## Context Manager Instrumentation
 
 The context manager is the clearest way to instrument production code because parent-child relationships are explicit and automatic.
@@ -130,19 +162,19 @@ openai = OpenAI()
 
 
 def answer_question(question: str, user_id: str, session_id: str) -> str:
-    with langfuse.start_as_current_observation(
-        as_type="span",
-        name="chat.answer",
-        input={"question": question},
-    ) as root:
-        with propagate_attributes(
-            user_id=user_id,
-            session_id=session_id,
-            trace_name="chat.answer",
-            metadata={"feature": "chat", "tenantTier": "enterprise"},
-            tags=["chat", "production"],
-            version="prompt-v17",
-        ):
+    with propagate_attributes(
+        user_id=user_id,
+        session_id=session_id,
+        trace_name="chat.answer",
+        metadata={"feature": "chat", "tenantTier": "enterprise"},
+        tags=["chat", "production"],
+        version="prompt-v17",
+    ):
+        with langfuse.start_as_current_observation(
+            as_type="span",
+            name="chat.answer",
+            input={"question": question},
+        ) as root:
             messages = [{"role": "user", "content": question}]
 
             with langfuse.start_as_current_observation(
@@ -181,6 +213,42 @@ Layered explanation:
 - Technical mechanics: the SDK sets the observation as the active OpenTelemetry span, and child SDK/framework/OTel spans inherit the active context.
 - Production implications: wrap the product workflow first, then add retrieval, tool, generation, guardrail, and persistence observations underneath.
 - Common mistakes: starting only a generation span, forgetting root output, or creating spans outside the active context in worker threads without context propagation.
+
+### Link Managed Prompts
+
+Link a prompt explicitly when your code creates the generation. This is the narrowest and preferred relationship:
+
+```python
+prompt = langfuse.get_prompt("support-answer", label="production")
+
+with langfuse.start_as_current_observation(
+    as_type="generation",
+    name="support-answer",
+    prompt=prompt,
+    input=prompt.compile(question=question),
+) as generation:
+    answer = call_model(prompt.compile(question=question))
+    generation.update(output=answer)
+```
+
+When OpenAI, OpenInference, LiteLLM `langfuse_otel`, or another integration creates the generation and offers no `prompt=` argument, Python SDK 4.14.0 or later can propagate the link:
+
+```python
+from langfuse import get_client, propagate_attributes
+from langfuse.openai import OpenAI
+
+langfuse = get_client()
+client = OpenAI()
+prompt = langfuse.get_prompt("support-answer", label="production")
+
+with propagate_attributes(prompt=prompt):
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt.compile(question="How do I reset SSO?"),
+    )
+```
+
+The propagated prompt attaches only to generation observations. It does not link root, retriever, tool, or generic span observations. An explicit prompt on a generation takes precedence over the propagated prompt. Do not propagate `prompt` when `prompt.is_fallback` is true: a local fallback has no persisted Langfuse prompt version to link.
 
 ## Decorator Instrumentation
 
@@ -509,7 +577,15 @@ from langfuse import Langfuse
 langfuse = Langfuse(sample_rate=0.1)
 ```
 
-Use sampling deliberately. Keep errors, negative feedback, guardrail failures, and new-release burn-in traces whenever possible.
+`LANGFUSE_SAMPLE_RATE` is a head-sampling decision. It is made before the request finishes, so it cannot know about a later exception, thumbs-down score, groundedness result, or safety evaluator outcome. Do not claim that a 10-percent SDK sample will later "keep all failures."
+
+Choose an implementable retention mechanism:
+
+- Keep `LANGFUSE_SAMPLE_RATE=1` for candidate traffic, then use an external trace buffer/tail-sampling Collector that can decide from final span status and completion attributes.
+- Head-sample only from facts known when the root starts, such as environment, release burn-in, route, internal-test cohort, or a bounded tenant tier.
+- If negative feedback arrives minutes later, retain the original trace up front or store the application payload in an approved system from which a feedback worker can create a separate evaluation record. Feedback cannot recover a trace that the SDK already discarded.
+
+Tail buffering increases Collector memory, bandwidth before the decision, and the amount of sensitive content temporarily held. Apply capture/redaction policy before buffering and size the decision window and trace capacity from peak traffic.
 
 Disable tracing without removing instrumentation:
 
@@ -520,9 +596,10 @@ export LANGFUSE_TRACING_ENABLED=false
 Sampling implications:
 
 - Unsampled traces do not send observations or associated scores.
-- Sampling at the SDK is simple, but application-aware retention is better when rare failures matter.
+- Scores attached to an unsampled trace are not sent; a later score cannot reverse the head decision.
+- SDK sampling is simple and cheap, but only start-time attributes can influence an outcome-aware policy at that point.
 - If you sample in the Collector, preserve complete traces. Partial traces are hard to debug.
-- Consider separate policies for production burn-in, high-value tenants, errors, and safety failures.
+- Tail sampling can retain completed errors and safety attributes only when all spans reach the same decision point before its window closes.
 
 ## Production Architecture Patterns
 

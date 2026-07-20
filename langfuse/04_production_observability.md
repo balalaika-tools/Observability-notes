@@ -1,6 +1,6 @@
 # Production Observability Workflows
 
-Last verified against official Langfuse observability documentation on 2026-06-18.
+Last verified against official Langfuse observability documentation on 2026-07-20.
 
 ## Mental Model
 
@@ -18,7 +18,7 @@ user impact / alert / feedback
   -> datasets and experiments verify the fix
 ```
 
-Langfuse solves "what happened inside the LLM workflow and was it good?" It does not replace metrics for paging, logs for forensic detail, or privacy controls that decide what is allowed to leave the application.
+Langfuse solves "what happened inside the LLM workflow and was it good?" Native Monitors can notify on supported observation and score cost, latency, volume, and quality thresholds. External metrics and incident systems remain necessary for infrastructure SLOs, unsupported signals, and richer paging/escalation. Langfuse also does not replace logs for forensic detail or privacy controls that decide what may leave the application.
 
 ## What to Capture
 
@@ -142,9 +142,12 @@ Example:
 
 ```python
 import os
-from langfuse import get_client, propagate_attributes
+from langfuse import Langfuse, propagate_attributes
 
-langfuse = get_client()
+langfuse = Langfuse(
+    release=os.environ["LANGFUSE_RELEASE"],
+    environment=os.environ["LANGFUSE_TRACING_ENVIRONMENT"],
+)
 
 
 def run_workflow(user_id: str, session_id: str) -> None:
@@ -153,10 +156,9 @@ def run_workflow(user_id: str, session_id: str) -> None:
             user_id=user_id,
             session_id=session_id,
             trace_name="agent.answer",
+            environment=os.environ["LANGFUSE_TRACING_ENVIRONMENT"],
             version=os.getenv("PROMPT_VERSION", "prompt-dev"),
             metadata={
-                "environment": os.getenv("ENVIRONMENT", "dev"),
-                "release": os.getenv("RELEASE", "local"),
                 "agentVersion": os.getenv("AGENT_VERSION", "local"),
             },
             tags=["agent"],
@@ -164,7 +166,7 @@ def run_workflow(user_id: str, session_id: str) -> None:
             execute_agent()
 ```
 
-Keep release and environment values low-cardinality and stable.
+Set `LANGFUSE_RELEASE` to the deployed artifact and `LANGFUSE_TRACING_ENVIRONMENT` to the deployment environment before client initialization. `propagate_attributes(environment=...)` may override the environment for a request-scoped execution. Do not put `environment` or `release` in generic metadata, and do not use `version` as a release substitute. Keep all three values low-cardinality and stable.
 
 Production convention:
 
@@ -220,14 +222,15 @@ Privacy review questions:
 
 Sampling is a tradeoff. For LLM systems, the rare traces are often the most valuable.
 
-Common strategy:
+`LANGFUSE_SAMPLE_RATE` and ordinary SDK samplers make a head decision when the root starts. They cannot see a later error, thumbs-down, safety score, or final cost. A later score cannot restore an excluded trace, and scores attached to an unsampled trace are not sent.
 
-- Keep all errors.
-- Keep all user-thumbs-down traces.
-- Keep all safety or guardrail failures.
-- Keep all traces from new releases for a short burn-in window.
-- Sample successful high-volume traffic.
-- Keep a representative sample per trace name, model, tenant tier, and release.
+An implementable strategy is:
+
+- Retain 100 percent of a bounded candidate stream until an outcome-aware decision is possible.
+- Use start-time head rules only for facts already known: new release, environment, route, internal test traffic, or bounded tenant tier.
+- If final errors, tool failures, latency, or safety attributes decide retention, send complete candidate traces to a trace-ID-routed Collector tail-sampling tier.
+- If user feedback arrives after export, retain the original candidate trace up front; feedback cannot rescue a head-dropped trace.
+- Sample remaining successful high-volume traffic by a documented probability.
 
 If sampling outside Langfuse with the Collector, make sure complete traces reach Langfuse. Dropping key spans can make agent and RAG workflows hard to debug.
 
@@ -236,9 +239,24 @@ Sampling decision points:
 | Goal | Strategy | Risk |
 | --- | --- | --- |
 | Reduce routine volume | Sample successful traces by workflow/model/tenant tier | May miss slow-burn quality regressions. |
-| Protect high-risk visibility | Always keep errors, safety failures, thumbs-down, new-release burn-in | Requires application or Collector logic beyond simple random sampling. |
+| Protect high-risk visibility | Buffer candidate traces and tail-select completed errors/safety attributes; retain feedback candidates up front | Costs memory/bandwidth and temporarily holds all candidate payloads. |
 | Control cost centrally | Collector tail/head sampling and routing | Incomplete traces if filters are span-level and too aggressive. |
 | Debug a rollout | Temporarily raise sample rate for one release/version | Must remember to return to normal after burn-in. |
+
+Tail sampling requires all spans for a trace to reach the same decision point and arrive within its decision window. Size active-trace capacity from peak new traces per second, trace duration, late arrival, and payload size. Apply masking before buffering; sampling is never a privacy control.
+
+## Alerting Architecture
+
+Use native Langfuse Monitors first when the signal is available from observations or numeric/categorical scores:
+
+1. Choose the data source and metric, such as p95 generation latency, summed cost, observation count, average groundedness, or categorical failure count.
+2. Filter by environment, trace/observation name, model, tags, release, or other bounded dimensions.
+3. Set a required alert threshold, optional warning threshold, and an evaluation window.
+4. Choose no-data behavior explicitly: treat as zero, keep previous severity, show `NO_DATA`, or notify after sustained no data.
+5. Enable renotification only when repeated notification adds operational value.
+6. Link Slack, an HMAC-verified webhook, or GitHub Actions automation.
+
+Keep OpenTelemetry metrics plus the incident platform for HTTP/service SLOs, queue depth, CPU/memory, Collector/exporter health, signals unsupported by Monitors, and advanced routing, deduplication, paging, or escalation. A Langfuse webhook can bridge a supported monitor into that broader incident workflow.
 
 ## Operational Triage
 
@@ -324,7 +342,7 @@ Responsibilities:
 | Agent/RAG service | Agent loop, retrieval, tool calls, generations, guardrails, LLM-specific scores. |
 | Collector | Redaction, batching, routing, resource attributes, backend-specific exporters. |
 | Metrics backend | SLO alerts, saturation, provider error rate, latency, queue health. |
-| Langfuse | Trace inspection, quality/cost analytics, score workflows, datasets, experiments. |
+| Langfuse | Trace inspection, quality/cost analytics, score workflows, native Monitors, datasets, experiments. |
 | Logs backend | Exceptions, stack traces, audit events, operational details. |
 
 ## What to Put in Langfuse vs Metrics vs Logs
@@ -350,7 +368,7 @@ Responsibilities:
 - Propagating baggage too broadly.
 - Sampling away failure traces.
 - Sending only LLM leaf spans to Langfuse while losing the request context.
-- Treating Langfuse dashboards as the only alerting mechanism.
+- Creating dashboards but no native Monitor or external alert for sustained user impact.
 
 ## Testing and Operational Checks
 
@@ -390,7 +408,7 @@ After production rollout:
 - Define trace designs for chat, RAG, agent, guardrail, and evaluator workflows.
 - Decide capture, masking, retention, and access policy before broad rollout.
 - Set environment, release, version, user/session, tags, and metadata consistently.
-- Use Langfuse for LLM trace/quality/cost workflows and a metrics backend for paging.
+- Use native Langfuse Monitors for supported observation/score thresholds and an external metrics/incident stack for infrastructure SLOs, unsupported signals, and escalation.
 - Preserve complete traces for errors, safety failures, negative feedback, and new releases.
 - Record token usage and model parameters on generations.
 - Record retriever IDs/scores/index metadata and tool input/output status.
@@ -405,3 +423,4 @@ After production rollout:
 - SDK advanced features: <https://langfuse.com/docs/observability/sdk/advanced-features>
 - OpenTelemetry ingestion: <https://langfuse.com/integrations/native/opentelemetry>
 - Metrics overview: <https://langfuse.com/docs/metrics/overview>
+- Monitors: <https://langfuse.com/docs/metrics/features/monitors>

@@ -273,7 +273,7 @@ processors:
   batch:
 
 exporters:
-  prometheusremotewrite:
+  prometheus_remote_write:
     endpoint: https://prometheus.example.com/api/v1/write
 
 service:
@@ -281,7 +281,7 @@ service:
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [prometheusremotewrite]
+      exporters: [prometheus_remote_write]
 ```
 
 Metric names and labels may be transformed by the backend. For Prometheus:
@@ -383,19 +383,106 @@ For paging, multi-window burn-rate alerts are better than one short threshold.
 A short window catches fast incidents. A longer window catches sustained
 degradation and reduces noise.
 
+The following complete example uses a 99.5-percent 30-day `/chat` SLO, so the error budget is `0.005`. The application emits a custom `http_server_requests_total` counter with `app_slo_result="bad"` when a request is a 5xx or exceeds eight seconds; this label is not added to auto-instrumented HTTP metrics by setting a span attribute. Recording rules precompute scoped error ratios:
+
+```yaml
+groups:
+  - name: chat-api-slo-recording
+    interval: 1m
+    rules:
+      - record: chat_api:slo_error_ratio:rate5m
+        expr: |
+          sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}[5m]))
+          /
+          clamp_min(sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[5m])), 1e-12)
+      - record: chat_api:slo_error_ratio:rate30m
+        expr: |
+          sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}[30m]))
+          /
+          clamp_min(sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[30m])), 1e-12)
+      - record: chat_api:slo_error_ratio:rate1h
+        expr: |
+          sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}[1h]))
+          /
+          clamp_min(sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[1h])), 1e-12)
+      - record: chat_api:slo_error_ratio:rate6h
+        expr: |
+          sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat",app_slo_result="bad"}[6h]))
+          /
+          clamp_min(sum(rate(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[6h])), 1e-12)
+
+  - name: chat-api-slo-alerts
+    rules:
+      - alert: ChatApiSloFastBurn
+        expr: |
+          (chat_api:slo_error_ratio:rate5m / 0.005 > 14.4)
+          and
+          (chat_api:slo_error_ratio:rate1h / 0.005 > 14.4)
+          and
+          sum(increase(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[5m])) >= 100
+          and
+          sum(increase(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[1h])) >= 1000
+        for: 2m
+        labels:
+          severity: page
+          service: chat-api
+        annotations:
+          summary: "chat-api is rapidly consuming its 30-day error budget"
+          runbook: "Check bad-event mix, release, dependencies, and representative traces."
+
+      - alert: ChatApiSloSlowBurn
+        expr: |
+          (chat_api:slo_error_ratio:rate30m / 0.005 > 6)
+          and
+          (chat_api:slo_error_ratio:rate6h / 0.005 > 6)
+          and
+          sum(increase(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[30m])) >= 500
+          and
+          sum(increase(http_server_requests_total{service_name="chat-api",deployment_environment_name="production",http_route="/chat"}[6h])) >= 5000
+        for: 15m
+        labels:
+          severity: ticket
+          service: chat-api
+        annotations:
+          summary: "chat-api has sustained error-budget burn"
+          runbook: "Compare six-hour bad events with baseline and open affected traces."
+```
+
+The short and long windows must both breach. The page catches rapid budget loss; the ticket catches slower sustained loss. Tune burn factors and traffic guards from the organization's SLO policy, and test the rules with `promtool test rules`.
+
 ## Practical Alerts
 
-The PromQL names below are examples.
+The PromQL names below are examples. Every query filters the intended service and environment inside the expression. An alert label such as `service: chat-api` does not filter input series; it only labels the alert after evaluation.
+
+Every ratio or baseline comparison also has a denominator/baseline check and a
+minimum-volume guard. The guard suppresses tiny samples; it is not a substitute
+for choosing a window long enough for the expected traffic.
 
 ### High HTTP Error Rate
 
 ```yaml
 - alert: ChatApiHigh5xxRate
   expr: |
-    sum(rate(http_server_requests_total{http_response_status_code=~"5.."}[5m]))
-    /
-    sum(rate(http_server_requests_total[5m]))
-    > 0.02
+    (
+      sum(rate(http_server_requests_total{
+        service_name="chat-api",
+        deployment_environment_name="production",
+        http_route="/chat",
+        http_response_status_code=~"5.."
+      }[5m]))
+      /
+      sum(rate(http_server_requests_total{
+        service_name="chat-api",
+        deployment_environment_name="production",
+        http_route="/chat"
+      }[5m]))
+    ) > 0.02
+    and
+    sum(rate(http_server_requests_total{
+      service_name="chat-api",
+      deployment_environment_name="production",
+      http_route="/chat"
+    }[5m])) >= 1
   for: 10m
   labels:
     severity: page
@@ -410,11 +497,31 @@ The PromQL names below are examples.
 ```yaml
 - alert: LlmP95LatencyHigh
   expr: |
-    histogram_quantile(
-      0.95,
-      sum(rate(llm_request_duration_seconds_bucket[10m]))
-      by (le, gen_ai_request_model, gen_ai_provider_name, http_route)
-    ) > 8
+    (
+      histogram_quantile(
+        0.95,
+        sum(rate(llm_request_duration_seconds_bucket{
+          service_name="chat-api",
+          deployment_environment_name="production",
+          http_route="/chat"
+        }[10m])) by (
+          le, service_name, deployment_environment_name,
+          gen_ai_request_model, gen_ai_provider_name, http_route
+        )
+      ) > 8
+    )
+    and on (
+      service_name, deployment_environment_name,
+      gen_ai_request_model, gen_ai_provider_name, http_route
+    )
+    sum(rate(llm_request_duration_seconds_count{
+      service_name="chat-api",
+      deployment_environment_name="production",
+      http_route="/chat"
+    }[10m])) by (
+      service_name, deployment_environment_name,
+      gen_ai_request_model, gen_ai_provider_name, http_route
+    ) >= 0.2
   for: 15m
   labels:
     severity: ticket
@@ -428,10 +535,26 @@ The PromQL names below are examples.
 ```yaml
 - alert: LlmErrorRateHigh
   expr: |
-    sum(rate(llm_requests_total{app_outcome="error"}[5m]))
-    /
-    sum(rate(llm_requests_total[5m]))
-    > 0.05
+    (
+      sum(rate(llm_requests_total{
+        service_name="chat-api",
+        deployment_environment_name="production",
+        http_route="/chat",
+        app_outcome="error"
+      }[5m]))
+      /
+      sum(rate(llm_requests_total{
+        service_name="chat-api",
+        deployment_environment_name="production",
+        http_route="/chat"
+      }[5m]))
+    ) > 0.05
+    and
+    sum(rate(llm_requests_total{
+      service_name="chat-api",
+      deployment_environment_name="production",
+      http_route="/chat"
+    }[5m])) >= 0.2
   for: 10m
   labels:
     severity: page
@@ -445,9 +568,32 @@ The PromQL names below are examples.
 ```yaml
 - alert: LlmInputTokenSpike
   expr: |
-    sum(rate(llm_tokens_total{gen_ai_token_type="input"}[15m]))
-    >
-    2 * sum(rate(llm_tokens_total{gen_ai_token_type="input"}[15m] offset 1d))
+    sum(rate(llm_tokens_total{
+      service_name="chat-api",
+      deployment_environment_name="production",
+      http_route="/chat",
+      gen_ai_token_type="input"
+    }[15m]))
+    > 2 * sum(rate(llm_tokens_total{
+      service_name="chat-api",
+      deployment_environment_name="production",
+      http_route="/chat",
+      gen_ai_token_type="input"
+    }[15m] offset 1d))
+    and
+    sum(rate(llm_tokens_total{
+      service_name="chat-api",
+      deployment_environment_name="production",
+      http_route="/chat",
+      gen_ai_token_type="input"
+    }[15m])) > 10
+    and
+    sum(rate(llm_tokens_total{
+      service_name="chat-api",
+      deployment_environment_name="production",
+      http_route="/chat",
+      gen_ai_token_type="input"
+    }[15m] offset 1d)) > 0
   for: 20m
   labels:
     severity: ticket
@@ -461,10 +607,23 @@ The PromQL names below are examples.
 ```yaml
 - alert: AgentToolFailureRateHigh
   expr: |
-    sum(rate(agent_tool_calls_total{app_outcome="error"}[10m])) by (agent_tool_name)
-    /
-    sum(rate(agent_tool_calls_total[10m])) by (agent_tool_name)
-    > 0.10
+    (
+      sum(rate(agent_tool_calls_total{
+        service_name="agent-service",
+        deployment_environment_name="production",
+        app_outcome="error"
+      }[10m])) by (service_name, deployment_environment_name, agent_tool_name)
+      /
+      sum(rate(agent_tool_calls_total{
+        service_name="agent-service",
+        deployment_environment_name="production"
+      }[10m])) by (service_name, deployment_environment_name, agent_tool_name)
+    ) > 0.10
+    and
+    sum(rate(agent_tool_calls_total{
+      service_name="agent-service",
+      deployment_environment_name="production"
+    }[10m])) by (service_name, deployment_environment_name, agent_tool_name) >= 0.1
   for: 15m
   labels:
     severity: ticket
@@ -478,10 +637,22 @@ The PromQL names below are examples.
 ```yaml
 - alert: AgentStepCountHigh
   expr: |
-    histogram_quantile(
-      0.95,
-      sum(rate(agent_steps_bucket[15m])) by (le, http_route)
-    ) > 12
+    (
+      histogram_quantile(
+        0.95,
+        sum(rate(agent_steps_bucket{
+          service_name="agent-service",
+          deployment_environment_name="production",
+          http_route="/run"
+        }[15m])) by (le, service_name, deployment_environment_name, http_route)
+      ) > 12
+    )
+    and on (service_name, deployment_environment_name, http_route)
+    sum(rate(agent_steps_count{
+      service_name="agent-service",
+      deployment_environment_name="production",
+      http_route="/run"
+    }[15m])) by (service_name, deployment_environment_name, http_route) >= 0.1
   for: 20m
   labels:
     severity: ticket
@@ -495,10 +666,23 @@ The PromQL names below are examples.
 ```yaml
 - alert: RagEmptyRetrievalsHigh
   expr: |
-    sum(rate(rag_retrieval_requests_total{app_outcome="empty"}[10m]))
-    /
-    sum(rate(rag_retrieval_requests_total[10m]))
-    > 0.05
+    (
+      sum(rate(rag_retrieval_requests_total{
+        service_name="rag-service",
+        deployment_environment_name="production",
+        app_outcome="empty"
+      }[10m]))
+      /
+      sum(rate(rag_retrieval_requests_total{
+        service_name="rag-service",
+        deployment_environment_name="production"
+      }[10m]))
+    ) > 0.05
+    and
+    sum(rate(rag_retrieval_requests_total{
+      service_name="rag-service",
+      deployment_environment_name="production"
+    }[10m])) >= 0.1
   for: 15m
   labels:
     severity: ticket
@@ -512,7 +696,11 @@ The PromQL names below are examples.
 ```yaml
 - alert: LlmJobQueueBacklogHigh
   expr: |
-    max(worker_queue_depth{queue_name="llm-jobs"}) > 1000
+    max(worker_queue_depth{
+      service_name="llm-worker",
+      deployment_environment_name="production",
+      queue_name="llm-jobs"
+    }) > 1000
   for: 15m
   labels:
     severity: ticket
@@ -573,9 +761,20 @@ The current GenAI semantic convention effort defines client metrics such as:
 | `gen_ai.client.operation.time_to_first_chunk` | Streaming time to first chunk. |
 | `gen_ai.client.operation.time_per_output_chunk` | Streaming chunk cadence. |
 
+It also defines agent and tool metrics:
+
+| Metric | Meaning |
+| --- | --- |
+| `gen_ai.invoke_agent.duration` | End-to-end duration of one in-process agent invocation. |
+| `gen_ai.invoke_agent.inference_calls` | Distribution of model calls made by one agent invocation, including failed calls and excluding sub-agent-owned calls. |
+| `gen_ai.invoke_agent.tool_calls` | Distribution of client-side tool calls made by one agent invocation, including failed calls and excluding sub-agent-owned calls. |
+| `gen_ai.execute_tool.duration` | Duration of one tool execution, with tool name and low-cardinality `error.type` on failure. |
+
 If you use these names, keep them consistent across services. If you use
 application names such as `llm.tokens` and `llm.request.duration`, document the
 mapping and do not mix both styles without a reason.
+
+The standard agent call-count metrics are histograms recorded once per invocation; an `app.agent.tool_calls` counter records one point per tool call. They answer similar questions but have different aggregation semantics and must not be summed together. Keep `app.*` for product-specific facts with no standard equivalent, such as step-limit stops, retrieval emptiness, guardrail policy outcomes, or business cost allocation.
 
 ## Quality Alerts
 

@@ -154,7 +154,6 @@ forks do not configure providers twice.
 # observability.py
 from __future__ import annotations
 
-import atexit
 import os
 from dataclasses import dataclass
 
@@ -192,12 +191,22 @@ def configure_otel() -> OtelHandles:
         }
     )
 
-    otlp_base = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+    otlp_base = os.getenv(
+        "OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"
+    ).rstrip("/")
+    traces_endpoint = os.getenv(
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        f"{otlp_base}/v1/traces",
+    ).rstrip("/")
+    metrics_endpoint = os.getenv(
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        f"{otlp_base}/v1/metrics",
+    ).rstrip("/")
 
     tracer_provider = TracerProvider(resource=resource)
     tracer_provider.add_span_processor(
         BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=f"{otlp_base}/v1/traces"),
+            OTLPSpanExporter(endpoint=traces_endpoint),
             max_queue_size=2048,
             max_export_batch_size=512,
             schedule_delay_millis=5000,
@@ -207,7 +216,7 @@ def configure_otel() -> OtelHandles:
     trace.set_tracer_provider(tracer_provider)
 
     metric_reader = PeriodicExportingMetricReader(
-        OTLPMetricExporter(endpoint=f"{otlp_base}/v1/metrics"),
+        OTLPMetricExporter(endpoint=metrics_endpoint),
         export_interval_millis=15000,
         export_timeout_millis=30000,
     )
@@ -222,16 +231,21 @@ def configure_otel() -> OtelHandles:
         meter_provider=meter_provider,
     )
 
-    atexit.register(shutdown_otel)
     return _otel_handles
 
 
 def shutdown_otel() -> None:
+    global _otel_handles
+
     if _otel_handles is None:
         return
 
-    _otel_handles.tracer_provider.shutdown()
-    _otel_handles.meter_provider.shutdown()
+    handles = _otel_handles
+    _otel_handles = None
+    try:
+        handles.tracer_provider.shutdown()
+    finally:
+        handles.meter_provider.shutdown()
 ```
 
 What this does:
@@ -243,7 +257,8 @@ What this does:
 - `MeterProvider` creates meters and owns metric aggregation/export behavior.
 - `PeriodicExportingMetricReader` collects aggregated metrics on an interval.
 - `OTLPMetricExporter` sends metric batches to the Collector.
-- `shutdown_otel()` flushes spans and metrics before the process exits.
+- Signal-specific endpoint variables override the normalized global base. A base ending in `/` therefore does not produce `//v1/traces` or `//v1/metrics`.
+- `shutdown_otel()` clears its stored handles before shutdown, so a repeated call is a no-op. This guide invokes it explicitly from the FastAPI lifespan or a script `finally` block rather than also registering `atexit`.
 
 ## Add Auto-Instrumentation
 
@@ -300,8 +315,6 @@ behavior.
 
 ```python
 from opentelemetry import trace
-from opentelemetry.trace import Status, StatusCode
-
 tracer = trace.get_tracer(__name__)
 
 
@@ -313,8 +326,6 @@ def retrieve_documents(query: str, top_k: int) -> list[dict]:
         try:
             docs = vector_store.search(query=query, top_k=top_k)
         except Exception as exc:
-            span.record_exception(exc)
-            span.set_status(Status(StatusCode.ERROR, str(exc)))
             span.set_attribute("error.type", type(exc).__name__)
             raise
 
@@ -328,7 +339,7 @@ Span design rules:
 | --- | --- |
 | Use stable names. | `rag.retrieve`, not `retrieve user 123`. |
 | Put bounded facts in attributes. | `rag.top_k=5`, `rag.retrieval.strategy=hybrid`. |
-| Record exceptions and set error status. | `span.record_exception(exc)`. |
+| Record exceptions and set error status. | Let `start_as_current_span()` record an escaping exception and error status by default; add low-cardinality `error.type` once. |
 | Avoid sensitive content. | Do not store raw prompts, documents, access tokens, or emails. |
 | Use semantic conventions where possible. | `http.route`, `gen_ai.request.model`, `db.system.name`. |
 

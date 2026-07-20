@@ -1,6 +1,6 @@
 # Evaluation, Metrics, and Alerting
 
-Last verified against official Langfuse evaluation and metrics documentation on 2026-06-18.
+Last verified against official Langfuse evaluation and metrics documentation on 2026-07-20.
 
 ## Mental Model
 
@@ -363,10 +363,16 @@ Layered explanation:
 Use experiments to compare prompt, model, retrieval, or agent changes before production rollout.
 
 ```python
+from datetime import datetime, timezone
+
 from langfuse import Evaluation, get_client
 
 langfuse = get_client()
-dataset = langfuse.get_dataset("support-rag-regression")
+version_timestamp = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+dataset = langfuse.get_dataset(
+    name="support-rag-regression",
+    version=version_timestamp,
+)
 
 
 def task(*, item, **kwargs):
@@ -398,10 +404,16 @@ Keep experiment names and run names stable enough that dashboards and release no
 For datasets hosted in Langfuse, you can also run from the dataset client so the run is automatically linked to the dataset in the UI:
 
 ```python
+from datetime import datetime, timezone
+
 from langfuse import get_client
 
 langfuse = get_client()
-dataset = langfuse.get_dataset("support-rag-regression")
+version_timestamp = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+dataset = langfuse.get_dataset(
+    name="support-rag-regression",
+    version=version_timestamp,
+)
 
 result = dataset.run_experiment(
     name="prompt-v18",
@@ -412,6 +424,8 @@ result = dataset.run_experiment(
 
 print(result.format())
 ```
+
+`get_dataset()` without `version=` returns the latest mutable state. For a reproducible release gate, obtain the chosen timestamp from the dataset version view or release configuration, pass it explicitly, and record the ISO timestamp in the experiment/run metadata and release evidence. Baseline and candidate runs must fetch the same timestamp.
 
 Experiment runner capabilities to rely on in production:
 
@@ -447,6 +461,41 @@ Langfuse metrics derive from traces and scores. Use them for:
 - volume by trace name, model, tags, or user segment
 - token usage trends
 
+Metrics API v2 is the current aggregate API:
+
+```bash
+export LANGFUSE_AUTH_STRING="$(printf '%s' "${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}" | base64 | tr -d '\n')"
+
+curl --fail-with-body --get \
+  -H "Authorization: Basic ${LANGFUSE_AUTH_STRING}" \
+  --data-urlencode 'query={
+    "view": "observations",
+    "metrics": [{"measure": "totalCost", "aggregation": "sum"}],
+    "dimensions": [{"field": "providedModelName"}],
+    "filters": [{
+      "column": "environment",
+      "operator": "=",
+      "value": "prod",
+      "type": "string"
+    }],
+    "fromTimestamp": "2026-07-19T00:00:00Z",
+    "toTimestamp": "2026-07-20T00:00:00Z",
+    "orderBy": [{"field": "sum_totalCost", "direction": "desc"}],
+    "config": {"row_limit": 100}
+  }' \
+  "${LANGFUSE_BASE_URL}/api/public/v2/metrics"
+```
+
+Use these views:
+
+| View | Meaning |
+| --- | --- |
+| `observations` | Observation latency, cost, token, and count aggregates, with supported trace dimensions. |
+| `scores-numeric` | Numeric and boolean score count/value aggregates. |
+| `scores-categorical` | Categorical score counts, including the `stringValue` dimension. |
+
+The default `config.row_limit` is 100 and the maximum is 1,000. Dimensions such as `id`, `traceId`, `userId`, and `sessionId` may be filtered but cannot be grouped because of cardinality. The v2 `observations` view counts observation rows: a trace with a root, retriever, and two generations contributes four observations. Observation counts are not trace counts; use the Observations API v2 and deduplicate `traceId` client-side when a true trace count is required.
+
 Common dashboards:
 
 | Dashboard | Useful charts |
@@ -463,15 +512,25 @@ Layered explanation:
 - Technical mechanics: Langfuse derives quality, cost, latency, and volume dimensions from ingested trace/evaluation data.
 - Production implications: Langfuse metrics are excellent for LLM/product analytics, while infrastructure SLOs still belong in your metrics backend.
 - Common mistakes: using Langfuse as the only alert engine, not exporting quality signals to paging systems when needed, and grouping by high-cardinality metadata.
+- Common mistakes: treating observation counts as trace counts, ignoring the row limit, and building a polling bridge for a threshold already supported by a native Monitor.
 
 ## Alerting Philosophy
 
-Langfuse is excellent for LLM quality and trace analytics. For paging, use a metrics or incident system that can evaluate alert rules continuously.
+Use a native Langfuse Monitor first for thresholds supported by observation or numeric/categorical score metrics:
+
+1. Select `Observations`, `Scores (numeric)`, or `Scores (categorical)` and choose the aggregation/measure.
+2. Add bounded filters such as environment, model, trace name, observation name, tag, release, or score name.
+3. Set the alert threshold, optional warning threshold, and evaluation window.
+4. Decide what no data means: compare as zero, keep the previous severity, show `NO_DATA`, or notify after sustained no data.
+5. Configure renotification (`Off` or every N minutes) to avoid silent persistent incidents or notification storms.
+6. Link one or more automations: Slack, an HMAC-verified webhook, or a GitHub Actions `workflow_dispatch`.
+
+Monitors notify on transitions into warning/alert and on recovery; sustained severity renotifies only when configured. Treat automation delivery as production infrastructure—after repeated delivery failures a trigger can be disabled, so monitor the destination and re-enable it after repair.
 
 Use two alert layers:
 
-1. Operational alerts from OpenTelemetry metrics: latency, errors, saturation, queue depth, provider failures.
-2. AI quality alerts from Langfuse metrics/scores exported or queried into your alerting workflow: feedback, groundedness, safety, cost, token spikes.
+1. Native Langfuse Monitors for supported observation/score cost, latency, volume, and quality thresholds.
+2. External OpenTelemetry metrics and incident tooling for infrastructure SLOs, unsupported/custom signals, cross-system correlation, on-call paging, deduplication, and escalation.
 
 Do not page on every single bad answer. Page on sustained user impact or safety-critical failures.
 
@@ -492,7 +551,7 @@ Do not page on every single bad answer. Page on sustained user impact or safety-
 
 ## Example: Export Quality Metrics to Alerting
 
-One production pattern is a scheduled job that queries Langfuse metrics or scores and writes compact time series to your metrics backend.
+If a required threshold is not supported by a native Monitor, a scheduled job can query Metrics API v2 and write compact time series to the metrics backend. Use a durable cursor, publish a monotonic processed-score counter for window sample guards, and make retries idempotent.
 
 ```python
 from dataclasses import dataclass
@@ -612,7 +671,7 @@ CI gates should be conservative and stable. Use them to block obvious regression
 - Build datasets from common paths, high-risk cases, and production failures.
 - Run experiments before prompt, model, retrieval, or agent changes ship.
 - Compare candidates against a stable baseline with quality, safety, latency, token, and cost dimensions.
-- Export compact quality metrics to your alerting stack when sustained quality drops should create incidents.
+- Configure native Monitors for supported sustained quality/cost/latency/volume thresholds; export compact metrics only for unsupported or cross-system alert logic.
 - Keep examples, rubrics, and release gates under review as the product changes.
 
 ## Official References
@@ -623,3 +682,5 @@ CI gates should be conservative and stable. Use them to block obvious regression
 - Datasets: <https://langfuse.com/docs/evaluation/experiments/datasets>
 - Experiments via SDK: <https://langfuse.com/docs/evaluation/experiments/experiments-via-sdk>
 - Metrics overview: <https://langfuse.com/docs/metrics/overview>
+- Metrics API v2: <https://langfuse.com/docs/metrics/features/metrics-api>
+- Monitors: <https://langfuse.com/docs/metrics/features/monitors>

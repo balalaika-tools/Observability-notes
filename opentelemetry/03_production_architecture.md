@@ -50,7 +50,7 @@ level and enabled in `service.pipelines`.
 | --- | --- | --- |
 | Receiver | Into the Collector | `otlp`, `prometheus`, `filelog`, `hostmetrics`. |
 | Processor | Between receiver and exporter | `memory_limiter`, `batch`, `attributes`, `resource`, `transform`, `tail_sampling`. |
-| Exporter | Out of the Collector | `otlphttp`, `prometheusremotewrite`, `debug`, vendor exporters. |
+| Exporter | Out of the Collector | `otlphttp`, `prometheus_remote_write`, `debug`, vendor exporters. |
 | Connector | Between pipelines | Span-derived metrics, routing, pipeline fan-in/fan-out. |
 | Extension | Collector capability | `health_check`, `pprof`, `zpages`, auth extensions. |
 
@@ -183,7 +183,7 @@ service:
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [prometheusremotewrite]
+      exporters: [prometheus_remote_write]
 
     logs:
       receivers: [otlp]
@@ -233,20 +233,73 @@ processors:
         value: production
         action: upsert
 
-  attributes/redact:
+  attributes/drop_secrets:
     actions:
       - key: http.request.header.authorization
         action: delete
       - key: http.request.header.cookie
         action: delete
+      - key: http.response.header.set_cookie
+        action: delete
+      - key: db.query.text
+        action: delete
       - key: db.statement
         action: delete
       - key: user.email
         action: hash
-      - key: gen_ai.input.messages
+      - key: exception.message
         action: delete
-      - key: gen_ai.output.messages
+      - key: exception.stacktrace
         action: delete
+
+  transform/drop_event_secrets:
+    error_mode: propagate
+    trace_statements:
+      - context: spanevent
+        statements:
+          - delete_key(attributes, "http.request.header.authorization")
+          - delete_key(attributes, "http.request.header.cookie")
+          - delete_key(attributes, "http.response.header.set_cookie")
+          - delete_key(attributes, "db.query.text")
+          - delete_key(attributes, "db.statement")
+          - delete_key(attributes, "exception.message")
+          - delete_key(attributes, "exception.stacktrace")
+
+  transform/redact_apm:
+    error_mode: propagate
+    trace_statements:
+      - context: span
+        statements:
+          - delete_key(attributes, "gen_ai.system_instructions")
+          - delete_key(attributes, "gen_ai.input.messages")
+          - delete_key(attributes, "gen_ai.output.messages")
+          - delete_key(attributes, "gen_ai.tool.definitions")
+          - delete_key(attributes, "gen_ai.tool.call.arguments")
+          - delete_key(attributes, "gen_ai.tool.call.result")
+          - delete_key(attributes, "langfuse.observation.input")
+          - delete_key(attributes, "langfuse.observation.output")
+          - delete_key(attributes, "langfuse.trace.input")
+          - delete_key(attributes, "langfuse.trace.output")
+          - delete_key(attributes, "llm.prompts")
+          - delete_key(attributes, "llm.completions")
+      - context: spanevent
+        statements:
+          - delete_key(attributes, "gen_ai.system_instructions")
+          - delete_key(attributes, "gen_ai.input.messages")
+          - delete_key(attributes, "gen_ai.output.messages")
+          - delete_key(attributes, "gen_ai.tool.definitions")
+          - delete_key(attributes, "gen_ai.tool.call.arguments")
+          - delete_key(attributes, "gen_ai.tool.call.result")
+          - delete_key(attributes, "langfuse.observation.input")
+          - delete_key(attributes, "langfuse.observation.output")
+          - delete_key(attributes, "langfuse.trace.input")
+          - delete_key(attributes, "langfuse.trace.output")
+          - delete_key(attributes, "llm.prompts")
+          - delete_key(attributes, "llm.completions")
+    log_statements:
+      - context: log
+        statements:
+          - set(body, "[REDACTED_BY_COLLECTOR]") where body != nil
 
   batch:
     timeout: 5s
@@ -264,7 +317,7 @@ exporters:
     headers:
       api-key: "${env:APM_API_KEY}"
 
-  prometheusremotewrite:
+  prometheus_remote_write:
     endpoint: https://prometheus.example.com/api/v1/write
     headers:
       authorization: "Bearer ${env:PROMETHEUS_TOKEN}"
@@ -277,21 +330,30 @@ exporters:
 service:
   extensions: [health_check]
   pipelines:
-    traces:
+    traces/langfuse:
       receivers: [otlp]
-      processors: [memory_limiter, resource/add_environment, attributes/redact, batch]
-      exporters: [otlphttp/langfuse, otlphttp/traces]
+      processors: [memory_limiter, resource/add_environment, attributes/drop_secrets, transform/drop_event_secrets, batch]
+      exporters: [otlphttp/langfuse]
+
+    traces/apm:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/add_environment, attributes/drop_secrets, transform/drop_event_secrets, transform/redact_apm, batch]
+      exporters: [otlphttp/traces]
 
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, resource/add_environment, batch]
-      exporters: [prometheusremotewrite]
+      exporters: [prometheus_remote_write]
 
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, resource/add_environment, attributes/redact, batch]
+      processors: [memory_limiter, resource/add_environment, attributes/drop_secrets, transform/redact_apm, batch]
       exporters: [otlphttp/logs]
 ```
+
+This is the advertised destination-specific split in executable form. The same receiver feeds two trace pipelines. Langfuse receives approved, application-masked LLM input/output after universal secret fields are removed. The general APM backend receives the same trace shape, timing, status, model, and usage attributes after payload fields and sensitive event attributes are removed. The log example suppresses every body and retains only structured allowlisted attributes; replace that conservative rule only after defining and testing a log-body masker.
+
+"Rich" never means raw. Mask or allowlist question, prompt, document, tool, account, and output content in the application before it enters a span. Collector deletion by key cannot find a secret embedded inside an otherwise allowed JSON string. Test both destinations with canary API keys, emails, authorization headers, exception messages, span events, legacy LLM keys, Langfuse root/observation payloads, and log bodies.
 
 Validate config before deploying:
 
@@ -344,6 +406,16 @@ exporters:
 The `otlphttp` exporter appends the signal path for the traces pipeline. Do not
 append `/v1/traces` unless the specific exporter or backend configuration
 requires it.
+
+`x-langfuse-ingestion-version: "4"` is not a general OTLP requirement. It opts direct OTel ingestion into Langfuse Cloud Fast Preview so v2 observation/metrics views receive the current ingestion path in real time. Keep it for that path. Omit the header when the project intentionally uses the legacy ingestion behavior or a self-hosted deployment does not support/enable the preview:
+
+```yaml
+exporters:
+  otlphttp/langfuse_without_fast_preview:
+    endpoint: https://langfuse.example.com/api/public/otel
+    headers:
+      Authorization: "Basic ${env:LANGFUSE_AUTH_STRING}"
+```
 
 Important Langfuse routing rules:
 

@@ -283,7 +283,14 @@ How deep is the queue?
 
 Metrics are not "compressed traces". They are their own signal and should be
 emitted independently. This matters because traces are often sampled, while
-metrics are usually used for exact totals, dashboards, autoscaling, and alerts.
+unsampled metrics are the appropriate aggregate signal for dashboards,
+autoscaling, request/error rates, and alerts.
+
+"Unsampled" does not mean an accounting ledger. Exporter loss, queue overflow,
+process crashes or restarts, cumulative/delta temporality conversion, Collector
+failure, and backend rejection can all lose or reset measurements. Use a
+transactional billing or audit system for exact money, quota, and compliance
+records; use telemetry metrics to operate the system.
 
 OpenTelemetry metrics have a few moving parts:
 
@@ -763,11 +770,16 @@ Head sampling decides early, usually when the root span starts:
 ```text
 root span starts
   -> sampler decides sampled or not sampled
-  -> child spans follow the parent decision
+  -> a parent-based sampler makes children follow the parent decision
 ```
 
 Head sampling is cheap and easy. Its limitation is that it cannot know whether
 the trace will later become slow or error.
+
+Parent-following is not universal. `ParentBased` delegates root decisions to a
+configured root sampler and respects the remote/local parent's sampled flag for
+children. A non-parent-based sampler can make a new decision for each span,
+which can produce partial traces and usually needs a deliberate reason.
 
 Tail sampling decides later, usually in the Collector, after seeing most or all
 spans in a trace:
@@ -820,7 +832,7 @@ processors:
 exporters:
   otlphttp/traces:
     endpoint: https://apm.example.com/otlp
-  prometheusremotewrite:
+  prometheus_remote_write:
     endpoint: https://prometheus.example.com/api/v1/write
 
 service:
@@ -832,7 +844,7 @@ service:
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [prometheusremotewrite]
+      exporters: [prometheus_remote_write]
 ```
 
 Processor order matters. For example, put memory limiting early, redaction
@@ -1043,9 +1055,9 @@ attributes, metric attributes, or logs if you want to see it in a backend.
 
 ### "Metrics can be derived from traces"
 
-Sometimes, but do not rely on this for alerting or totals. Traces may be
-sampled. Metrics should be emitted independently for accurate aggregate
-behavior.
+Sometimes, but do not rely on this for alerting or aggregate behavior. Traces
+may be sampled. Emit metrics independently, and remember that the telemetry
+delivery path still does not make them a transactional accounting record.
 
 ### "OpenTelemetry gives me observability by itself"
 

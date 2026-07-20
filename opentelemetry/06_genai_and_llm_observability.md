@@ -15,11 +15,7 @@ attributes on spans." The goal is to make an LLM trace tell the story of one
 user request from the API boundary, through retrieval and model calls, through
 tool execution, and finally into Langfuse or another backend.
 
-This page uses the OpenTelemetry GenAI semantic conventions checked on June 18,
-2026. These conventions are still marked Development and now live in the
-dedicated `open-telemetry/semantic-conventions-genai` repository. Treat the
-attribute names as the current best standard, but keep them behind helpers so a
-future convention update is easy to adopt.
+This page was checked on July 20, 2026 against core OpenTelemetry semantic conventions `v1.43.0` and the dedicated `open-telemetry/semantic-conventions-genai` repository at commit `c26a2c21d1ee70d5231bd440c7b48d3c94ee506a` (2026-07-17). The dedicated repository depends on core semconv `v1.43.0` at that revision. GenAI conventions are still marked Development. Pin a release or commit in your own compatibility note; a check date without a revision cannot be reproduced after `main` changes.
 
 ## The Mental Model
 
@@ -130,6 +126,8 @@ LANGFUSE_OBSERVATION_OUTPUT = "langfuse.observation.output"
 This looks boring, which is exactly the point. When the convention evolves, one
 module changes instead of every LLM call site.
 
+Use one error pattern for every GenAI operation in this chapter. Put a low-cardinality `error.type` on the failed span, then re-raise. Python's `start_as_current_span()` defaults record the escaping exception and set error status, so the examples do not also call `record_exception()` or put `str(exc)` in status. If an instrumentation disables `record_exception` or `set_status_on_exception`, it must take over both responsibilities exactly once.
+
 ## Operation Vocabulary
 
 Use `gen_ai.operation.name` to describe the logical GenAI operation.
@@ -219,7 +217,7 @@ Useful parent attributes:
 | `http.route` | Low-cardinality endpoint name. |
 | `enduser.id` or application user attribute | User correlation, if allowed by policy. |
 | `app.tenant.id` | Tenant correlation, if allowed and bounded. |
-| `app.workflow.name` | Product workflow, such as `support_rag`. |
+| `gen_ai.workflow.name` | Product workflow, such as `support_rag`. |
 | `app.experiment.name` | A/B or prompt experiment, if low-cardinality. |
 
 For Langfuse, prefer Langfuse-specific trace metadata for fields that need to be
@@ -294,7 +292,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from opentelemetry import trace
-from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.trace import SpanKind
 
 from observability.genai_attributes import (
     ERROR_TYPE,
@@ -307,8 +305,6 @@ from observability.genai_attributes import (
     GENAI_REQUEST_MODEL,
     GENAI_RESPONSE_ID,
     GENAI_RESPONSE_MODEL,
-    LANGFUSE_OBSERVATION_INPUT,
-    LANGFUSE_OBSERVATION_OUTPUT,
 )
 
 tracer = trace.get_tracer(__name__)
@@ -346,8 +342,6 @@ def complete_chat(
                 max_tokens=800,
             )
         except Exception as exc:
-            span.record_exception(exc)
-            span.set_status(Status(StatusCode.ERROR, str(exc)))
             span.set_attribute(ERROR_TYPE, type(exc).__name__)
             raise
 
@@ -365,8 +359,22 @@ def complete_chat(
             span.set_attribute(GENAI_OUTPUT_TOKENS, response.usage.completion_tokens)
 
         if capture_content:
-            span.set_attribute(LANGFUSE_OBSERVATION_INPUT, json.dumps({"messages": messages}))
-            span.set_attribute(LANGFUSE_OBSERVATION_OUTPUT, json.dumps({"content": answer}))
+            input_messages = [
+                {
+                    "role": message["role"],
+                    "parts": [{"type": "text", "content": message["content"]}],
+                }
+                for message in messages
+            ]
+            output_messages = [
+                {
+                    "role": "assistant",
+                    "parts": [{"type": "text", "content": answer}],
+                    "finish_reason": first_choice.finish_reason,
+                }
+            ]
+            span.set_attribute("gen_ai.input.messages", json.dumps(input_messages))
+            span.set_attribute("gen_ai.output.messages", json.dumps(output_messages))
 
         return answer
 ```
@@ -380,6 +388,7 @@ Notes:
   user-specific label.
 - `error.type` is low-cardinality. Use exception class names or provider error
   codes, not full error messages.
+- `start_as_current_span()` records an escaping exception and sets error status by default. The `except` block adds only `error.type` and re-raises, so it does not create a duplicate exception event or put raw exception text in status.
 - This wrapper is where provider-specific response parsing belongs.
 
 ## Streaming
@@ -425,24 +434,28 @@ def stream_chat(client, messages: list[dict], *, model: str):
         first_chunk_at: float | None = None
         chunks: list[str] = []
 
-        stream = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            stream=True,
-        )
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+            )
 
-        for chunk in stream:
-            if first_chunk_at is None:
-                first_chunk_at = time.perf_counter()
-                span.set_attribute(
-                    "gen_ai.response.time_to_first_chunk",
-                    first_chunk_at - start,
-                )
+            for chunk in stream:
+                if first_chunk_at is None:
+                    first_chunk_at = time.perf_counter()
+                    span.set_attribute(
+                        "gen_ai.response.time_to_first_chunk",
+                        first_chunk_at - start,
+                    )
 
-            token = extract_text_delta(chunk)
-            if token:
-                chunks.append(token)
-                yield token
+                token = extract_text_delta(chunk)
+                if token:
+                    chunks.append(token)
+                    yield token
+        except Exception as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
 
         span.set_attribute("app.llm.stream.chunk_count", len(chunks))
 ```
@@ -470,6 +483,30 @@ Current opt-in content attributes include:
 | `gen_ai.tool.call.result` | Tool execution result. |
 | `gen_ai.retrieval.query.text` | Retrieval query text. |
 | `gen_ai.retrieval.documents` | Retrieved document details. |
+
+These `gen_ai.*` fields use the standard GenAI content schemas; serialize the
+message/part objects as JSON when the language API accepts only scalar
+attributes. `langfuse.observation.input` and
+`langfuse.observation.output` are backend-specific mapping fields, not
+OpenTelemetry semantic conventions. Set them separately only on the Langfuse
+export path when its UI should receive an intentionally captured payload.
+
+When a provider accepts system instructions separately from chat history, the
+standard shape is an array of content parts:
+
+```python
+system_instructions = [
+    {"type": "text", "content": "Answer from approved support sources only."}
+]
+span.set_attribute(
+    "gen_ai.system_instructions",
+    json.dumps(system_instructions),
+)
+```
+
+Do not pull a `system`-role message out of a provider's chat-history array just
+to populate this field. In that API shape it remains a role-bearing entry in
+`gen_ai.input.messages`, as the inference example shows.
 
 Production policy should answer:
 
@@ -538,7 +575,11 @@ def embed_texts(client, texts: list[str], *, model: str) -> list[list[float]]:
             "app.embedding.input_count": len(texts),
         },
     ) as span:
-        response = client.embeddings.create(model=model, input=texts)
+        try:
+            response = client.embeddings.create(model=model, input=texts)
+        except Exception as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
 
         if response.usage:
             span.set_attribute("gen_ai.usage.input_tokens", response.usage.prompt_tokens)
@@ -571,7 +612,11 @@ def retrieve_documents(vector_store, query_vector: list[float], *, top_k: int):
             "gen_ai.retrieval.top_k": top_k,
         },
     ) as span:
-        docs = vector_store.search(query_vector, top_k=top_k)
+        try:
+            docs = vector_store.search(query_vector, top_k=top_k)
+        except Exception as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
 
         span.set_attribute("app.retrieval.result_count", len(docs))
         if docs:
@@ -643,8 +688,6 @@ def execute_tool(tool_registry, call) -> dict:
         try:
             result = tool_registry[tool_name](**call.arguments)
         except Exception as exc:
-            span.record_exception(exc)
-            span.set_status(Status(StatusCode.ERROR, str(exc)))
             span.set_attribute("error.type", type(exc).__name__)
             raise
 
@@ -684,17 +727,40 @@ def run_support_agent(request: SupportRequest) -> AgentAnswer:
         "invoke_agent support_agent",
         attributes={
             "gen_ai.operation.name": "invoke_agent",
-            "app.agent.name": "support_agent",
-            "app.workflow.name": "support_rag",
+            "gen_ai.agent.name": "support_agent",
+            "gen_ai.workflow.name": "support_rag",
         },
     ) as span:
-        plan = make_plan(request)
-        docs = retrieve_for_plan(plan)
-        answer = call_model_with_tools(request, docs)
+        try:
+            plan = make_plan(request)
+            docs = retrieve_for_plan(plan)
+            answer = call_model_with_tools(request, docs)
+        except Exception as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
 
         span.set_attribute("app.agent.step_count", plan.step_count)
         span.set_attribute("app.agent.tool_call_count", answer.tool_call_count)
         return answer
+```
+
+A workflow uses the same error contract and the workflow-specific standard
+attributes:
+
+```python
+def run_support_workflow(request: SupportRequest) -> AgentAnswer:
+    with tracer.start_as_current_span(
+        "invoke_workflow support_rag",
+        attributes={
+            "gen_ai.operation.name": "invoke_workflow",
+            "gen_ai.workflow.name": "support_rag",
+        },
+    ) as span:
+        try:
+            return run_support_agent(request)
+        except Exception as exc:
+            span.set_attribute("error.type", type(exc).__name__)
+            raise
 ```
 
 The agent span should not contain raw chain-of-thought. If you capture a plan,
@@ -751,6 +817,20 @@ that host models or orchestrate workflows:
 | `gen_ai.server.time_to_first_token` | `s` | Server-side first token latency. |
 | `gen_ai.server.time_per_output_token` | `s` | Server-side output token pacing. |
 | `gen_ai.workflow.duration` | `s` | End-to-end GenAI workflow duration. |
+
+Agent and tool conventions add metrics for the orchestration work itself:
+
+| Metric | Unit | Meaning |
+| --- | --- | --- |
+| `gen_ai.invoke_agent.duration` | `s` | Duration of one agent invocation. |
+| `gen_ai.invoke_agent.inference_calls` | `{inference_call}` | Inference calls made during one agent invocation. |
+| `gen_ai.invoke_agent.tool_calls` | `{tool_call}` | Tool calls made during one agent invocation. |
+| `gen_ai.execute_tool.duration` | `s` | Duration of one tool execution. |
+
+The per-invocation call-count metrics describe fan-out; they are not failure
+counters. Use their standard attributes and a low-cardinality `error.type` on
+duration measurements when the operation fails. Keep `app.*` counters only for
+product facts that these instruments do not express.
 
 Token usage should be emitted when the count is readily available. If a provider
 reports billable tokens and raw tokens separately, report billable tokens for the
@@ -1037,7 +1117,7 @@ For a new LLM service:
 - wrap each provider call in an inference span;
 - set operation, provider, and request model at span creation time;
 - record response model, response ID, finish reasons, and token usage;
-- record error status, exception, and `error.type`;
+- ensure escaping errors are recorded once and add low-cardinality `error.type`;
 - add retrieval, embedding, tool, memory, agent, and workflow spans where they
   explain real behavior;
 - emit GenAI duration and token metrics or equivalent application metrics;

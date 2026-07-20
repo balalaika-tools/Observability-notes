@@ -31,7 +31,12 @@ Use the Langfuse SDK when:
 - you are writing Python or JS/TS application code and want higher-level helpers for generations, scores, and attribute propagation;
 - you still want OpenTelemetry compatibility but do not want to wire OTLP exporters manually.
 
-In production LLM systems, the strongest pattern is usually both:
+A production LLM system may use both APIs, but each process still needs one
+trace-provider ownership path. Either let the Langfuse SDK initialize the
+provider and add general OpenTelemetry instrumentation to it, or initialize the
+provider yourself and attach the Langfuse span processor/exporter. Do not let
+two independent bootstraps replace the global provider or export the same span
+twice.
 
 ```text
 Application code
@@ -47,7 +52,13 @@ OpenTelemetry Collector
 
 ## Official References Used
 
-This guide was checked on June 18, 2026 against:
+This guide was checked on July 20, 2026. Core semantic-convention guidance is
+anchored to `v1.43.0`; the faster-moving GenAI material is separately anchored
+to `open-telemetry/semantic-conventions-genai` commit
+`c26a2c21d1ee70d5231bd440c7b48d3c94ee506a` from 2026-07-17. Keep both anchors:
+the dedicated GenAI repository can change without a new core release.
+
+References:
 
 - [OpenTelemetry overview](https://opentelemetry.io/docs/what-is-opentelemetry/)
 - [OpenTelemetry components](https://opentelemetry.io/docs/concepts/components/)
@@ -69,8 +80,8 @@ This guide was checked on June 18, 2026 against:
 - [OpenTelemetry Collector internal telemetry](https://opentelemetry.io/docs/collector/internal-telemetry/)
 - [OpenTelemetry security configuration best practices](https://opentelemetry.io/docs/security/config-best-practices/)
 - [OpenTelemetry sampling](https://opentelemetry.io/docs/concepts/sampling/)
-- [OpenTelemetry GenAI semantic conventions repository](https://github.com/open-telemetry/semantic-conventions-genai)
-- [OpenTelemetry GenAI spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md)
-- [OpenTelemetry GenAI metrics](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-metrics.md)
-- [OpenTelemetry GenAI agent spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md)
+- [OpenTelemetry GenAI semantic conventions, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/tree/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a)
+- [OpenTelemetry GenAI spans, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a/docs/gen-ai/gen-ai-spans.md)
+- [OpenTelemetry GenAI metrics, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a/docs/gen-ai/gen-ai-metrics.md)
+- [OpenTelemetry GenAI agent spans, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a/docs/gen-ai/gen-ai-agent-spans.md)
 - [Langfuse OpenTelemetry integration](https://langfuse.com/integrations/native/opentelemetry)

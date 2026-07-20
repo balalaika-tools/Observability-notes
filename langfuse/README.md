@@ -1,6 +1,6 @@
 # Langfuse Guide
 
-Last verified against official Langfuse documentation on 2026-06-18.
+Last verified against official Langfuse documentation on 2026-07-20.
 
 Langfuse is an observability, evaluation, prompt management, and metrics platform for LLM applications. It is built on OpenTelemetry, but it adds LLM-specific concepts that general observability backends do not usually understand well: prompts, generations, model usage, cost, user feedback, scores, datasets, experiments, and review workflows.
 
@@ -17,10 +17,12 @@ Langfuse solves:
 - Prompt and model iteration: "Which version won?"
 - Feedback loops: "Which production failures should become regression tests?"
 - LLM-specific analytics: "What did this workflow cost by model, release, user segment, and score?"
+- Native monitors: "Did observation cost, latency, volume, or a quality score cross a sustained threshold?"
 
 Langfuse does not replace:
 
-- Infrastructure metrics and paging.
+- Infrastructure metrics and SLO alerting for CPU, memory, queues, network, service errors, and other unsupported signals.
+- Incident-management escalation, ownership, deduplication, and on-call workflows beyond monitor automations.
 - General log storage.
 - Authorization, data-loss prevention, or privacy policy enforcement.
 - A model gateway, prompt runtime, vector database, or eval framework by itself.
@@ -57,8 +59,9 @@ Read the guide in order if you are designing a new rollout. Jump to the integrat
 | Python or JavaScript/TypeScript app and you can add Langfuse code | Use the Langfuse SDK. For Python, use SDK v4 APIs from `langfuse`: `get_client`, `observe`, and `propagate_attributes`. |
 | Existing service already emits OpenTelemetry spans | Send OTLP/HTTP traces to Langfuse, either directly or through the Collector. |
 | Polyglot microservices | Use OpenTelemetry everywhere; use Langfuse SDKs in Python/JS LLM services where they add value; route GenAI traces to Langfuse. |
-| You need SLO alerts on request rate, errors, latency, queue depth, or saturation | Export OpenTelemetry metrics to a metrics backend and use Langfuse for trace, quality, and evaluation workflows. |
-| You need quality, cost, latency, token, prompt-version, or user feedback analytics | Use Langfuse traces, scores, metrics, dashboards, and the metrics API. |
+| You need SLO alerts on request rate, errors, queue depth, or saturation | Export OpenTelemetry metrics to a metrics backend; these infrastructure signals and escalation workflows remain outside Langfuse. |
+| You need observation or score thresholds for cost, latency, volume, or quality | Create a native Langfuse Monitor with filters, warning/alert thresholds, a window, no-data and renotification behavior, then link Slack, webhook, or GitHub Actions automations. |
+| You need quality, cost, latency, token, prompt-version, or user feedback analytics | Use Langfuse traces, scores, dashboards, native Monitors, and Metrics API v2. |
 
 Decision points:
 
@@ -94,6 +97,7 @@ Application
   |
   |-- Langfuse SDK or OTLP spans --> Langfuse
   |       traces, generations, prompts, scores, sessions, cost, quality
+  |       native monitors -> Slack / webhook / GitHub Actions
   |
   |-- OpenTelemetry metrics -------> Prometheus / managed metrics backend
   |       latency SLOs, errors, saturation, alerting
@@ -102,7 +106,7 @@ Application
           incident forensics, audit trails, debugging
 ```
 
-The strongest production setup uses all three. Langfuse explains what happened inside LLM and agent workflows. Metrics wake you up when the system is unhealthy. Logs provide exact operational evidence.
+The production setup uses each signal deliberately. Langfuse explains LLM and agent behavior and can notify on supported observation/score thresholds. The external metrics and incident stack owns infrastructure SLOs, unsupported signals, paging policy, and advanced escalation. Logs provide exact operational evidence.
 
 ## End-to-End Lifecycle
 
@@ -113,6 +117,7 @@ The strongest production setup uses all three. Langfuse explains what happened i
 5. Langfuse maps OpenTelemetry spans into observations, derives trace-level fields, and computes LLM-specific views for latency, cost, usage, and quality.
 6. Users, humans, code evaluators, and LLM judges attach scores.
 7. Engineers inspect traces, compare release/version dimensions, build datasets from failures, and run experiments before the next rollout.
+8. Native Monitors evaluate supported cost, latency, volume, and score thresholds; external alerting evaluates infrastructure SLOs and drives the broader incident workflow.
 
 The main design goal is not "capture everything." It is "capture enough safe context that a future engineer can explain a bad answer, reproduce it, and know whether the fix helped."
 
@@ -145,6 +150,7 @@ The main design goal is not "capture everything." It is "capture enough safe con
 - Langfuse observation types: <https://langfuse.com/docs/observability/features/observation-types>
 - Langfuse OpenTelemetry ingestion: <https://langfuse.com/integrations/native/opentelemetry>
 - Langfuse metrics: <https://langfuse.com/docs/metrics/overview>
+- Langfuse monitors: <https://langfuse.com/docs/metrics/features/monitors>
 - Langfuse scores: <https://langfuse.com/docs/evaluation/scores/overview>
 - Langfuse datasets: <https://langfuse.com/docs/evaluation/experiments/datasets>
 - Langfuse experiments via SDK: <https://langfuse.com/docs/evaluation/experiments/experiments-via-sdk>

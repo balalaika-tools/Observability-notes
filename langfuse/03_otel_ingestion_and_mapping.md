@@ -1,6 +1,6 @@
 # OpenTelemetry Ingestion and Attribute Mapping
 
-Last verified against official Langfuse OpenTelemetry documentation on 2026-06-18.
+Last verified against official Langfuse OpenTelemetry documentation on 2026-07-20.
 
 ## Mental Model
 
@@ -96,7 +96,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 
-def configure_langfuse_otlp() -> None:
+def configure_langfuse_otlp() -> TracerProvider:
     auth = b64encode(
         f"{os.environ['LANGFUSE_PUBLIC_KEY']}:{os.environ['LANGFUSE_SECRET_KEY']}".encode()
     ).decode()
@@ -122,9 +122,21 @@ def configure_langfuse_otlp() -> None:
         )
     )
     trace.set_tracer_provider(provider)
+    return provider
 ```
 
-This example creates a direct exporter from one Python process to Langfuse. In production, many teams export to a Collector first so redaction, retry, batching, and routing policy are centralized.
+This example creates a direct exporter from one Python process to Langfuse. Retain the returned provider and flush it in short-lived work:
+
+```python
+provider = configure_langfuse_otlp()
+try:
+    run_job()
+finally:
+    provider.force_flush(timeout_millis=30_000)
+    provider.shutdown()
+```
+
+`BatchSpanProcessor` exports asynchronously. Without `force_flush()` or `shutdown()`, the last batch from a CLI, test, worker, or serverless invocation can remain in memory when the process exits. In long-running services, call `shutdown()` once from the process lifespan hook. In production, many teams export to a Collector first so redaction, retry, batching, and routing policy are centralized.
 
 ## Span Attributes for Langfuse
 
@@ -265,7 +277,7 @@ Recommended production options:
 
 ## Collector Routing
 
-A common production pattern sends all traces to the central tracing backend and only LLM or agent traces to Langfuse.
+A common production pattern sends all traces to the central tracing backend and complete LLM/agent traces to Langfuse. Route at the receiver or whole-trace boundary. Do not filter individual spans merely because they lack a generation attribute.
 
 ```yaml
 receivers:
@@ -275,6 +287,12 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
+  otlp/llm:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4327
+      http:
+        endpoint: 0.0.0.0:4328
 
 processors:
   memory_limiter:
@@ -283,12 +301,6 @@ processors:
   batch:
     timeout: 5s
     send_batch_size: 1024
-  filter/llm:
-    error_mode: ignore
-    traces:
-      span:
-        - 'attributes["gen_ai.operation.name"] == nil and attributes["langfuse.observation.type"] == nil'
-
 exporters:
   otlphttp/langfuse:
     endpoint: https://cloud.langfuse.com/api/public/otel
@@ -303,16 +315,16 @@ exporters:
 service:
   pipelines:
     traces/main:
-      receivers: [otlp]
+      receivers: [otlp, otlp/llm]
       processors: [memory_limiter, batch]
       exporters: [otlp/main_traces]
     traces/langfuse:
-      receivers: [otlp]
-      processors: [memory_limiter, filter/llm, batch]
+      receivers: [otlp/llm]
+      processors: [memory_limiter, batch]
       exporters: [otlphttp/langfuse]
 ```
 
-Be careful with span-level filtering. Langfuse needs a root span to construct the trace correctly, so filtering only leaf generations can produce incomplete traces. A safer pattern is to mark an entire workflow as LLM-related at the root and propagate that marker.
+LLM services send all spans to port 4327/4328; ordinary services use 4317/4318. Both receiver streams reach the main backend, while only the complete LLM-service stream reaches Langfuse. Protect both receivers on the private network. If one service mixes LLM and non-LLM workflows and volume requires selective routing, use trace-ID-aware routing plus tail/whole-trace policy. A root marker such as `llm.workflow=true` must be propagated to all spans or evaluated by a trace-aware component; a span-level filter on that marker still drops unmarked parents and children.
 
 Architecture responsibilities:
 
@@ -325,6 +337,153 @@ Architecture responsibilities:
 | Langfuse | Map spans into LLM traces, observations, metrics, and evaluation workflows. |
 
 Use Collector filtering when platform teams need centralized routing or cost control. Use SDK `should_export_span` when one Python/JS service needs local control over which spans Langfuse receives.
+
+## Raw-OTLP Dataset Experiment
+
+Use the Langfuse experiment runner in Python or TypeScript when possible. For another runtime that emits raw OTLP, model each dataset item as a separate root trace. Never create one enclosing span for the whole experiment.
+
+The following Python example shows the wire contract. `BaggageSpanProcessor` copies only the listed experiment keys to new spans:
+
+```python
+import json
+import os
+from base64 import b64encode
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+import httpx
+from opentelemetry import baggage, context, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+
+class ExperimentBaggageSpanProcessor(SpanProcessor):
+    ALLOWED_PREFIXES = ("langfuse.experiment.",)
+    ALLOWED_KEYS = {"langfuse.environment"}
+
+    def on_start(self, span, parent_context=None):
+        ctx = parent_context or context.get_current()
+        for key, value in baggage.get_all(context=ctx).items():
+            if key in self.ALLOWED_KEYS or key.startswith(self.ALLOWED_PREFIXES):
+                span.set_attribute(key, value)
+
+    def on_end(self, span):
+        pass
+
+    def shutdown(self):
+        pass
+
+    def force_flush(self, timeout_millis=30_000):
+        return True
+
+
+@dataclass(frozen=True)
+class Item:
+    id: str
+    version: datetime
+    input: dict
+    expected_output: dict
+    metadata: dict
+
+
+auth = b64encode(
+    f"{os.environ['LANGFUSE_PUBLIC_KEY']}:{os.environ['LANGFUSE_SECRET_KEY']}".encode()
+).decode()
+provider = TracerProvider()
+provider.add_span_processor(ExperimentBaggageSpanProcessor())
+provider.add_span_processor(
+    BatchSpanProcessor(
+        OTLPSpanExporter(
+            endpoint=(
+                f"{os.environ['LANGFUSE_BASE_URL'].rstrip('/')}"
+                "/api/public/otel/v1/traces"
+            ),
+            headers={
+                "Authorization": f"Basic {auth}",
+                "x-langfuse-ingestion-version": "4",
+            },
+        )
+    )
+)
+trace.set_tracer_provider(provider)
+tracer = provider.get_tracer("raw-otel-experiment")
+dataset_version = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+
+experiment_ctx = context.Context()  # No active span: every item starts a new trace.
+for key, value in {
+    "langfuse.experiment.id": "exp-support-rag-v18",
+    "langfuse.experiment.name": "support-rag-prompt-v18",
+    "langfuse.experiment.dataset.id": "dataset-id-from-langfuse",
+    "langfuse.experiment.description": "Pinned dataset regression",
+    "langfuse.experiment.metadata.candidate": "prompt-v18",
+    "langfuse.environment": "experiment",
+}.items():
+    experiment_ctx = baggage.set_baggage(key, value, context=experiment_ctx)
+
+
+def run_item(item: Item) -> None:
+    root = tracer.start_span("experiment-item", context=experiment_ctx)
+    trace_id = format(root.get_span_context().trace_id, "032x")
+    root_span_id = format(root.get_span_context().span_id, "016x")
+    item_version = item.version.isoformat()
+
+    item_attributes = {
+        "langfuse.experiment.item.id": item.id,
+        "langfuse.experiment.item.root_observation_id": root_span_id,
+        "langfuse.experiment.item.version": item_version,
+    }
+    for key, value in item_attributes.items():
+        root.set_attribute(key, value)
+    root.set_attribute("langfuse.observation.input", json.dumps(item.input))
+    root.set_attribute(
+        "langfuse.experiment.item.expected_output",
+        json.dumps(item.expected_output),
+    )
+    root.set_attribute(
+        "langfuse.experiment.item.metadata.segment",
+        str(item.metadata["segment"]),
+    )
+
+    item_ctx = experiment_ctx
+    for key, value in item_attributes.items():
+        item_ctx = baggage.set_baggage(key, value, context=item_ctx)
+    item_ctx = trace.set_span_in_context(root, item_ctx)
+
+    token = context.attach(item_ctx)
+    try:
+        # Instrumented child generations/tools inherit experiment and item baggage.
+        output = run_instrumented_task(item.input)
+        root.set_attribute("langfuse.observation.output", json.dumps(output))
+    finally:
+        context.detach(token)
+        root.end()
+
+    # Scores target both the item trace and its root observation.
+    httpx.post(
+        f"{os.environ['LANGFUSE_BASE_URL']}/api/public/scores",
+        auth=(os.environ["LANGFUSE_PUBLIC_KEY"], os.environ["LANGFUSE_SECRET_KEY"]),
+        json={
+            "traceId": trace_id,
+            "observationId": root_span_id,
+            "name": "required_citations_present",
+            "value": 1,
+            "dataType": "BOOLEAN",
+        },
+        timeout=10,
+    ).raise_for_status()
+
+
+try:
+    for item in pinned_items:
+        assert item.version == dataset_version
+        run_item(item)
+finally:
+    provider.force_flush(timeout_millis=30_000)
+    provider.shutdown()
+```
+
+Register `ExperimentBaggageSpanProcessor` before starting any spans. For a Langfuse-managed dataset, use the dataset and item IDs returned by Langfuse and set every item's `version` to the exact fetched dataset version timestamp. Local datasets may use stable local correlation IDs but must omit item version. Input, actual output, and expected output belong on the item root; experiment/item identity belongs in baggage so child spans participate in the same experiment.
 
 ## Request/Response Shape for OTLP
 
@@ -375,6 +534,7 @@ The real OTLP encoding may be protobuf or JSON, but the semantic contract is the
 - Using legacy `gen_ai.system` for new instrumentation instead of `gen_ai.provider.name`.
 - Sending raw prompts, retrieved documents, or user data without privacy review.
 - Filtering out the root span in the Collector.
+- Using attribute path segments named `__proto__`, `constructor`, or `prototype`. Langfuse silently drops those segments; rename them during normalization, for example to `proto_name`, `constructor_name`, or `prototype_name`.
 - Treating Langfuse as a metrics backend for all OTel metrics. Langfuse is trace and LLM workflow focused; send operational metrics to a metrics backend.
 
 ## Troubleshooting

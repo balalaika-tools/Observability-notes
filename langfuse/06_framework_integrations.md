@@ -1,6 +1,6 @@
 # Framework Integrations
 
-Last verified against official Langfuse integration docs on 2026-06-18.
+Last verified against official Langfuse integration documentation on 2026-07-20.
 
 ## Mental Model
 
@@ -28,6 +28,19 @@ They solve "capture the internals I already delegated to this framework." They d
 | Existing OpenTelemetry instrumentation | OTLP/HTTP to Langfuse, preferably through the Collector |
 | Mixed custom code plus framework calls | Wrap the workflow with Langfuse SDK spans and pass the integration callback inside the active context |
 
+## Tested Versions and Support Boundaries
+
+Use a lockfile and rerun trace-shape tests on every integration upgrade. This guide's July 20, 2026 baseline is:
+
+| Integration | Compatible baseline for these examples | Sync / async / streaming | Boundary and shutdown rule |
+| --- | --- | --- | --- |
+| LangChain/LangGraph callback | `langfuse>=4.14,<5`, `langchain>=1,<2`, `langchain-openai>=1,<2`, `langgraph>=1,<2` | `invoke`/`ainvoke`, batch, stream/astream are supported by the callback | Framework-created generations only; flush in CLI, worker, and serverless exits. |
+| Langfuse OpenAI wrapper | `langfuse>=4.14,<5`, `openai>=1.92,<3` | Sync, async, functions/tools, and streaming; request `stream_options={"include_usage": True}` for streamed usage | Stable OpenAI client APIs are supported. Assistants API is not; beta APIs may require manual `@observe`. Flush short-lived processes. |
+| LiteLLM `langfuse_otel` | `langfuse>=4.14,<5`, `litellm>=1.65,<2`, matched OTel SDK/exporter packages | Sync/async/streaming depends on the LiteLLM call/proxy path; validate usage on the final stream chunk | The published integration does not promise one universal minimum LiteLLM release; pin the exact tested proxy/SDK build and flush/shut down its OTel provider on short-lived exits. |
+| OpenInference or other OTel-native instrumentation | `langfuse>=4.14,<5` for prompt propagation; `opentelemetry-sdk>=1.39,<2` with matching `0.60b0+` instrumentation | Determined by that instrumentor; test sync, async, and streaming separately | Only accepted spans with correct GenAI/Langfuse mapping appear. Force-flush the provider in serverless/batch jobs. |
+
+The ranges are compatibility bounds, not permission to resolve new dependencies during deployment. Lock an exact set after the smoke tests pass. If a package's official page does not publish a minimum version for a feature, the locked, staging-tested version is the support contract.
+
 Decision points:
 
 - Prefer the integration closest to the model call when you mainly need provider prompt/output/usage/cost.
@@ -35,6 +48,46 @@ Decision points:
 - Prefer gateway instrumentation when many services share one model gateway and application changes are expensive.
 - Prefer raw OTel when platform teams need runtime-neutral routing and Collector controls.
 - Avoid double-instrumenting the same model call unless you intentionally want both views and know how to de-duplicate analysis.
+
+## Link Managed Prompts Through Auto-Instrumentation
+
+Python SDK 4.14.0 or later can propagate a managed prompt to generations created by integrations that do not expose a Langfuse `prompt=` parameter:
+
+```python
+from langfuse import get_client, propagate_attributes
+
+langfuse = get_client()
+prompt = langfuse.get_prompt("support-answer", label="production")
+compiled = prompt.compile(question="How do I reset SSO?")
+
+with propagate_attributes(prompt=prompt):
+    result = auto_instrumented_model_call(compiled)
+```
+
+Use the same scope directly around the call that creates generations:
+
+```python
+# LangChain or an OpenInference-instrumented provider
+with propagate_attributes(prompt=prompt):
+    result = chain.invoke(
+        {"question": "How do I reset SSO?"},
+        config={"callbacks": [CallbackHandler()]},
+    )
+
+# Langfuse OpenAI wrapper
+with propagate_attributes(prompt=prompt):
+    response = client.responses.create(model="gpt-4o-mini", input=compiled)
+
+# LiteLLM SDK with the langfuse_otel callback
+litellm.callbacks = ["langfuse_otel"]
+with propagate_attributes(prompt=prompt):
+    response = litellm.completion(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": compiled}],
+    )
+```
+
+Prompt propagation links only generation observations, not roots, chains, retrievers, agents, or tools. An explicit observation-level prompt always wins. A fallback prompt has no persisted Langfuse version and cannot be linked; skip propagation when `prompt.is_fallback` is true and record a bounded fallback flag instead.
 
 ## LangChain and LangGraph
 

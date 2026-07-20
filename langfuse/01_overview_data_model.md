@@ -1,6 +1,6 @@
 # Langfuse Overview and Data Model
 
-Last verified against official Langfuse documentation on 2026-06-18.
+Last verified against official Langfuse documentation on 2026-07-20.
 
 ## Mental Model
 
@@ -74,7 +74,7 @@ Examples:
 - A RAG answer that retrieves documents, reranks them, calls a model, validates output, and stores feedback.
 - An agent task with planning, tool calls, retries, and final synthesis.
 
-Langfuse traces share IDs with OpenTelemetry traces. The trace record can hold:
+In the v4/Fast Preview observation-first model, a trace is primarily the correlation envelope identified by the OpenTelemetry trace ID. The observations carry the work and payload. Shared trace dimensions include:
 
 - `name`
 - `userId`
@@ -83,14 +83,15 @@ Langfuse traces share IDs with OpenTelemetry traces. The trace record can hold:
 - `version`
 - `tags`
 - trace-level `metadata`
-- trace-level input and output
+
+The input and output of the root observation are the current source of trace input and output. Older ingestion paths may still expose separately written trace-level input/output fields for compatibility, but new v4 instrumentation should not write two competing copies.
 
 Use a trace name for the product workflow, such as `chat.answer`, `support.agent`, or `code_review.generate`, not for high-cardinality values.
 
 Layered explanation:
 
 - Beginner intuition: one trace is one story from request to result.
-- Technical mechanics: Langfuse uses the OpenTelemetry trace ID; trace fields are derived from Langfuse SDK helpers or `langfuse.*` span attributes.
+- Technical mechanics: Langfuse uses the OpenTelemetry trace ID to correlate observations; the root observation supplies current trace I/O, while propagated attributes supply shared dimensions.
 - Production implications: root trace names, release/version, environment, user/session, and tags decide whether dashboards and incident filters work.
 - Common mistakes: naming traces with request IDs, setting trace attributes only on a leaf span, and failing to separate release from prompt/workflow version.
 
@@ -131,10 +132,12 @@ A generation is a special observation for model calls. It should include:
 - input messages or prompt
 - output text or structured output
 - token usage via `usage_details`
-- optional cost details if your system computes custom cost
+- optional cost details when you must override inferred pricing
 - provider and request metadata when useful
 
 Generations are where most LLM debugging starts: prompt, model, retrieved context, tool state, token usage, latency, and final output all meet there.
+
+Langfuse can infer usage when it has a tokenizer and can infer cost when usage plus a matching model-price definition are available. Provider/SDK-supplied usage is preferred to inferred usage. User-supplied `usage_details` and `cost_details` take precedence over inferred values; supplied cost is used verbatim, so provide it only for an authoritative provider charge or custom agreement. Usage detail buckets must be mutually exclusive or totals and inferred cost can be double-counted.
 
 Layered explanation:
 
@@ -260,13 +263,72 @@ Layered explanation:
 
 Prompt management lets you version prompts independently from application code. In production, connect prompt versions to traces so quality, latency, and cost can be compared across prompt changes.
 
-A useful prompt workflow:
+A runnable production workflow fetches the `production` label (the default), compiles variables, and links the returned prompt object to the exact generation:
+
+```python
+from langfuse import get_client
+from openai import OpenAI
+
+langfuse = get_client()
+openai = OpenAI()
+
+prompt = langfuse.get_prompt(
+    "support-answer",
+    label="production",       # Or use version=17 for a pinned rollout/experiment.
+    cache_ttl_seconds=300,
+)
+compiled = prompt.compile(question="How do I reset SSO?")
+
+with langfuse.start_as_current_observation(
+    as_type="generation",
+    name="support-answer",
+    model="gpt-4o-mini",
+    input=compiled,
+    prompt=prompt,             # Links this persisted name/version.
+) as generation:
+    response = openai.responses.create(model="gpt-4o-mini", input=compiled)
+    generation.update(output=response.output_text)
+```
+
+For a third-party integration that creates the generation, Python SDK 4.14.0 or later can propagate the prompt link:
+
+```python
+from langfuse import propagate_attributes
+from langfuse.openai import OpenAI
+
+client = OpenAI()
+prompt = langfuse.get_prompt("support-answer", label="production")
+
+with propagate_attributes(prompt=prompt):
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt.compile(question="How do I reset SSO?"),
+    )
+```
+
+Propagation links only generation observations. A prompt set explicitly on a generation wins over the propagated prompt.
+
+Prompt fetches use a client cache. Fresh entries return locally; expired entries can be served stale while background revalidation runs. Pre-fetch at startup if an instance must not accept traffic without the managed prompt. A `fallback=` value covers a first fetch when both cache and network are unavailable:
+
+```python
+prompt = langfuse.get_prompt(
+    "support-answer",
+    label="production",
+    fallback="Answer this support question: {{question}}",
+)
+compiled = prompt.compile(question="How do I reset SSO?")
+```
+
+Check `prompt.is_fallback`. A fallback has no persisted Langfuse prompt version and cannot be linked to a generation; omit `prompt=prompt` and do not propagate it. Record a bounded `promptFallback=true` metadata flag and alert on fallback use instead.
+
+A useful prompt lifecycle is:
 
 1. Store prompt templates in Langfuse.
-2. Fetch the version your environment should use.
-3. Include the prompt name and version on traces or observations.
-4. Run experiments before promotion.
-5. Watch quality and cost after release.
+2. Point a protected or controlled environment label at the approved version.
+3. Fetch that label, or pin an immutable version for an experiment.
+4. Link the returned prompt object to generation observations.
+5. Run experiments before promotion.
+6. Watch quality and cost after release.
 
 ### Datasets and Experiments
 
@@ -307,6 +369,7 @@ This compact shape gives future debuggers enough evidence without turning Langfu
 ```json
 {
   "trace": {
+    "id": "9d1b6c3e7f9a4d8bb1e2c3a4f5d6e7a8",
     "name": "rag.answer",
     "user_id": "user_8f3a",
     "session_id": "chat_2026_06_18_001",
@@ -314,12 +377,19 @@ This compact shape gives future debuggers enough evidence without turning Langfu
     "version": "rag-prompt-v18",
     "tags": ["rag", "support"],
     "metadata": {
-      "environment": "prod",
       "tenantTier": "enterprise",
       "retrievalStrategy": "hybrid-v2"
-    }
+    },
+    "environment": "prod"
   },
   "observations": [
+    {
+      "type": "span",
+      "name": "rag.answer",
+      "parent_observation_id": null,
+      "input": {"question": "How do I reset SSO?"},
+      "output": {"answer": "Use Security settings [doc_001]."}
+    },
     {
       "type": "retriever",
       "name": "rag.retrieve",

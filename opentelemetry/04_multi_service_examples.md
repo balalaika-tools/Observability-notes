@@ -159,18 +159,28 @@ you need explicit control.
 import httpx
 from fastapi import FastAPI, Request
 from opentelemetry import baggage, context, trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.propagate import inject
 
 app = FastAPI()
 tracer = trace.get_tracer(__name__)
+HTTPXClientInstrumentor().instrument()
+FastAPIInstrumentor.instrument_app(app)
 
 
 @app.post("/chat")
 async def chat(request: Request) -> dict:
     body = await request.json()
-    session_id = body["session_id"]
-    tenant_tier = body.get("tenant_tier", "free")
-    experiment = body.get("experiment_variant", "control")
+    identity = authenticate_request(request)
+    session_id = load_authorized_session(identity, body["session_id"])
+    tenant_tier = identity.tenant_tier
+    experiment = experiment_service.variant_for(identity.user_id, "chat-prompt")
+
+    # Validate even server-derived values before they become propagating headers.
+    session_id = validate_baggage_value(session_id, max_length=128)
+    tenant_tier = validate_enum(tenant_tier, {"free", "pro", "enterprise"})
+    experiment = validate_enum(experiment, {"control", "prompt-v2"})
 
     ctx = baggage.set_baggage("app.session.id", session_id)
     ctx = baggage.set_baggage("app.tenant.tier", tenant_tier, context=ctx)
@@ -220,6 +230,8 @@ Important details:
 - The request body does not carry tracing metadata.
 - `context.detach(token)` prevents baggage from leaking into unrelated requests.
 - Baggage values are safe categories or opaque IDs, not raw user content.
+- FastAPI creates the gateway `SERVER` span; HTTPX creates each outbound `CLIENT` span and also injects context. The explicit `inject()` calls make the carrier visible but are redundant once HTTPX instrumentation is verified.
+- `session_id` is length/character validated and ownership checked. Tenant tier and experiment assignment come from trusted server state rather than caller-selected request fields.
 
 ## Downstream Service With Manual Extraction
 
@@ -228,10 +240,12 @@ Manual extraction:
 ```python
 from fastapi import FastAPI, Request
 from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.propagate import extract
 
 app = FastAPI()
 tracer = trace.get_tracer(__name__)
+FastAPIInstrumentor.instrument_app(app)
 
 
 @app.post("/search")
@@ -380,14 +394,33 @@ from opentelemetry.propagate import extract, inject
 
 
 def publish_job(queue, payload: dict) -> None:
-    headers: dict[str, str] = {}
-    inject(headers)
-    queue.publish(payload, headers=headers)
+    with tracer.start_as_current_span(
+        "orders publish",
+        kind=trace.SpanKind.PRODUCER,
+        attributes={
+            "messaging.system": "rabbitmq",
+            "messaging.destination.name": "orders",
+            "messaging.operation.type": "publish",
+        },
+    ) as producer:
+        headers: dict[str, str] = {}
+        # Inject from the active PRODUCER span, not its parent request span.
+        inject(headers)
+        queue.publish(payload, headers=headers)
 
 
 def consume_job(message) -> None:
     parent_ctx = extract(message.headers)
-    with tracer.start_as_current_span("worker.process_job", context=parent_ctx):
+    with tracer.start_as_current_span(
+        "orders process",
+        context=parent_ctx,
+        kind=trace.SpanKind.CONSUMER,
+        attributes={
+            "messaging.system": "rabbitmq",
+            "messaging.destination.name": "orders",
+            "messaging.operation.type": "process",
+        },
+    ):
         process(message.payload)
 ```
 
@@ -395,8 +428,8 @@ This creates a parent-child relationship:
 
 ```text
 POST /chat
-  queue publish
-    worker.process_job
+  orders publish             PRODUCER
+    orders process           CONSUMER
 ```
 
 Use this when the worker job is causally part of the same request.
