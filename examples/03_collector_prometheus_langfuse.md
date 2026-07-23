@@ -395,6 +395,16 @@ service:
 
 The general trace backend receives `attributes/redact_payloads`; Langfuse does not, because masked LLM payloads are useful there. Both paths still remove credentials, database statements, exception messages, and sensitive event attributes. The logs pipeline replaces bodies entirely in this safe-default template because the span `attributes` processor cannot rewrite log bodies. Replace that rule only with a tested structured-log allowlist.
 
+The tail sampler in this configuration belongs only to `traces/langfuse`.
+The `logs` pipeline does not receive its keep/drop decision. A log can therefore
+retain a `trace_id` for a trace rejected from Langfuse, even though this example's
+unsampled `traces/main` pipeline may still retain that trace in the general
+backend. If every trace destination uses tail sampling, the same log can remain
+when no trace backend has the trace. See
+[Trace Sampling Does Not Sample Logs](../opentelemetry/03_production_architecture.md#trace-sampling-does-not-sample-logs)
+for head-sampling filters, tail-aligned buffering tradeoffs, and the required
+relationship between error logs and span status.
+
 These lists are deny-by-key second lines of defense. Application code must allowlist captured content before it creates spans, especially on the richer Langfuse path. Add keys for every captured header and instrumentation library, then test canary secrets in span attributes, span events, exception data, and log bodies.
 
 `UnderscoreEscapingWithoutSuffixes` is explicit: dots and unsupported characters become underscores, while unit and counter-type suffixes are not added. Histogram structural series still use `_bucket`, `_count`, and `_sum`. The PromQL below is written for that strategy. If you choose the default `UnderscoreEscapingWithSuffixes`, regenerate and test every series name instead of copying these rules.

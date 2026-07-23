@@ -913,9 +913,15 @@ trace and span IDs in log fields -> correlation with traces
 
 ## Zero-Code Instrumentation
 
-Zero-code instrumentation launches your app through `opentelemetry-instrument`.
-It can install matching instrumentation packages and configure exporters through
-environment variables.
+Zero-code instrumentation removes framework instrumentor calls and most SDK
+setup from application code. Two commands have different jobs:
+
+- `opentelemetry-bootstrap` inspects packages in the active Python environment
+  and recommends or installs matching `opentelemetry-instrumentation-*`
+  packages.
+- `opentelemetry-instrument` configures the SDK from CLI options and environment
+  variables, discovers the installed instrumentors, and applies their runtime
+  hooks before starting the application command.
 
 Typical setup:
 
@@ -925,6 +931,21 @@ pip install opentelemetry-distro \
 
 opentelemetry-bootstrap -a install
 ```
+
+Running `opentelemetry-bootstrap` without arguments only prints the recommended
+instrumentation packages. `-a install` installs them. The launcher does not
+contain every FastAPI, HTTPX, SQLAlchemy, or Redis integration itself; the
+corresponding instrumentation package must exist in the environment.
+
+The practical difference is:
+
+| Concern | Programmatic setup | Zero-code launcher |
+| --- | --- | --- |
+| Provider and exporters | Python startup code constructs them. | Distro and environment variables configure them. |
+| Framework and client hooks | Code calls `FastAPIInstrumentor.instrument_app(app)`, `HTTPXClientInstrumentor().instrument()`, and similar methods. | Installed instrumentors are discovered and activated automatically. |
+| Instrumentation dependencies | Install each integration explicitly. | `opentelemetry-bootstrap -a install` can discover and install matching integrations. |
+| Custom processors and metric views | Direct control in Python. | Limited to what the distro and declarative configuration expose. |
+| Business spans and metrics | Written with the OTel API. | Still written with the OTel API; zero-code cannot infer `rag.retrieve` or other domain operations. |
 
 Run:
 
@@ -937,12 +958,32 @@ OTEL_LOGS_EXPORTER=none \
 opentelemetry-instrument uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
+With the appropriate packages installed, this can create inbound FastAPI server
+spans, outbound HTTP client spans, SQLAlchemy database spans, and Redis client
+spans without calls such as `FastAPIInstrumentor.instrument_app(app)` in
+`app.py`.
+
+Disable an installed integration without uninstalling its package by using its
+instrumentor entry-point name:
+
+```bash
+OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=urllib3,redis \
+opentelemetry-instrument uvicorn app:app
+```
+
+Do not normally activate the same integration both ways. Launching with
+`opentelemetry-instrument` while application code also calls that integration's
+`.instrument()` or `.instrument_app()` method can produce warnings, duplicate
+hooks, or duplicate spans. Manual business spans are different: they use the
+provider configured by the launcher and should remain in application code.
+
+For reproducible deployments, run bootstrap while resolving or building the
+environment, then lock the resulting instrumentation packages. Do not let each
+container startup discover and install a potentially different dependency set.
+
 Use zero-code when you want broad automatic coverage quickly. Use code-based
 setup when you need precise provider configuration, custom processors, explicit
 metric views, or controlled shutdown.
-
-Zero-code still benefits from manual spans and metrics. Manual instrumentation
-calls the OTel API and will use the provider that the launcher configured.
 
 ## Background Workers And Queues
 

@@ -917,6 +917,11 @@ Use structured logs in production:
 Use span events for events that are only meaningful inside a trace. Use logs
 for operational records you may want to query independently.
 
+Correlation is an identifier match, not a retention guarantee. A log can carry
+valid `trace_id` and `span_id` values even when sampling or backend retention
+later removes the corresponding trace. A log backend can therefore contain a
+correlated record for which the trace backend has no stored trace.
+
 ### Baggage
 
 Baggage is key-value context that propagates with a request across service

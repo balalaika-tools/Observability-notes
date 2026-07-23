@@ -194,6 +194,35 @@ service:
 The same receiver can feed all three pipelines. The processors and exporters
 should reflect each signal's needs.
 
+### CloudWatch Logs As A Destination
+
+The Collector Contrib distribution includes an `awscloudwatchlogs` exporter.
+It uses the default AWS credential chain and can create the configured log group
+and stream when they do not already exist:
+
+```yaml
+exporters:
+  awscloudwatchlogs:
+    log_group_name: "/services/{ServiceName}"
+    log_stream_name: "{InstanceId}"
+    region: "${env:AWS_REGION}"
+    log_retention: 30
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, batch]
+      exporters: [awscloudwatchlogs]
+```
+
+`{ServiceName}` and `{InstanceId}` are replaced from the corresponding resource
+attributes. `log_retention` applies only when the exporter creates a new log
+group; manage existing groups separately. Confirm that the deployed Collector
+distribution contains this exporter, grant only the required CloudWatch Logs
+permissions, and validate the config against the exact Collector release. The
+exporter's OpenTelemetry logging support is currently experimental.
+
 ## A Production Collector Config
 
 This example:
@@ -562,6 +591,141 @@ Tail sampling requirements:
 
 At scale, use trace-ID-aware load balancing before the tail-sampling tier so all
 spans for the same trace land on the same Collector instance.
+
+### Trace Sampling Does Not Sample Logs
+
+Sending traces and logs through the same Collector does not give them a shared
+sampling decision. Collector pipelines are signal-specific, and the standard
+tail-sampling processor operates on traces:
+
+```yaml
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [otlphttp/traces]
+
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awscloudwatchlogs]
+```
+
+Suppose the application emits this telemetry:
+
+```text
+trace abc123
+  span: POST /chat
+  log: request started, trace_id=abc123
+  log: provider call completed, trace_id=abc123
+```
+
+If `tail_sampling` rejects trace `abc123`, the log records still continue
+through the logs pipeline:
+
+```text
+CloudWatch Logs -> records with trace_id=abc123
+trace backend   -> no stored trace abc123
+```
+
+These are sometimes called orphan logs: their trace context is valid, but the
+corresponding trace was not retained. The shared Collector provides routing and
+correlation fields; it does not make storage retention atomic across signals.
+The same outcome is possible when a backend expires traces sooner than logs.
+
+#### Head Sampling And The Sampled Flag
+
+An OTel log record can contain `TraceId`, `SpanId`, and `TraceFlags`. With head
+sampling, the `SAMPLED` flag is known when the log is emitted. The OTel Logs SDK
+specification defines a development `trace_based` logger setting that drops a
+correlated log when it has a valid span ID and its sampled flag is unset.
+
+Use that behavior only when the chosen language SDK or logging bridge implements
+it and dropping those logs is intentional. It does not affect standalone logs
+without trace context, and it is not a universal Collector setting. For
+non-OTLP structured logs, include `trace_flags` as well as `trace_id` and
+`span_id` if downstream filtering needs the head decision.
+
+#### Tail Sampling Cannot Reuse The Head Decision
+
+Tail sampling decides after spans have reached the Collector. A log may already
+have been exported before that decision exists. In the common design where the
+SDK records all candidate traces, their logs arrive with the head sampled flag
+set; a later tail rejection cannot retroactively change that flag or recall the
+logs.
+
+Exact tail-aligned retention requires a stateful cross-signal component that:
+
+1. buffers logs by `trace_id`;
+2. waits for the trace sampling decision;
+3. releases or drops the buffered logs with that decision;
+4. handles untraced logs, late spans, timeouts, restarts, and missing decisions.
+
+That is custom infrastructure, not a normal pair of Collector pipelines. It
+adds memory pressure, log latency, ordering and recovery problems, and a larger
+temporary store of potentially sensitive data. Use it only when a strict
+retention requirement justifies that operational cost.
+
+#### Log Severity Is Not Span Status
+
+Log severity and span status are separate fields. This statement:
+
+```python
+logger.error("provider failed")
+```
+
+does not by itself set the active span to `ERROR`. A tail policy that keeps
+error-status traces needs the failed operation to record trace-side failure
+semantics:
+
+```python
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+tracer = trace.get_tracer(__name__)
+
+
+def call_provider_safely():
+    with tracer.start_as_current_span("provider.request") as span:
+        try:
+            return call_provider()
+        except Exception as exc:
+            span.record_exception(exc)
+            span.set_status(Status(StatusCode.ERROR))
+            span.set_attribute("error.type", type(exc).__qualname__)
+            logger.exception("provider call failed")
+            return None
+```
+
+An escaped exception may be recorded and marked `ERROR` automatically by an SDK
+context manager. When code catches the exception inside the span, as above,
+record the exception and final status explicitly if the operation truly failed.
+Do not mark every span as failed merely because it emitted an error-level log: a
+successful fallback can make the containing operation successful even though a
+child operation failed.
+
+#### Recommended Production Default
+
+Prefer independent, importance-aware retention:
+
+```text
+traces
+  -> keep 100% of failed and slow traces
+  -> keep traces with critical bounded attributes
+  -> probabilistically sample normal traffic
+
+logs
+  -> keep operational WARN/ERROR records
+  -> sample or drop noisy INFO/DEBUG records
+  -> redact sensitive bodies and attributes
+```
+
+Make important failures visible in both signals: emit a structured error log and
+set the relevant span status or bounded `error.type`. Accept that an ordinary
+informational log may point to a trace that was not retained. Correlation depends
+on correct trace context and backend retention, not on traces and logs passing
+through the same Collector.
 
 ## Metrics Are Not Sampled Traces
 
