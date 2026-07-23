@@ -269,6 +269,540 @@ Use links when there is a relationship but not a direct parent-child hierarchy.
 For example, a batch job that processes 100 messages may link to the producing
 spans rather than pretending one message is the parent of the whole batch.
 
+#### Complete Worked Trace
+
+The field list becomes easier to understand when every field belongs to one
+request. This teaching example deliberately includes:
+
+- a successful HTTP request with a failed child operation;
+- nested internal and client spans;
+- attributes, events, an exception, and span status;
+- a queue producer and a consumer in a new trace;
+- a span link between the two traces;
+- resource and instrumentation-scope metadata.
+
+The application accepts a chat request, retrieves context, calls an LLM twice,
+handles the provider failure, publishes an asynchronous result, and later
+persists that result:
+
+```text
+Trace A: 4bf92f3577b34da6a3ce929d0e0e4736
+
+POST /chat                                      SERVER    2.850 s  UNSET
+├── rag.retrieve                                INTERNAL  0.320 s  UNSET
+│   └── POST /vector-search                     CLIENT    0.280 s  UNSET
+├── chat claude-sonnet                          CLIENT    2.100 s  ERROR
+└── send exception-analysis-results             PRODUCER  0.040 s  UNSET
+
+Trace B: 9a82a1c307ab4f18b029d712f346a015
+
+process exception-analysis-results              CONSUMER  0.740 s  UNSET
+└── INSERT analysis_result                      CLIENT    0.120 s  UNSET
+
+process exception-analysis-results
+  -- link --> send exception-analysis-results in Trace A
+```
+
+Trace A is one tree because its spans share a trace ID and use parent-child
+relationships. The consumer intentionally starts Trace B as a new root. Its
+link preserves the causal relationship without pretending that work performed
+later by another process is nested synchronous work.
+
+Continuing the producer trace into the consumer is also valid for many
+single-message flows. A new trace plus a link is useful when the queue boundary
+is also a lifecycle boundary, or when one consumer operation represents a
+batch with several producing contexts. Choose one policy deliberately and
+apply it consistently.
+
+##### One Span With Every Major Field
+
+This is a normalized teaching representation of the failed LLM span. It is not
+literal OTLP JSON: OTLP uses its own protobuf/JSON encoding, and console
+exporters have a language-specific debug format.
+
+```json
+{
+  "identity": {
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "7e31fbd423ab9c11",
+    "parent_span_id": "00f067aa0ba902b7",
+    "trace_flags": "01",
+    "trace_state": ""
+  },
+  "name": "chat claude-sonnet",
+  "kind": "CLIENT",
+  "start_time": "2026-07-23T10:15:30.500Z",
+  "end_time": "2026-07-23T10:15:32.600Z",
+  "duration_ms": 2100,
+  "status": {
+    "code": "ERROR",
+    "description": "Bedrock failed after retries"
+  },
+  "attributes": {
+    "gen_ai.operation.name": "chat",
+    "gen_ai.provider.name": "aws.bedrock",
+    "gen_ai.request.model": "claude-sonnet",
+    "server.address": "bedrock-runtime.us-east-1.amazonaws.com",
+    "retry.count": 1,
+    "app.outcome": "provider_failed",
+    "error.type": "ProviderTimeoutError"
+  },
+  "events": [
+    {
+      "name": "request.sent",
+      "timestamp": "2026-07-23T10:15:30.520Z",
+      "attributes": {
+        "retry.attempt": 1
+      }
+    },
+    {
+      "name": "retry.scheduled",
+      "timestamp": "2026-07-23T10:15:31.300Z",
+      "attributes": {
+        "retry.next_attempt": 2,
+        "retry.delay_ms": 200,
+        "retry.reason": "provider_timeout"
+      }
+    },
+    {
+      "name": "request.sent",
+      "timestamp": "2026-07-23T10:15:31.500Z",
+      "attributes": {
+        "retry.attempt": 2
+      }
+    },
+    {
+      "name": "exception",
+      "timestamp": "2026-07-23T10:15:32.590Z",
+      "attributes": {
+        "exception.type": "ProviderTimeoutError",
+        "exception.message": "Bedrock request timed out on attempt 2",
+        "exception.stacktrace": "Traceback (most recent call last): ...",
+        "exception.escaped": false
+      }
+    }
+  ],
+  "links": [],
+  "dropped_attributes_count": 0,
+  "dropped_events_count": 0,
+  "dropped_links_count": 0,
+  "resource": {
+    "service.name": "chat-api",
+    "service.version": "1.0.0",
+    "deployment.environment.name": "development"
+  },
+  "instrumentation_scope": {
+    "name": "example.complete-trace",
+    "version": "1.0.0"
+  }
+}
+```
+
+Read it in layers:
+
+| Layer | Fields | Meaning |
+| --- | --- | --- |
+| Identity and position | `trace_id`, `span_id`, `parent_span_id`, trace flags and state | Which trace this operation belongs to, where it sits in the tree, and propagation/sampling state. |
+| Operation | `name`, `kind` | What happened and whether this process acted as server, client, internal code, producer, or consumer. |
+| Time | Start and end timestamps | The measured interval. Duration is normally derived from these timestamps rather than assigned by application code. |
+| Description | Attributes | Searchable facts about the operation as a whole. |
+| Timeline | Events | Timestamped facts that happened during the operation. |
+| Non-tree relationships | Links | Causal references that do not imply a parent-child interval. |
+| Outcome | Status | Whether this operation failed. The exception event explains the failure; status classifies the final outcome. |
+| Emitter identity | Resource and instrumentation scope | Which service emitted the span and which code created it. |
+| Data loss | Dropped counts | Whether SDK limits caused attributes, events, or links to be discarded. |
+
+The LLM child is `ERROR`, but the root HTTP span remains `UNSET` and records
+`http.response.status_code=202`. That is correct here: the application handled
+the provider failure and successfully accepted asynchronous work. A parent's
+status describes the parent operation, not the worst status among its children.
+
+The consumer span has a different trace ID and no parent, but contains this
+relationship:
+
+```json
+{
+  "name": "process exception-analysis-results",
+  "trace_id": "9a82a1c307ab4f18b029d712f346a015",
+  "parent_span_id": null,
+  "links": [
+    {
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "ae32b4f11d98c307",
+      "attributes": {
+        "link.type": "produced_by",
+        "messaging.message.id": "message-987"
+      }
+    }
+  ]
+}
+```
+
+##### Runnable Python Simulation
+
+This is a single-process simulation, not a substitute for FastAPI, HTTP client,
+SQS, LLM, and database instrumentations. It keeps the infrastructure fake so
+the span mechanics remain visible. It uses `SimpleSpanProcessor` only to make
+console output deterministic for a short-lived demo; production services
+normally use `BatchSpanProcessor` and OTLP.
+
+Use Python 3.11 or later:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install \
+  'opentelemetry-api>=1.39,<2' \
+  'opentelemetry-sdk>=1.39,<2'
+```
+
+Save the following as `complete_trace_demo.py` and run
+`python complete_trace_demo.py`:
+
+```python
+from __future__ import annotations
+
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any
+
+from opentelemetry import context as otel_context
+from opentelemetry import propagate, trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import (
+    ConsoleSpanExporter,
+    SimpleSpanProcessor,
+)
+from opentelemetry.trace import Link, SpanKind, Status, StatusCode
+
+
+resource = Resource.create(
+    {
+        "service.name": "chat-api",
+        "service.version": "1.0.0",
+        "deployment.environment.name": "development",
+    }
+)
+provider = TracerProvider(resource=resource)
+provider.add_span_processor(
+    SimpleSpanProcessor(ConsoleSpanExporter())
+)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("example.complete-trace", "1.0.0")
+
+
+class ProviderTimeoutError(TimeoutError):
+    pass
+
+
+@dataclass(frozen=True)
+class QueueMessage:
+    message_id: str
+    job_id: str
+    body: dict[str, Any]
+    headers: dict[str, str]
+
+
+def fake_vector_search(query: str) -> list[dict[str, Any]]:
+    time.sleep(0.01)
+    return [
+        {"id": f"doc-{index}", "score": 0.9 - index * 0.05}
+        for index in range(1, 6)
+    ]
+
+
+def fake_llm_call(attempt: int) -> str:
+    time.sleep(0.01)
+    raise ProviderTimeoutError(
+        f"Bedrock request timed out on attempt {attempt}"
+    )
+
+
+def retrieve_documents(query: str) -> list[dict[str, Any]]:
+    with tracer.start_as_current_span(
+        "rag.retrieve",
+        kind=SpanKind.INTERNAL,
+        attributes={
+            "rag.query.length": len(query),
+            "rag.top_k": 5,
+            "rag.reranking.enabled": True,
+        },
+    ) as retrieval_span:
+        with tracer.start_as_current_span(
+            "POST /vector-search",
+            kind=SpanKind.CLIENT,
+            attributes={
+                "http.request.method": "POST",
+                "url.full": (
+                    "https://retrieval-service/vector-search"
+                ),
+                "server.address": "retrieval-service",
+                "server.port": 443,
+            },
+        ) as client_span:
+            documents = fake_vector_search(query)
+            client_span.set_attribute(
+                "http.response.status_code", 200
+            )
+
+        retrieval_span.add_event(
+            "reranking.completed",
+            {
+                "rag.documents.before": 20,
+                "rag.documents.after": len(documents),
+                "rag.reranker.model": "cohere-rerank-v3",
+            },
+        )
+        retrieval_span.set_attribute(
+            "rag.documents.returned", len(documents)
+        )
+        retrieval_span.set_attribute("app.outcome", "success")
+        return documents
+
+
+def call_llm_with_retry(prompt: str) -> str | None:
+    with tracer.start_as_current_span(
+        "chat claude-sonnet",
+        kind=SpanKind.CLIENT,
+        attributes={
+            "gen_ai.operation.name": "chat",
+            "gen_ai.provider.name": "aws.bedrock",
+            "gen_ai.request.model": "claude-sonnet",
+            "server.address": (
+                "bedrock-runtime.us-east-1.amazonaws.com"
+            ),
+            "app.prompt.length": len(prompt),
+        },
+    ) as span:
+        for attempt in (1, 2):
+            span.add_event(
+                "request.sent", {"retry.attempt": attempt}
+            )
+            try:
+                return fake_llm_call(attempt)
+            except ProviderTimeoutError as exc:
+                if attempt == 1:
+                    span.add_event(
+                        "retry.scheduled",
+                        {
+                            "retry.next_attempt": 2,
+                            "retry.delay_ms": 5,
+                            "retry.reason": "provider_timeout",
+                        },
+                    )
+                    time.sleep(0.005)
+                    continue
+
+                # The exception is handled inside this span, so record both
+                # its details and the operation's final status explicitly.
+                span.record_exception(
+                    exc,
+                    attributes={
+                        "retry.attempt": attempt,
+                        "exception.escaped": False,
+                    },
+                )
+                span.set_attribute("retry.count", attempt - 1)
+                span.set_attribute(
+                    "app.outcome", "provider_failed"
+                )
+                span.set_attribute(
+                    "error.type", type(exc).__qualname__
+                )
+                span.set_status(
+                    Status(
+                        StatusCode.ERROR,
+                        description="Bedrock failed after retries",
+                    )
+                )
+                return None
+
+    raise AssertionError("unreachable")
+
+
+def publish_result(
+    *, job_id: str, result: dict[str, Any]
+) -> QueueMessage:
+    message_id = str(uuid.uuid4())
+
+    with tracer.start_as_current_span(
+        "send exception-analysis-results",
+        kind=SpanKind.PRODUCER,
+        attributes={
+            "messaging.system": "aws_sqs",
+            "messaging.destination.name": (
+                "exception-analysis-results"
+            ),
+            "messaging.operation.name": "send",
+            "messaging.operation.type": "send",
+            "messaging.message.id": message_id,
+            "app.job.id": job_id,
+        },
+    ) as span:
+        time.sleep(0.005)
+        headers: dict[str, str] = {}
+        propagate.inject(headers)
+        span.add_event(
+            "message.published",
+            {
+                "messaging.message.body.size": len(
+                    str(result).encode()
+                )
+            },
+        )
+
+    return QueueMessage(
+        message_id=message_id,
+        job_id=job_id,
+        body=result,
+        headers=headers,
+    )
+
+
+def persist_result(result: dict[str, Any]) -> None:
+    with tracer.start_as_current_span(
+        "INSERT analysis_result",
+        kind=SpanKind.CLIENT,
+        attributes={
+            "db.system.name": "postgresql",
+            "db.namespace": "exception_management",
+            "db.operation.name": "INSERT",
+            "db.collection.name": "analysis_result",
+            "server.address": "results-db.internal",
+            "server.port": 5432,
+        },
+    ):
+        time.sleep(0.005)
+
+
+def consume_message(message: QueueMessage) -> None:
+    extracted = propagate.extract(message.headers)
+    producer_context = trace.get_current_span(
+        extracted
+    ).get_span_context()
+    producer_link = Link(
+        producer_context,
+        attributes={
+            "link.type": "produced_by",
+            "messaging.message.id": message.message_id,
+        },
+    )
+
+    # An empty Context prevents the producer from becoming the parent.
+    with tracer.start_as_current_span(
+        "process exception-analysis-results",
+        context=otel_context.Context(),
+        kind=SpanKind.CONSUMER,
+        links=[producer_link],
+        attributes={
+            "messaging.system": "aws_sqs",
+            "messaging.destination.name": (
+                "exception-analysis-results"
+            ),
+            "messaging.operation.name": "process",
+            "messaging.operation.type": "process",
+            "messaging.message.id": message.message_id,
+            "app.job.id": message.job_id,
+        },
+    ) as span:
+        span.add_event(
+            "message.received",
+            {"messaging.message.delivery_count": 1},
+        )
+        persist_result(message.body)
+
+
+def handle_chat_request(query: str) -> QueueMessage:
+    job_id = str(uuid.uuid4())
+    with tracer.start_as_current_span(
+        "POST /chat",
+        kind=SpanKind.SERVER,
+        attributes={
+            "http.request.method": "POST",
+            "http.route": "/chat",
+            "url.path": "/chat",
+            "url.scheme": "https",
+            "server.address": "chat-api",
+        },
+    ) as root_span:
+        root_span.add_event(
+            "request.validated",
+            {"validation.schema": "chat-request-v2"},
+        )
+        documents = retrieve_documents(query)
+        answer = call_llm_with_retry(
+            f"{query}\n\nRetrieved document count: {len(documents)}"
+        )
+
+        if answer is None:
+            result: dict[str, Any] = {
+                "status": "provider_failed",
+                "answer": None,
+            }
+            root_span.add_event(
+                "llm.unavailable",
+                {"fallback.action": "publish_failure_result"},
+            )
+        else:
+            result = {"status": "completed", "answer": answer}
+
+        message = publish_result(job_id=job_id, result=result)
+        root_span.set_attribute("http.response.status_code", 202)
+        root_span.set_attribute("app.job.id", job_id)
+        root_span.add_event(
+            "response.created",
+            {"response.mode": "async"},
+        )
+        return message
+
+
+def main() -> None:
+    message = handle_chat_request(
+        "How does OpenTelemetry tracing work?"
+    )
+    time.sleep(0.01)
+    consume_message(message)
+    provider.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+The console output will use generated IDs and actual measured timestamps, so it
+will not match the illustrative IDs above. Verify these invariants instead:
+
+- the first five spans share one trace ID and follow the shown parent IDs;
+- every span has its own span ID;
+- the LLM span has an exception event and `ERROR` status;
+- the root span remains `UNSET` with HTTP status `202`;
+- the consumer has a new trace ID, no parent, and one link to the producer;
+- the database span is a child of the consumer;
+- every span carries the simulation's `chat-api` resource; in a real
+  deployment, the worker would normally have its own service resource;
+- `get_tracer()` attaches the `example.complete-trace` instrumentation scope,
+  although some console-exporter versions omit it from their debug rendering.
+
+The SDK generates IDs, captures start and end times, calculates parentage from
+the active context, and tracks limit-related dropped counts. Instrumentation
+chooses the operation name and kind and adds domain attributes and events.
+Provider setup supplies the resource; `get_tracer()` supplies the
+instrumentation scope. Status can be explicit, or the Python context manager
+can record an escaped exception and set `ERROR` automatically. If code catches
+an exception inside the span, as this demo does for retry handling, record the
+exception and final error status explicitly.
+
+In a real service, let FastAPI/ASGI, HTTPX, the queue client, and the database
+instrumentation create their protocol spans and propagate context. Keep manual
+spans for business operations such as `rag.retrieve`. Export with OTLP through
+a batch processor, and never put raw prompts, retrieved documents, queue
+payloads, credentials, or personal data into general-purpose attributes.
+The GenAI and messaging conventions evolve faster than core tracing, so pin
+the convention version used by instrumentation packages and recheck these
+names during upgrades.
+
 ### Metrics
 
 Metrics are numerical measurements aggregated over time. They answer:
