@@ -1,6 +1,6 @@
 # Framework Integrations
 
-Last verified against official Langfuse integration documentation on 2026-07-20.
+Last verified against official Langfuse and OpenTelemetry documentation on 2026-07-24.
 
 ## Mental Model
 
@@ -17,6 +17,8 @@ framework/model gateway event
 
 They solve "capture the internals I already delegated to this framework." They do not know your product workflow, privacy policy, release strategy, feedback model, or which business decisions deserve spans. In production, the best pattern is often a manual root observation plus integration-generated children.
 
+The callback, wrapper, and SDK paths in this chapter are intentionally Langfuse-aware. If application tracing must remain backend-independent, use the OpenTelemetry-native path: emit standard OTel, `gen_ai.*`, and organization-owned `app.*` attributes to a Collector, then add Langfuse mappings only in its Langfuse pipeline. The complete implementation boundary is defined in [03_otel_ingestion_and_mapping.md#vendor-neutral-application-contract](03_otel_ingestion_and_mapping.md#vendor-neutral-application-contract).
+
 ## Integration Decision Table
 
 | Stack | Recommended integration |
@@ -25,7 +27,7 @@ They solve "capture the internals I already delegated to this framework." They d
 | OpenAI Python SDK | `langfuse.openai` drop-in wrapper |
 | LiteLLM Proxy | `langfuse_otel` callback in LiteLLM proxy config |
 | LiteLLM SDK | Langfuse LiteLLM SDK integration or OpenAI-compatible wrapper path |
-| Existing OpenTelemetry instrumentation | OTLP/HTTP to Langfuse, preferably through the Collector |
+| Existing vendor-neutral OpenTelemetry instrumentation | OTLP to a Collector; its Langfuse exporter uses OTLP/HTTP and destination-specific mappings |
 | Mixed custom code plus framework calls | Wrap the workflow with Langfuse SDK spans and pass the integration callback inside the active context |
 
 ## Tested Versions and Support Boundaries
@@ -37,7 +39,7 @@ Use a lockfile and rerun trace-shape tests on every integration upgrade. This gu
 | LangChain/LangGraph callback | `langfuse>=4.14,<5`, `langchain>=1,<2`, `langchain-openai>=1,<2`, `langgraph>=1,<2` | `invoke`/`ainvoke`, batch, stream/astream are supported by the callback | Framework-created generations only; flush in CLI, worker, and serverless exits. |
 | Langfuse OpenAI wrapper | `langfuse>=4.14,<5`, `openai>=1.92,<3` | Sync, async, functions/tools, and streaming; request `stream_options={"include_usage": True}` for streamed usage | Stable OpenAI client APIs are supported. Assistants API is not; beta APIs may require manual `@observe`. Flush short-lived processes. |
 | LiteLLM `langfuse_otel` | `langfuse>=4.14,<5`, `litellm>=1.65,<2`, matched OTel SDK/exporter packages | Sync/async/streaming depends on the LiteLLM call/proxy path; validate usage on the final stream chunk | The published integration does not promise one universal minimum LiteLLM release; pin the exact tested proxy/SDK build and flush/shut down its OTel provider on short-lived exits. |
-| OpenInference or other OTel-native instrumentation | `langfuse>=4.14,<5` for prompt propagation; `opentelemetry-sdk>=1.39,<2` with matching `0.60b0+` instrumentation | Determined by that instrumentor; test sync, async, and streaming separately | Only accepted spans with correct GenAI/Langfuse mapping appear. Force-flush the provider in serverless/batch jobs. |
+| OpenInference or other OTel-native instrumentation | `langfuse>=4.14,<5` for prompt propagation; `opentelemetry-sdk>=1.39,<2` with matching `0.60b0+` instrumentation | Determined by that instrumentor; test sync, async, and streaming separately | Only accepted spans with correct GenAI fields and destination mapping appear. Force-flush the provider in serverless/batch jobs. |
 
 The ranges are compatibility bounds, not permission to resolve new dependencies during deployment. Lock an exact set after the smoke tests pass. If a package's official page does not publish a minimum version for a feature, the locked, staging-tested version is the support contract.
 
@@ -340,20 +342,22 @@ Layered explanation:
 For OpenTelemetry-native or third-party auto-instrumentation libraries:
 
 1. Prefer the current OpenTelemetry GenAI semantic conventions.
-2. Route traces to Langfuse through OTLP/HTTP.
-3. Add Langfuse-specific attributes when you need first-class trace, observation, user, session, metadata, tags, release, or version fields.
-4. Send operational metrics to your metrics backend.
+2. Export standard OTel, `gen_ai.*`, and documented `app.*` attributes to an OpenTelemetry Collector.
+3. Route complete GenAI workflow traces—not only model-call leaf spans—into the Collector's Langfuse pipeline.
+4. Add `langfuse.*` attributes in that destination pipeline when first-class trace, observation, metadata, tags, release, version, or other Langfuse fields require an explicit mapping.
+5. Keep the original neutral attributes unchanged for other trace backends.
+6. Send operational metrics to your metrics backend.
 
 See [03_otel_ingestion_and_mapping.md](03_otel_ingestion_and_mapping.md) and [../opentelemetry/06_genai_and_llm_observability.md](../opentelemetry/06_genai_and_llm_observability.md).
 
-Legacy notes in this repo previously included OpenLLMetry and OpenLIT examples. Treat these as OpenTelemetry-native instrumentation choices: if they emit current OTel spans, route them to Langfuse via OTLP/HTTP and add Langfuse attributes where needed. Use the current project documentation for those packages before copying setup code, because auto-instrumentation package APIs change faster than the OTLP and Langfuse mapping layer.
+Legacy notes in this repo previously included OpenLLMetry and OpenLIT examples. Treat these as OpenTelemetry-native instrumentation choices: if they emit current OTel spans, route them to the Collector and apply Langfuse-specific enrichment only in its Langfuse pipeline. Use the current project documentation for those packages before copying setup code, because auto-instrumentation package APIs change faster than the OTLP and Langfuse mapping layer.
 
 Layered explanation:
 
 - Beginner intuition: if a library emits OTel GenAI spans, Langfuse can often ingest them.
-- Technical mechanics: Langfuse maps GenAI and `langfuse.*` span attributes into its data model.
-- Production implications: standard OTel gives portability, but Langfuse-specific attributes are still needed for first-class filtering, sessions, versions, and metadata.
-- Common mistakes: assuming all third-party spans are mapped perfectly, not preserving root spans through Collector filters, and missing provider/model/usage attributes.
+- Technical mechanics: Langfuse maps standard GenAI fields directly, while a destination-scoped Collector transform fills Langfuse-specific schema gaps.
+- Production implications: application instrumentation stays portable even when Langfuse-specific attributes are required for first-class filtering, versions, and metadata.
+- Common mistakes: adding vendor attributes inside otherwise neutral application code, assuming all third-party spans are mapped perfectly, not preserving root spans through Collector routing, and missing provider/model/usage attributes.
 
 ## Mixing Auto and Manual Instrumentation
 
@@ -384,7 +388,7 @@ Rules:
 | Manual root + OpenAI wrapper | You call OpenAI directly but need product context | Root span for request plus wrapper-created generation children. |
 | LiteLLM-only | You mainly need central model call logs across many apps | Proxy generations with app-provided user/session/tags where possible. |
 | LiteLLM + app spans | You need both central provider observability and business workflow traces | App root/tool/retriever spans plus gateway model spans; watch for duplication. |
-| Raw OTel integration | Existing library emits GenAI spans or app is non-Python/JS | OTel spans routed through Collector with Langfuse mapping attributes. |
+| Vendor-neutral raw OTel | Existing library emits GenAI spans or the app must remain backend-independent | Neutral OTel spans routed through the Collector; only the Langfuse pipeline adds Langfuse mapping attributes. |
 
 ## Troubleshooting
 
@@ -396,7 +400,7 @@ Rules:
 | OpenAI streaming usage missing | Usage not requested/handled for stream, or final empty choices chunk mishandled | Request usage where provider supports it and handle chunks with empty `choices`. |
 | Azure/OpenAI model names look wrong | Deployment name recorded without model name | Pass model metadata where the provider/framework supports it. |
 | LiteLLM traces lack product workflow | Gateway sees provider request but not application steps | Add manual app spans and pass user/session/tags through gateway metadata. |
-| OTel-native library spans are absent | SDK default filtering or Collector filter drops them | Add/extend `should_export_span` or Collector routing and preserve parent spans. |
+| OTel-native library spans are absent | Collector routing dropped the workflow or kept only model-call leaves | Route the complete GenAI trace and preserve root, parent, and business spans. |
 | Sensitive data captured by integration | Wrapper/callback captured provider inputs/outputs | Disable capture where supported, add SDK masking, or redact before model calls. |
 
 ## Integration Checklist
