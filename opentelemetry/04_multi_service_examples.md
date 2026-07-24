@@ -17,7 +17,7 @@ For HTTP, the carrier is usually request headers. For queues, it is usually
 message metadata. For gRPC, it is metadata. For custom transports, you choose a
 place to carry the context.
 
-## Target Architecture
+## 🗺️ Target Architecture
 
 Example application:
 
@@ -62,7 +62,7 @@ POST /chat                         gateway SERVER span
 The point is not the exact span names. The point is one `trace_id`, clear
 service boundaries, and enough business spans to explain the request.
 
-## Context vs Baggage
+## 🔗 Context vs Baggage
 
 Trace context and baggage travel together, but they mean different things.
 
@@ -95,7 +95,9 @@ Bad baggage:
 Baggage does not automatically become span attributes. You must explicitly copy
 allowlisted baggage keys into spans, metrics, or logs.
 
-## Shared Baggage Span Processor
+> ⚠️ **Watch out:** Baggage values never appear in traces or metrics on their own — if you need a baggage value in a span attribute, you must explicitly copy it, or use a span processor like the one below to do it automatically.
+
+## 🛠️ Shared Baggage Span Processor
 
 A span processor can copy allowlisted baggage values onto spans as they start.
 Register this in each service that wants those values to appear in traces.
@@ -148,7 +150,7 @@ Do not copy every baggage key. Treat baggage from external callers as untrusted.
 Use an application namespace such as `app.*`. Use `langfuse.*` only when you
 are intentionally setting Langfuse trace or observation fields.
 
-## Gateway With Manual Propagation
+## 🛠️ Gateway With Manual Propagation
 
 This example shows manual injection so the mechanics are visible. If FastAPI and
 HTTPX instrumentations are active, they usually create server/client spans and
@@ -229,11 +231,13 @@ Important details:
 - `inject(headers)` serializes trace context and baggage into HTTP headers.
 - The request body does not carry tracing metadata.
 - `context.detach(token)` prevents baggage from leaking into unrelated requests.
+
+> ⚠️ **Watch out:** Forgetting `context.detach(token)` in an async server causes baggage from one user's request to bleed into concurrent unrelated requests that share the same thread or task context.
 - Baggage values are safe categories or opaque IDs, not raw user content.
 - FastAPI creates the gateway `SERVER` span; HTTPX creates each outbound `CLIENT` span and also injects context. The explicit `inject()` calls make the carrier visible but are redundant once HTTPX instrumentation is verified.
 - `session_id` is length/character validated and ownership checked. Tenant tier and experiment assignment come from trusted server state rather than caller-selected request fields.
 
-## Downstream Service With Manual Extraction
+## 🛠️ Downstream Service With Manual Extraction
 
 Manual extraction:
 
@@ -281,7 +285,7 @@ async def search(request: Request) -> dict:
 Avoid creating a manual server span if the framework instrumentation already
 created one. Add internal business spans under the active server span instead.
 
-## Automatic Propagation
+## 🔄 Automatic Propagation
 
 With FastAPI and HTTPX instrumentation enabled:
 
@@ -305,7 +309,7 @@ with tracer.start_as_current_span("prompt.build") as span:
 This is the usual production shape. Manual `inject()` and `extract()` are for
 custom transports, queues, or tests.
 
-## What Headers Look Like
+## 📦 What Headers Look Like
 
 For HTTP, W3C Trace Context uses `traceparent`:
 
@@ -337,7 +341,9 @@ baggage: app.tenant.tier=enterprise,app.experiment.variant=reranker_b
 Do not log full inbound headers unless you redact first. Headers may contain
 credentials and baggage.
 
-## Correlate Traces, Logs, And Metrics
+> ⚠️ **Watch out:** Logging raw inbound headers leaks authorization tokens, cookies, and the full baggage string — always redact before logging headers in any context.
+
+## 🔗 Correlate Traces, Logs, And Metrics
 
 Inside any service, traces, metrics, and logs should share enough context to
 move between them during incidents.
@@ -385,7 +391,7 @@ This gives:
 Metric attributes should remain low-cardinality. Do not add trace IDs, user IDs,
 prompts, or full queries to metric attributes.
 
-## Propagation Through Queues
+## 🔄 Propagation Through Queues
 
 Queue propagation uses message headers or metadata:
 
@@ -434,7 +440,9 @@ POST /chat
 
 Use this when the worker job is causally part of the same request.
 
-## Span Links For Decoupled Work
+> 💡 **Key insight:** Call `inject(headers)` inside the PRODUCER span (not before it) so the consumer sees the PRODUCER as its parent — injecting from an outer span skips the queue boundary and produces a misleading trace shape.
+
+## 🔗 Span Links For Decoupled Work
 
 Sometimes a queued job is related but not a direct child:
 
@@ -467,7 +475,7 @@ def process_batch(messages: list) -> None:
 
 Links say "related to these contexts" without pretending there is one parent.
 
-## Async Tasks And Threads
+## 🔄 Async Tasks And Threads
 
 Context usually flows through normal async call paths, but it can be lost when
 work moves into background tasks, thread pools, subprocesses, or custom
@@ -496,7 +504,9 @@ def run_with_context(parent_ctx, payload: dict) -> None:
 If spans suddenly become roots when work leaves the request handler, suspect
 context loss.
 
-## Propagation Through gRPC And Custom Transports
+> 💡 **Key insight:** When spans unexpectedly start a new trace instead of being children, the root cause is almost always context lost at an async boundary — capture the context explicitly before handing off to a thread pool, executor, or background task.
+
+## 🔗 Propagation Through gRPC And Custom Transports
 
 For gRPC, use gRPC instrumentation where available. It should handle metadata
 injection and extraction.
@@ -525,7 +535,7 @@ Requirements for a custom carrier:
 - it must not expose tracing metadata to user-visible payloads;
 - it should survive serialization and broker hops.
 
-## Propagator Configuration
+## 🌐 Propagator Configuration
 
 All services should agree on propagators. Common setting:
 
@@ -539,7 +549,7 @@ format, traces will break at that boundary.
 During migrations, some teams configure multiple propagators. Be explicit and
 document the compatibility period.
 
-## Baggage And Langfuse Context
+## 🔗 Baggage And Langfuse Context
 
 For LLM applications, you often need user, session, release, prompt, or
 experiment context across spans.
@@ -567,7 +577,7 @@ Use `app.*` when the context is generally useful. Use `langfuse.*` when you are
 intentionally mapping fields into Langfuse. Do not put raw prompts or documents
 in baggage.
 
-## End-To-End Local Test
+## 🛠️ End-To-End Local Test
 
 To verify propagation locally:
 
@@ -585,7 +595,7 @@ Expected:
 - logs inside the request include the same trace ID;
 - metrics have route/model/outcome labels but not trace ID or user email.
 
-## Troubleshooting Broken Traces
+## 🔍 Troubleshooting Broken Traces
 
 Every service starts a new trace:
 
@@ -625,7 +635,7 @@ Queue jobs become root traces:
 - broker stripped metadata;
 - job is intentionally decoupled and should use span links instead.
 
-## Design Checklist
+## ✅ Design Checklist
 
 - Use auto-instrumentation for standard HTTP/gRPC/database/queue clients.
 - Add manual spans around business operations.

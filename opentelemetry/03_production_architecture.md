@@ -17,7 +17,7 @@ services
 This chapter explains how to design that pipeline so it is understandable,
 operable, and safe.
 
-## What The Collector Owns
+## 📦 What The Collector Owns
 
 The Collector owns shared telemetry policy. It should not own application
 meaning. Application services still create spans, metrics, logs, attributes, and
@@ -41,7 +41,9 @@ retrieval, an agent tool call, or an LLM generation, the app is under-
 instrumented. If every service hardcodes backend credentials and routing, the
 platform is under-architected.
 
-## Collector Components
+> 💡 **Key insight:** If the Collector has to infer what an operation was from raw attributes, your application is under-instrumented — span names and business attributes belong in the service, not in Collector transforms.
+
+## 📦 Collector Components
 
 Collector config is built from components. Components are configured at the top
 level and enabled in `service.pipelines`.
@@ -69,7 +71,7 @@ service:
 A configured component that is not referenced in a pipeline is not active.
 Processor order matters.
 
-## Common Topologies
+## 🗺️ Common Topologies
 
 ### Direct Export
 
@@ -158,7 +160,7 @@ Gateway:
 
 This pattern gives both local resilience and centralized policy.
 
-## Signal-Specific Pipelines
+## 🔀 Signal-Specific Pipelines
 
 Do not assume traces, metrics, and logs should travel to the same backend.
 
@@ -223,7 +225,7 @@ distribution contains this exporter, grant only the required CloudWatch Logs
 permissions, and validate the config against the exact Collector release. The
 exporter's OpenTelemetry logging support is currently experimental.
 
-## A Production Collector Config
+## 🛠️ A Production Collector Config
 
 This example:
 
@@ -384,6 +386,8 @@ This is the advertised destination-specific split in executable form. The same r
 
 "Rich" never means raw. Mask or allowlist question, prompt, document, tool, account, and output content in the application before it enters a span. Collector deletion by key cannot find a secret embedded inside an otherwise allowed JSON string. Test both destinations with canary API keys, emails, authorization headers, exception messages, span events, legacy LLM keys, Langfuse root/observation payloads, and log bodies.
 
+> ⚠️ **Watch out:** Collector `attributes` processors delete by key name only — a secret embedded inside a JSON string value passes through untouched; mask or redact sensitive content in application code before it enters a span attribute.
+
 Validate config before deploying:
 
 ```bash
@@ -394,7 +398,7 @@ In CI, validate every Collector config change. In production, deploy config
 changes gradually because a bad telemetry config can create blind spots during
 incidents.
 
-## Processor Order
+## 🔄 Processor Order
 
 A practical default order:
 
@@ -418,7 +422,7 @@ Reasons:
 Some processors are signal-specific. A processor referenced by multiple
 pipelines gets a separate instance per pipeline.
 
-## Langfuse In A Collector Pipeline
+## 🗄️ Langfuse In A Collector Pipeline
 
 Langfuse accepts traces through an OTLP HTTP endpoint. Use a Collector
 `otlphttp` exporter that points at the Langfuse OTEL base endpoint:
@@ -469,7 +473,7 @@ If you send the same raw trace stream to multiple backends, every backend gets
 the same sensitive attributes. Use a dedicated redacted pipeline when that is
 not acceptable.
 
-## Routing And Fan-Out
+## 🔀 Routing And Fan-Out
 
 Fan-out means sending one signal to multiple exporters:
 
@@ -497,7 +501,7 @@ Exact routing mechanics depend on Collector distribution and available
 processors/connectors. The design question is always the same: which backend is
 allowed to receive which attributes?
 
-## Sampling Strategy
+## 🎲 Sampling Strategy
 
 Sampling controls trace volume. It is not a substitute for metrics.
 
@@ -591,6 +595,8 @@ Tail sampling requirements:
 
 At scale, use trace-ID-aware load balancing before the tail-sampling tier so all
 spans for the same trace land on the same Collector instance.
+
+> ⚠️ **Watch out:** Tail sampling silently produces incomplete traces if spans for the same trace arrive at different Collector replicas — you must route by trace ID before the tail-sampling tier, not by standard round-robin.
 
 ### Trace Sampling Does Not Sample Logs
 
@@ -705,6 +711,8 @@ Do not mark every span as failed merely because it emitted an error-level log: a
 successful fallback can make the containing operation successful even though a
 child operation failed.
 
+> 💡 **Key insight:** `logger.error(...)` does not set the active span to ERROR — span status and log severity are completely independent fields that must both be set explicitly when an operation fails.
+
 #### Recommended Production Default
 
 Prefer independent, importance-aware retention:
@@ -727,7 +735,7 @@ informational log may point to a trace that was not retained. Correlation depend
 on correct trace context and backend retention, not on traces and logs passing
 through the same Collector.
 
-## Metrics Are Not Sampled Traces
+## 📊 Metrics Are Not Sampled Traces
 
 Do not build alerting totals only from sampled traces. A 5 percent trace sample
 cannot accurately tell you exact request volume, token volume, error rate, or
@@ -744,7 +752,7 @@ logs -> searchable local details and audit-style records
 Span-derived metrics can be useful for convenience, but they should be treated
 carefully if the traces are sampled before derivation.
 
-## Scaling The Collector
+## 🗺️ Scaling The Collector
 
 Scale the Collector like a production service.
 
@@ -783,7 +791,7 @@ Collector capacity depends on:
 Large attributes, especially LLM prompts and outputs, can dominate bandwidth and
 memory. Decide early where those payloads are allowed and how much to truncate.
 
-## Resilience And Backpressure
+## 🔀 Resilience And Backpressure
 
 Telemetry should help production; it should not take production down.
 
@@ -809,7 +817,7 @@ Understand failure modes:
 Telemetry loss is usually preferable to application downtime, but silent
 telemetry loss during an incident is painful. Alert on Collector self-telemetry.
 
-## Security And Privacy
+## 🔒 Security And Privacy
 
 Secure the Collector as production infrastructure:
 
@@ -842,7 +850,7 @@ afterthought. Decide which backend is allowed to receive prompt and completion
 payloads, how masking works, who can access the data, and how long it is
 retained.
 
-## Collector Self-Telemetry
+## 🔍 Collector Self-Telemetry
 
 The Collector emits its own logs and metrics. Scrape or export them.
 
@@ -867,7 +875,12 @@ Example operational alerts:
 - Tail sampling late decisions or policy errors.
 - OTLP receiver request errors or refused data.
 
-## Deployment Patterns
+## 🗺️ Deployment Patterns
+
+For copyable Docker and Kubernetes baselines, image/distribution selection,
+Helm-versus-Operator guidance, Service discovery, scaling, security, upgrades,
+and runbooks, use the dedicated
+[Collector Deployment Guide](deployment/README.md).
 
 ### Kubernetes
 
@@ -911,7 +924,7 @@ Serverless functions need special care:
 - managed layers or extensions may provide instrumentation;
 - keep payload capture small because invocation time matters.
 
-## Environment Separation
+## 🌐 Environment Separation
 
 Separate environments explicitly:
 
@@ -925,7 +938,7 @@ Do not mix staging and production in the same dashboards without a clear
 environment label. Do not use the same exporter credentials for all
 environments unless your backend permissions are intentionally shared.
 
-## Operational Checklist
+## ✅ Operational Checklist
 
 Before production:
 
@@ -952,7 +965,7 @@ During incidents:
 - Check recent deploys, prompt versions, model routes, and backend status.
 - Verify whether sampling or redaction changed visibility.
 
-## Production Failure Modes
+## 🔍 Production Failure Modes
 
 No telemetry reaches backend:
 
@@ -993,3 +1006,7 @@ Sensitive data appears in a backend:
 - Collector redaction ran after fan-out;
 - a backend received the raw pipeline instead of the redacted one;
 - prompts and outputs were enabled without a masking policy.
+
+**Next**: Apply this architecture with the
+[Collector Deployment Guide](deployment/README.md), then continue to
+[Multi-Service Examples](04_multi_service_examples.md).

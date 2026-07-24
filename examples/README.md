@@ -17,7 +17,7 @@ Then use these examples as implementation templates.
 | [02_multi_service_agent.md](02_multi_service_agent.md) | Gateway calling a bounded tool-using agent | Direct SDK tracing in both services |
 | [03_collector_prometheus_langfuse.md](03_collector_prometheus_langfuse.md) | Collector routing to Langfuse and Prometheus-compatible metrics | Centralized Collector export |
 
-## Install
+## 🛠️ Install
 
 The examples use Python 3.11 or later. These ranges keep the APIs used here compatible while allowing patch and minor security updates:
 
@@ -42,7 +42,9 @@ python -c 'import fastapi, httpx, langfuse, openai, opentelemetry.sdk'
 
 Lock the resolved versions in the application rather than resolving this range during every deployment. OpenTelemetry stable packages and beta instrumentation packages are released as matched sets: SDK `1.39.x` corresponds to instrumentation `0.60b0`, for example. Upgrade them together and run the smoke request for the relevant example.
 
-## Baseline Environment
+> 💡 **Key insight:** OpenTelemetry stable and beta instrumentation packages release as matched sets — upgrade SDK and instrumentation packages together and verify with a smoke request, not independently.
+
+## 🗺️ Baseline Environment
 
 Load credentials from secret management. Environment and release use Langfuse's first-class configuration fields:
 
@@ -57,9 +59,11 @@ export OPENAI_API_KEY="sk-proj-..."
 
 Do not substitute custom `ENVIRONMENT` or `RELEASE` metadata keys. `LANGFUSE_TRACING_ENVIRONMENT` and `LANGFUSE_RELEASE` populate the fields used by Langfuse filters and release analytics. OpenTelemetry resources use the separate `deployment.environment.name` and `service.version` attributes.
 
-## Bootstrap Profile A: Langfuse Direct Tracing and OTLP Metrics
+## 🏗️ Bootstrap Profile A: Langfuse Direct Tracing and OTLP Metrics
 
 Use this profile for examples 01 and 02. Langfuse owns trace batching and direct export. A separate OpenTelemetry `MeterProvider` sends unsampled operational metrics to a Collector. Do not install a second application `TracerProvider` for the same calls.
+
+> ⚠️ **Watch out:** A second application `TracerProvider` for the same calls creates duplicate generation spans and double-counts usage and cost.
 
 ```python
 # observability.py
@@ -111,9 +115,11 @@ def shutdown_observability() -> None:
 
 Initialize this module before instrumenting FastAPI or HTTPX. Call `shutdown_observability()` once from the FastAPI lifespan shutdown path, or in a `finally` block for a script.
 
-## Bootstrap Profile B: Centralized Collector Export
+## 🔀 Bootstrap Profile B: Centralized Collector Export
 
 Use this profile for example 03. One application-owned OpenTelemetry provider sends traces and metrics to the Collector; the Collector owns Langfuse authentication, redaction, sampling, retry, and fan-out. Do not also initialize a Langfuse direct trace exporter in that process.
+
+> ⚠️ **Watch out:** Do not initialize a Langfuse direct trace exporter alongside Profile B — the Collector owns Langfuse export in this setup, and using both creates duplicate spans.
 
 ```bash
 export OTEL_SERVICE_NAME="agent-service"
@@ -125,7 +131,7 @@ export OTEL_SEMCONV_STABILITY_OPT_IN="http"
 
 Configure one `TracerProvider` with an OTLP span exporter and one `MeterProvider` with an OTLP metric exporter, using [../opentelemetry/02_python_instrumentation.md](../opentelemetry/02_python_instrumentation.md). Shut down both providers once when the process exits.
 
-## Safe Capture Default
+## 🔒 Safe Capture Default
 
 Mask content before it reaches either an observation or a third-party auto-instrumentation layer. A practical default is an allowlist plus length limits:
 
@@ -156,7 +162,7 @@ The examples intentionally retain only these fields:
 
 Apply an export-stage masker as a second line of defense for spans created by integrations. Test the policy with representative secrets, PII, headers, exceptions, prompts, documents, tool results, and feedback.
 
-## Avoid Duplicate Capture
+## ⚠️ Avoid Duplicate Capture
 
 There are four different mechanisms to distinguish:
 
@@ -169,7 +175,9 @@ Collector fan-out --------------- copies an existing span to destinations
 
 Two exporters receiving the same span is intentional fan-out. Two instrumentations wrapping one model call creates two observations and double-counts usage and cost. Pick one generation owner per model call: a Langfuse wrapper, a framework callback, provider OTel instrumentation, or gateway instrumentation. Keep business/root spans from manual instrumentation and configure one global provider ownership model per process.
 
-## Run and Verify
+> 💡 **Key insight:** Two exporters on the same span is intentional fan-out; two instrumentations wrapping the same model call double-counts usage and cost — they look similar but have completely different effects.
+
+## ✅ Run and Verify
 
 Example 01:
 
@@ -205,7 +213,7 @@ promtool check rules alerts.yaml
 
 Send the policy fixtures from that example. Verify selected complete traces in Langfuse, all operational metrics in the Prometheus-compatible backend, normalized label names, Collector health, and no secret canary values at either destination.
 
-## Example Review Checklist
+## ✅ Example Review Checklist
 
 - Replace placeholder model names with models available in the provider account.
 - Keep one primary capture path per model call.

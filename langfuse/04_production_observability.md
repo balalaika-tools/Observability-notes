@@ -2,7 +2,7 @@
 
 Last verified against official Langfuse observability documentation on 2026-07-20.
 
-## Mental Model
+## 🧭 Mental Model
 
 Production Langfuse instrumentation should make real incidents and product questions easier to answer.
 
@@ -20,7 +20,9 @@ user impact / alert / feedback
 
 Langfuse solves "what happened inside the LLM workflow and was it good?" Native Monitors can notify on supported observation and score cost, latency, volume, and quality thresholds. External metrics and incident systems remain necessary for infrastructure SLOs, unsupported signals, and richer paging/escalation. Langfuse also does not replace logs for forensic detail or privacy controls that decide what may leave the application.
 
-## What to Capture
+> 💡 **Key insight:** Langfuse is the LLM behavior layer of your observability stack — not a replacement for it; wire it alongside your metrics backend and log system, not instead of them.
+
+## 📦 What to Capture
 
 Capture enough to debug and evaluate the workflow:
 
@@ -44,7 +46,7 @@ Layered capture guidance:
 - Production implications: capture policy affects privacy, retention, dashboard value, and whether traces can be shared in incidents.
 - Common mistakes: recording huge documents in metadata, disabling all capture and losing debuggability, or assuming provider SDK inputs are automatically safe.
 
-## Trace Design by Workflow
+## 🗺️ Trace Design by Workflow
 
 ### Chat
 
@@ -130,7 +132,7 @@ Tradeoffs:
 - Use a max-steps value and stop reason so loops and early exits are obvious.
 - Record tool failures as both Langfuse observation errors and low-cardinality OTel metrics.
 
-## Environments, Releases, and Versions
+## 🏷️ Environments, Releases, and Versions
 
 Use all three consistently:
 
@@ -178,9 +180,11 @@ Production convention:
 | Tags | Feature/workflow labels | Quality judgments or user-specific values |
 | Metadata | Low-cardinality segment fields | Secrets, raw docs, unbounded unique keys |
 
-## Privacy and Data Minimization
+## 🔒 Privacy and Data Minimization
 
 Production LLM traces can contain sensitive content. Decide what to capture before broad rollout.
+
+> ⚠️ **Watch out:** Provider SDK integrations (e.g., the OpenAI wrapper) capture inputs and outputs automatically — without an explicit capture policy and masking tests in place before rollout, sensitive data reaches Langfuse silently.
 
 Recommended controls:
 
@@ -218,11 +222,13 @@ Privacy review questions:
 - Which traces can be promoted into reusable datasets?
 - Are masking tests part of CI or staging validation?
 
-## Sampling Strategy
+## 📐 Sampling Strategy
 
 Sampling is a tradeoff. For LLM systems, the rare traces are often the most valuable.
 
 `LANGFUSE_SAMPLE_RATE` and ordinary SDK samplers make a head decision when the root starts. They cannot see a later error, thumbs-down, safety score, or final cost. A later score cannot restore an excluded trace, and scores attached to an unsampled trace are not sent.
+
+> ⚠️ **Watch out:** If you rely on negative user feedback to identify bad traces, head-sampling can silently discard those traces before the feedback arrives — they are gone and unrecoverable.
 
 An implementable strategy is:
 
@@ -245,7 +251,7 @@ Sampling decision points:
 
 Tail sampling requires all spans for a trace to reach the same decision point and arrive within its decision window. Size active-trace capacity from peak new traces per second, trace duration, late arrival, and payload size. Apply masking before buffering; sampling is never a privacy control.
 
-## Alerting Architecture
+## 📊 Alerting Architecture
 
 Use native Langfuse Monitors first when the signal is available from observations or numeric/categorical scores:
 
@@ -258,7 +264,7 @@ Use native Langfuse Monitors first when the signal is available from observation
 
 Keep OpenTelemetry metrics plus the incident platform for HTTP/service SLOs, queue depth, CPU/memory, Collector/exporter health, signals unsupported by Monitors, and advanced routing, deduplication, paging, or escalation. A Langfuse webhook can bridge a supported monitor into that broader incident workflow.
 
-## Operational Triage
+## 🔍 Operational Triage
 
 When an incident happens, move from metrics to Langfuse traces:
 
@@ -279,7 +285,7 @@ Incident metadata to preserve:
 - suspected category: retrieval, prompt, model, tool, guardrail, provider, infrastructure
 - dataset items created from the incident
 
-## Quality Triage
+## 🔍 Quality Triage
 
 For a drop in answer quality:
 
@@ -302,7 +308,7 @@ Quality failure categories:
 | Guardrail | Policy version, false positive/negative, blocked output |
 | UX/product | User asked unsupported task, missing clarification flow, bad handoff |
 
-## Cost Triage
+## 📊 Cost Triage
 
 For a token or cost spike:
 
@@ -321,7 +327,7 @@ Cost controls:
 - Add budget tests for prompts and context builders.
 - Watch model migrations with side-by-side Langfuse dashboards.
 
-## Multi-Service Production Pattern
+## 🗺️ Multi-Service Production Pattern
 
 For a gateway calling downstream LLM services:
 
@@ -345,7 +351,7 @@ Responsibilities:
 | Langfuse | Trace inspection, quality/cost analytics, score workflows, native Monitors, datasets, experiments. |
 | Logs backend | Exceptions, stack traces, audit events, operational details. |
 
-## What to Put in Langfuse vs Metrics vs Logs
+## 📐 What to Put in Langfuse vs Metrics vs Logs
 
 | Data | Best home |
 | --- | --- |
@@ -357,7 +363,7 @@ Responsibilities:
 | Exception stack traces and audit events | Log backend |
 | Trace and span IDs | All systems for correlation |
 
-## Common Production Pitfalls
+## ⚠️ Common Production Pitfalls
 
 - Capturing everything without a privacy review.
 - Naming traces with user IDs or request IDs.
@@ -370,7 +376,7 @@ Responsibilities:
 - Sending only LLM leaf spans to Langfuse while losing the request context.
 - Creating dashboards but no native Monitor or external alert for sustained user impact.
 
-## Testing and Operational Checks
+## ✅ Testing and Operational Checks
 
 Before production:
 
@@ -390,7 +396,7 @@ After production rollout:
 - Promote representative failures into datasets.
 - Revisit sampling and capture policy after traffic volume is known.
 
-## Troubleshooting
+## 🔍 Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
@@ -403,7 +409,7 @@ After production rollout:
 | Scores do not align with user complaints | Feedback attached to wrong trace or score semantics changed | Store trace ID with UI response; define score configs and evaluator versions. |
 | Datasets do not catch regressions | Dataset has easy/stale examples only | Add production failures, edge cases, and reviewed expected outputs continuously. |
 
-## Production Checklist
+## ✅ Production Checklist
 
 - Define trace designs for chat, RAG, agent, guardrail, and evaluator workflows.
 - Decide capture, masking, retention, and access policy before broad rollout.
@@ -416,7 +422,7 @@ After production rollout:
 - Turn representative production failures into dataset items.
 - Validate staging traces, dashboards, alerts, redaction, and Collector filters before production.
 
-## Official References
+## 🔌 Official References
 
 - Langfuse concepts: <https://langfuse.com/docs/observability/data-model>
 - SDK instrumentation: <https://langfuse.com/docs/observability/sdk/instrumentation>

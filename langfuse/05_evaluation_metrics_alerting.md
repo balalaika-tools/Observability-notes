@@ -2,7 +2,7 @@
 
 Last verified against official Langfuse evaluation and metrics documentation on 2026-07-20.
 
-## Mental Model
+## 🧭 Mental Model
 
 Langfuse turns traces into AI engineering feedback loops. The loop is:
 
@@ -26,7 +26,7 @@ production trace
 
 Langfuse evaluation solves quality measurement and iteration for LLM workflows. It does not make judges automatically correct, replace human review for high-stakes domains, or provide continuous paging by itself. Use external metrics/incident systems for operational alerts and use Langfuse as the quality and trace investigation system.
 
-## Scores
+## 🧪 Scores
 
 Scores are the core metric primitive for quality. They can come from users, humans, code, or model-based evaluators.
 
@@ -82,7 +82,7 @@ Layered explanation:
 - Production implications: score names and rubrics become dashboard and release-gate contracts.
 - Common mistakes: changing score semantics without versioning, duplicating scores on retries, and mixing feedback, labels, and measurements under one name.
 
-## Choosing Score Types
+## 📐 Choosing Score Types
 
 | Need | Score type | Example |
 | --- | --- | --- |
@@ -103,7 +103,7 @@ Decision points:
 | Classify failure cause | `CATEGORICAL` score | Tags added after the fact |
 | Capture open-ended review | `TEXT` score | Cramming prose into categorical values |
 
-## Score Configs
+## 🏷️ Score Configs
 
 Score configs standardize scoring across a team. They define score names, data types, and optional constraints such as numeric ranges or allowed categories.
 
@@ -115,6 +115,8 @@ Use score configs when:
 - you want invalid score values rejected instead of silently polluting analytics.
 
 Score configs are required for annotation queues and optional for programmatic SDK/API scoring. Create and manage them in the Langfuse UI under project score/evaluation settings, or via the Langfuse API when you need automation.
+
+> ⚠️ **Watch out:** Changing a score's value range or semantics without versioning silently corrupts all historical dashboard averages and experiment comparisons that rely on that score name.
 
 Practical score config examples:
 
@@ -133,7 +135,7 @@ Layered explanation:
 - Production implications: configs prevent dashboards from comparing incompatible values.
 - Common mistakes: creating a config after scores already diverged, archiving without documenting migration, and using one generic `quality` score for unrelated workflows.
 
-## User Feedback
+## 👤 User Feedback
 
 User feedback should land on the trace the user actually saw.
 
@@ -155,6 +157,8 @@ def submit_feedback(trace_id: str, thumbs_up: bool, comment: str | None = None) 
 
 Store the Langfuse trace ID with the response payload or conversation message so the feedback endpoint can attach the score later.
 
+> 💡 **Key insight:** User feedback must be attached to the trace the user actually saw — if you don't store and return the trace ID with the response, there is no reliable way to link it later.
+
 Feedback lifecycle:
 
 1. Root trace starts while generating the answer.
@@ -169,7 +173,7 @@ Common mistakes:
 - Storing raw user email as score metadata.
 - Treating one negative answer as a page instead of alerting on sustained trends.
 
-## Code Evaluators
+## 🛠️ Code Evaluators
 
 Use deterministic code for checks that do not require judgment:
 
@@ -214,7 +218,7 @@ Layered explanation:
 - Production implications: use them for CI gates, safety checks, schema checks, citation checks, and regression tests.
 - Common mistakes: using an LLM judge for deterministic checks, not versioning evaluator logic, and failing to make evaluator retries idempotent.
 
-## LLM-as-Judge
+## 🧪 LLM-as-Judge
 
 Use model judges for fuzzy judgments, but treat them as evaluators that need validation.
 
@@ -276,7 +280,7 @@ Judge quality controls:
 - Prefer categorical rubrics for failure class and numeric rubrics for quality trend.
 - Budget judge cost separately from production answer cost.
 
-## Human Annotation
+## 👤 Human Annotation
 
 Human review is still the anchor for high-stakes quality work. Use it to calibrate LLM-as-judge prompts, review edge cases, and build gold datasets.
 
@@ -309,7 +313,7 @@ Layered explanation:
 - Production implications: human labels calibrate judges, define gold datasets, and make release gates credible.
 - Common mistakes: unclear rubrics, unbalanced samples, no second-review process, and reviewing only failures without common successful cases.
 
-## Datasets
+## 📁 Datasets
 
 Datasets turn production examples into regression tests.
 
@@ -358,7 +362,7 @@ Layered explanation:
 - Production implications: datasets let you compare changes before rollout and reproduce historical failures.
 - Common mistakes: using raw production dumps, leaving expected outputs vague, forgetting source trace IDs, and not versioning the dataset state used for a release decision.
 
-## Experiments
+## 📁 Experiments
 
 Use experiments to compare prompt, model, retrieval, or agent changes before production rollout.
 
@@ -427,6 +431,8 @@ print(result.format())
 
 `get_dataset()` without `version=` returns the latest mutable state. For a reproducible release gate, obtain the chosen timestamp from the dataset version view or release configuration, pass it explicitly, and record the ISO timestamp in the experiment/run metadata and release evidence. Baseline and candidate runs must fetch the same timestamp.
 
+> ⚠️ **Watch out:** Running two experiment comparisons at different times without pinning a dataset version means they may have silently evaluated different items — making the comparison invalid as a release gate.
+
 Experiment runner capabilities to rely on in production:
 
 - concurrent execution with configurable limits;
@@ -451,7 +457,7 @@ Experiment design checklist:
 - Track latency, token usage, cost, safety, and quality.
 - Inspect failures manually before promotion.
 
-## Langfuse Metrics
+## 📊 Langfuse Metrics
 
 Langfuse metrics derive from traces and scores. Use them for:
 
@@ -514,7 +520,7 @@ Layered explanation:
 - Common mistakes: using Langfuse as the only alert engine, not exporting quality signals to paging systems when needed, and grouping by high-cardinality metadata.
 - Common mistakes: treating observation counts as trace counts, ignoring the row limit, and building a polling bridge for a threshold already supported by a native Monitor.
 
-## Alerting Philosophy
+## 📊 Alerting Philosophy
 
 Use a native Langfuse Monitor first for thresholds supported by observation or numeric/categorical score metrics:
 
@@ -534,7 +540,7 @@ Use two alert layers:
 
 Do not page on every single bad answer. Page on sustained user impact or safety-critical failures.
 
-## Practical Alert Ideas
+## 📊 Practical Alert Ideas
 
 | Alert | Source | Why it matters |
 | --- | --- | --- |
@@ -549,7 +555,7 @@ Do not page on every single bad answer. Page on sustained user impact or safety-
 | Empty retrieval rate high | OTel metrics | Search/index issue |
 | Experiment regression | Langfuse experiments | Block release before production |
 
-## Example: Export Quality Metrics to Alerting
+## 🛠️ Example: Export Quality Metrics to Alerting
 
 If a required threshold is not supported by a native Monitor, a scheduled job can query Metrics API v2 and write compact time series to the metrics backend. Use a durable cursor, publish a monotonic processed-score counter for window sample guards, and make retries idempotent.
 
@@ -593,7 +599,7 @@ def publish_quality_metrics(windows: list[QualityWindow], metrics: MetricsClient
 
 Keep alert dimensions low-cardinality. Alert by workflow, environment, release, and model; investigate individual traces in Langfuse.
 
-## Release Gates
+## ✅ Release Gates
 
 Before deploying a prompt, model, retrieval, or agent change:
 
@@ -606,7 +612,7 @@ Before deploying a prompt, model, retrieval, or agent change:
 
 This turns Langfuse from a passive trace viewer into an engineering control system.
 
-## CI/CD Evaluation Gates
+## ✅ CI/CD Evaluation Gates
 
 Run a small but representative experiment suite in CI for changes that affect prompts, retrieval, models, tools, or agent logic.
 
@@ -648,7 +654,7 @@ def assert_release_gate(run_scores: list[GateScore]) -> None:
 
 CI gates should be conservative and stable. Use them to block obvious regressions, then use production Langfuse dashboards and alerts to monitor the long tail.
 
-## Troubleshooting
+## 🔍 Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
@@ -661,7 +667,7 @@ CI gates should be conservative and stable. Use them to block obvious regression
 | Alerts are noisy | Alerting on individual bad answers or low sample counts | Require sustained windows and minimum counts. |
 | Quality drop is hard to investigate | Scores not tied to release/version/model/prompt dimensions | Add release/version/model metadata to traces and score metadata. |
 
-## Evaluation Checklist
+## ✅ Evaluation Checklist
 
 - Define the quality questions each workflow must answer.
 - Choose score names, data types, constraints, and score configs before broad rollout.
@@ -674,7 +680,7 @@ CI gates should be conservative and stable. Use them to block obvious regression
 - Configure native Monitors for supported sustained quality/cost/latency/volume thresholds; export compact metrics only for unsupported or cross-system alert logic.
 - Keep examples, rubrics, and release gates under review as the product changes.
 
-## Official References
+## 🔌 Official References
 
 - Scores overview: <https://langfuse.com/docs/evaluation/scores/overview>
 - Scores data model: <https://langfuse.com/docs/evaluation/scores/data-model>

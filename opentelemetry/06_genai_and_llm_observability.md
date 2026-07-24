@@ -17,7 +17,7 @@ tool execution, and finally into Langfuse or another backend.
 
 This page was checked on July 20, 2026 against core OpenTelemetry semantic conventions `v1.43.0` and the dedicated `open-telemetry/semantic-conventions-genai` repository at commit `c26a2c21d1ee70d5231bd440c7b48d3c94ee506a` (2026-07-17). The dedicated repository depends on core semconv `v1.43.0` at that revision. GenAI conventions are still marked Development. Pin a release or commit in your own compatibility note; a check date without a revision cannot be reproduced after `main` changes.
 
-## The Mental Model
+## 🧭 The Mental Model
 
 The normal OpenTelemetry model still applies:
 
@@ -59,7 +59,7 @@ The trace gives causality. Metrics give aggregate behavior. Logs give detailed
 events. Langfuse turns the LLM parts into product-facing observability: prompt
 versions, sessions, model outputs, costs, scores, and datasets.
 
-## What GenAI Observability Should Answer
+## 📌 What GenAI Observability Should Answer
 
 A useful LLM trace should answer questions in several layers.
 
@@ -84,7 +84,9 @@ If your trace only shows "called OpenAI" and a duration, it is not enough for a
 production LLM system. It tells you that a dependency was slow, but not why the
 workflow behaved the way it did.
 
-## Stability And Compatibility
+> 💡 **Key insight:** Wrapping a model call in a single opaque span tells you latency but not causality — separate spans for retrieval, embedding, inference, tool execution, and evaluation are what let you answer "was it the retrieval, the model, or the tool that made this request fail?"
+
+## ⚠️ Stability And Compatibility
 
 The GenAI semantic conventions are still Development. That has practical
 consequences:
@@ -128,7 +130,7 @@ module changes instead of every LLM call site.
 
 Use one error pattern for every GenAI operation in this chapter. Put a low-cardinality `error.type` on the failed span, then re-raise. Python's `start_as_current_span()` defaults record the escaping exception and set error status, so the examples do not also call `record_exception()` or put `str(exc)` in status. If an instrumentation disables `record_exception` or `set_status_on_exception`, it must take over both responsibilities exactly once.
 
-## Operation Vocabulary
+## 🏷️ Operation Vocabulary
 
 Use `gen_ai.operation.name` to describe the logical GenAI operation.
 
@@ -155,7 +157,7 @@ Use `gen_ai.operation.name` to describe the logical GenAI operation.
 Keep custom operations low-cardinality. Do not put prompt text, user IDs,
 request IDs, document IDs, or dynamic task descriptions in operation names.
 
-## Provider Names
+## 🏷️ Provider Names
 
 Use `gen_ai.provider.name` for the provider or platform known to the
 instrumentation.
@@ -187,7 +189,7 @@ proxy platform at span start. If the final upstream provider becomes known later
 record it separately with an application attribute such as
 `app.llm.upstream_provider`.
 
-## Trace Shape For LLM Applications
+## 🗺️ Trace Shape For LLM Applications
 
 A good trace has stable boundaries:
 
@@ -224,7 +226,7 @@ For Langfuse, prefer Langfuse-specific trace metadata for fields that need to be
 filterable in Langfuse. Plain OTel attributes may still be retained, but they
 may not be first-class filters in Langfuse.
 
-## Inference Spans
+## 📦 Inference Spans
 
 An inference span represents one logical model operation from the caller's point
 of view. It should start when the request is issued and end when the response is
@@ -279,7 +281,7 @@ The older `gen_ai.system` name appears in older libraries and dashboards. Treat
 it as legacy compatibility. Prefer `gen_ai.provider.name` in new raw
 instrumentation.
 
-## Manual Inference Span Example
+## 🛠️ Manual Inference Span Example
 
 The exact provider client differs by SDK. This example uses a
 chat-completions-shaped client to show the OpenTelemetry pattern:
@@ -391,7 +393,7 @@ Notes:
 - `start_as_current_span()` records an escaping exception and sets error status by default. The `except` block adds only `error.type` and re-raises, so it does not create a duplicate exception event or put raw exception text in status.
 - This wrapper is where provider-specific response parsing belongs.
 
-## Streaming
+## 🔄 Streaming
 
 Streaming has two different latency stories:
 
@@ -465,7 +467,9 @@ harder to read. Record aggregate streaming metrics and, if you need full content
 capture the final assembled output or store chunk events in a system designed for
 payload review.
 
-## Content Capture
+> ⚠️ **Watch out:** Creating a child span for each streamed token generates thousands of spans per request, overwhelms your Collector and backend, and makes the trace completely unreadable — one span per inference call is the right granularity.
+
+## 🔒 Content Capture
 
 Prompts, system instructions, tool definitions, tool arguments, retrieved
 documents, and model outputs can contain sensitive data. OpenTelemetry GenAI
@@ -534,7 +538,7 @@ If your OpenTelemetry backend is a general APM tool, be careful about sending
 large prompt payloads there. Attribute size limits, retention, indexing cost, and
 access control may all be wrong for LLM content.
 
-## RAG Trace Shape
+## 🗺️ RAG Trace Shape
 
 Retrieval-augmented generation should not be one opaque model span. Split it
 into the operations that can fail or degrade independently:
@@ -654,7 +658,7 @@ with tracer.start_as_current_span(
     span.set_attribute("app.rerank.output_count", len(ranked_docs))
 ```
 
-## Tool Execution
+## 🛠️ Tool Execution
 
 Tools are important because agent failures often come from tools, not the model.
 A tool span should represent the actual tool execution, not merely the model's
@@ -699,7 +703,7 @@ Tool names should be bounded. If users can create arbitrary tool names, map them
 to a small set such as `custom_tool` and put the user-defined name somewhere that
 is not used for metrics or high-cardinality indexing.
 
-## Agents And Workflows
+## 🔄 Agents And Workflows
 
 Agents and workflows are the parent concepts around multiple GenAI operations.
 Use them when a single user-visible task may involve several model calls, tool
@@ -766,7 +770,7 @@ def run_support_workflow(request: SupportRequest) -> AgentAnswer:
 The agent span should not contain raw chain-of-thought. If you capture a plan,
 capture a product-safe summary or use Langfuse with a deliberate privacy policy.
 
-## Memory
+## 📦 Memory
 
 Memory spans are useful when an agent reads or writes long-term user, tenant, or
 task memory.
@@ -795,7 +799,7 @@ Memory data is often sensitive. By default, record operational facts:
 Avoid raw memory content in general traces unless the user, product, and
 compliance posture explicitly allow it.
 
-## GenAI Metrics
+## 📊 GenAI Metrics
 
 Traces explain one request. Metrics explain the fleet.
 
@@ -865,7 +869,7 @@ Application-specific metrics can still be useful:
 Use semantic convention metrics where they fit. Use `app.*` metrics for product
 or business behavior that OpenTelemetry cannot standardize.
 
-## Langfuse And OpenTelemetry
+## 🗄️ Langfuse And OpenTelemetry
 
 Langfuse can receive OpenTelemetry traces and map GenAI attributes into its LLM
 observability model. The key design choice is what you want Langfuse to own
@@ -929,7 +933,9 @@ Do not assume that every OTel attribute becomes a nice Langfuse filter. Decide
 which fields matter for Langfuse workflows and write them with the Langfuse
 metadata prefixes.
 
-## Collector Routing For LLM Systems
+> 💡 **Key insight:** A plain OTel span attribute like `app.tenant_tier` lands in Langfuse's raw metadata but is not directly filterable in its UI — only `langfuse.trace.metadata.*` and `langfuse.observation.metadata.*` keys become first-class filter fields in Langfuse.
+
+## 🔀 Collector Routing For LLM Systems
 
 The Collector is where you can send different signals and attributes to
 different places.
@@ -972,7 +978,7 @@ redacting prompt/output attributes before the APM export while preserving them
 for Langfuse. This can be done with separate Collector pipelines or with
 application-side policy.
 
-## Sampling
+## 🎲 Sampling
 
 Sampling is tricky for LLM systems because rare traces can be expensive and
 important. A good sampling policy usually keeps:
@@ -1003,7 +1009,9 @@ Collector or backend that can make a decision after span completion.
 Do not rely on sampling for privacy. Redaction and content-capture controls must
 work whether a trace is sampled or not.
 
-## Cost And Quality
+> ⚠️ **Watch out:** Sampling is not a privacy control — a trace that is not sampled today may be sampled tomorrow if traffic patterns change; redaction and content-capture opt-ins must be correct regardless of sampling decisions.
+
+## 📊 Cost And Quality
 
 OpenTelemetry does not standardize every cost and quality field because those
 are product-specific. Add application attributes or metrics for your business
@@ -1032,7 +1040,7 @@ Prefer Langfuse scores for LLM evaluation workflows when you want dataset,
 prompt, session, and evaluation views. Use OTel metrics when you want fleet-wide
 alerting and dashboards.
 
-## Logs And Trace Correlation
+## 🔗 Logs And Trace Correlation
 
 LLM logs should be correlated with traces, but they should not become a shadow
 payload store by accident.
@@ -1057,7 +1065,7 @@ Use trace correlation fields in logs so an operator can jump from a log line to
 the trace. Keep raw prompt and output capture in Langfuse or a controlled
 payload store, not in broad application logs.
 
-## Testing Instrumentation
+## 🛠️ Testing Instrumentation
 
 Test the instrumentation like product code. At minimum, verify:
 
@@ -1092,7 +1100,7 @@ Integration tests should run a small app through a local Collector and confirm
 that the backend receives what you expect. This catches endpoint, protocol,
 header, and redaction mistakes that unit tests cannot see.
 
-## Common Pitfalls
+## ⚠️ Common Pitfalls
 
 | Pitfall | Why it hurts | Fix |
 | --- | --- | --- |
@@ -1108,7 +1116,7 @@ header, and redaction mistakes that unit tests cannot see.
 | Assuming Langfuse filters every OTel attribute | Important metadata becomes hard to search. | Use `langfuse.trace.metadata.*` and `langfuse.observation.metadata.*`. |
 | Treating GenAI conventions as fully stable | Future changes cause drift. | Track convention check date and isolate names. |
 
-## Implementation Checklist
+## ✅ Implementation Checklist
 
 For a new LLM service:
 
@@ -1130,7 +1138,7 @@ For a new LLM service:
 - add tests for span attributes, error behavior, and content-capture defaults;
 - document the GenAI semantic convention check date.
 
-## How This Fits With The Other Notes
+## 🧭 How This Fits With The Other Notes
 
 - [01_concepts.md](01_concepts.md) explains the OpenTelemetry mental model:
   signals, context, SDKs, exporters, the Collector, resources, and backends.

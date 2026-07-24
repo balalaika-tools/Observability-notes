@@ -8,7 +8,7 @@ This chapter explains how to design OpenTelemetry metrics, export them, map
 them into Prometheus-style backends, and turn them into useful alerts for
 distributed systems and LLM applications.
 
-## Metric Mental Model
+## 🧭 Metric Mental Model
 
 OpenTelemetry metrics flow like this:
 
@@ -33,7 +33,7 @@ Metrics are not sampled traces. If traces are sampled at 5 percent, you still
 need complete metrics for request counts, error rates, latency SLOs, token
 usage, queue depth, and capacity.
 
-## Traces vs Metrics
+## 📐 Traces vs Metrics
 
 | Signal | Use for | Example question |
 | --- | --- | --- |
@@ -51,7 +51,7 @@ metric alert fires
   -> runbook suggests mitigation
 ```
 
-## Metric Design Principles
+## 📐 Metric Design Principles
 
 Good metrics are:
 
@@ -67,7 +67,7 @@ Good metrics are:
 Avoid "because it might be useful someday" metrics. Every metric has storage,
 query, alerting, and cognitive cost.
 
-## Instruments
+## 📦 Instruments
 
 Choose the instrument based on what you are measuring.
 
@@ -90,7 +90,9 @@ queue currently has 842 jobs -> ObservableGauge
 Do not use a gauge for total requests. Do not use a counter for latency. Do not
 record one metric per user, prompt, trace, or request ID.
 
-## Naming And Units
+> ⚠️ **Watch out:** Recording a metric attribute that includes a user ID, trace ID, or prompt hash creates a new time series per request, which can crash a Prometheus-compatible backend or make it prohibitively expensive within hours.
+
+## 🏷️ Naming And Units
 
 Metric names should describe the thing being measured.
 
@@ -115,7 +117,7 @@ Use clear units:
 For duration histograms, seconds are common in OTel and Prometheus-style
 ecosystems.
 
-## Attributes And Cardinality
+## 📊 Attributes And Cardinality
 
 Attributes become metric dimensions. Each unique combination can become a time
 series in the backend.
@@ -149,7 +151,7 @@ Cardinality budget is one of the most important metric design constraints. The
 right label can make an alert actionable. The wrong label can make a metrics
 backend expensive or unstable.
 
-## Useful Metrics For Production Systems
+## 🗺️ Useful Metrics For Production Systems
 
 | Metric | Instrument | Labels | Alert use |
 | --- | --- | --- | --- |
@@ -169,7 +171,7 @@ backend expensive or unstable.
 Use semantic convention metrics when they fit. Use application metrics when you
 need product-specific meaning. Be consistent.
 
-## Python Custom Metrics Example
+## 🛠️ Python Custom Metrics Example
 
 ```python
 from opentelemetry import metrics
@@ -215,7 +217,7 @@ def run_tool(tool_name: str, args: dict) -> dict:
 Keep `tool_name` bounded. If users can define arbitrary tools, normalize or
 bucket names before recording metrics.
 
-## Histograms
+## 📊 Histograms
 
 Histograms are the usual instrument for latency and distributions.
 
@@ -241,11 +243,13 @@ p99 latency = shows severe tail behavior
 Averages are useful for capacity planning, but alerts should often use
 percentiles or SLO burn rates.
 
+> 💡 **Key insight:** Average latency hides tail pain — a p95 alert on a histogram fires for the 1-in-20 slow request that users actually notice, while an average alert may stay silent even as a subset of users experience 10x timeouts.
+
 In Prometheus-style backends, histograms usually become bucket time series. Make
 sure buckets match the thing being measured. A 10-second LLM latency histogram
 needs different buckets from a 50-millisecond cache lookup histogram.
 
-## Export Patterns
+## 📤 Export Patterns
 
 Most teams export metrics through OTLP to a Collector and then to a metrics
 backend:
@@ -294,7 +298,9 @@ Metric names and labels may be transformed by the backend. For Prometheus:
 
 Confirm final names in the backend before writing alerts.
 
-## Prometheus Name Mapping Example
+> ⚠️ **Watch out:** Prometheus rewrites OTel metric names (dots to underscores, `_total` suffix on counters, `_bucket`/`_count`/`_sum` on histograms) — write and test your PromQL against the actual exported names, not the names you chose in code.
+
+## 🏷️ Prometheus Name Mapping Example
 
 An OTel metric:
 
@@ -333,7 +339,7 @@ app.outcome -> app_outcome
 The examples below use Prometheus-style names. Adjust them to the names your
 backend actually exposes.
 
-## Alert Design
+## 📐 Alert Design
 
 Alerts should represent user or business impact, not every unusual internal
 value.
@@ -362,7 +368,7 @@ enterprise chat queue oldest job age > 5 minutes for 10 minutes
 
 The second alert describes user impact and persistence.
 
-## SLO And Burn-Rate Thinking
+## 📐 SLO And Burn-Rate Thinking
 
 An SLO is a reliability target, such as:
 
@@ -450,7 +456,9 @@ groups:
 
 The short and long windows must both breach. The page catches rapid budget loss; the ticket catches slower sustained loss. Tune burn factors and traffic guards from the organization's SLO policy, and test the rules with `promtool test rules`.
 
-## Practical Alerts
+> 💡 **Key insight:** A single-window threshold alert fires on momentary spikes and goes noisy; requiring both a short window (5m/1h) and a long window (30m/6h) to breach simultaneously eliminates the vast majority of false pages.
+
+## 🛠️ Practical Alerts
 
 The PromQL names below are examples. Every query filters the intended service and environment inside the expression. An alert label such as `service: chat-api` does not filter input series; it only labels the alert after evaluation.
 
@@ -712,7 +720,7 @@ for choosing a window long enough for the expected traffic.
 Queue depth alone can be misleading. Pair it with oldest job age or processing
 rate when possible.
 
-## LLM Metrics
+## 📊 LLM Metrics
 
 LLM systems need operational, cost, and quality metrics.
 
@@ -750,7 +758,7 @@ Quality metrics:
 | Empty retrieval rate | Retrieval metric. |
 | Tool argument validation failures | App counter. |
 
-## GenAI Semantic Convention Metrics
+## 🏷️ GenAI Semantic Convention Metrics
 
 The current GenAI semantic convention effort defines client metrics such as:
 
@@ -776,7 +784,7 @@ mapping and do not mix both styles without a reason.
 
 The standard agent call-count metrics are histograms recorded once per invocation; an `app.agent.tool_calls` counter records one point per tool call. They answer similar questions but have different aggregation semantics and must not be summed together. Keep `app.*` for product-specific facts with no standard equivalent, such as step-limit stops, retrieval emptiness, guardrail policy outcomes, or business cost allocation.
 
-## Quality Alerts
+## 🔍 Quality Alerts
 
 Latency and errors are not enough for LLM systems. You also need quality
 signals, but quality alerts require care. A noisy judge score can wake people
@@ -809,7 +817,7 @@ Example quality alert design:
 | Safety block spike | OTel counter | Block rate doubles day-over-day and volume > threshold. |
 | Release regression | Langfuse experiment | New release below baseline by 5 percent. |
 
-## Dashboards
+## 🗺️ Dashboards
 
 A useful service dashboard should show:
 
@@ -839,7 +847,7 @@ Dashboards should be built for comparison: current release versus previous
 release, this hour versus yesterday, model A versus model B, route A versus
 route B.
 
-## Runbook Template
+## ✅ Runbook Template
 
 Every alert should answer:
 
@@ -862,7 +870,7 @@ For LLM incidents, the trace investigation usually starts with:
 5. Check Langfuse scores and user feedback for quality impact.
 6. Decide whether to roll back code, prompt, model, retrieval config, or provider route.
 
-## Troubleshooting Metrics
+## 🔍 Troubleshooting Metrics
 
 Metric missing:
 
@@ -900,7 +908,7 @@ Alert did not fire:
 - data was delayed or dropped in Collector/exporter;
 - metric was derived from sampled traces.
 
-## Final Design Checklist
+## ✅ Final Design Checklist
 
 - Each metric has an owner and purpose.
 - Units are explicit and correct.

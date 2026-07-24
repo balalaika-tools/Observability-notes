@@ -1,0 +1,23 @@
+{
+  "apiKeyHelper": "bash ~/.claude/scripts/google-auth-helper.sh",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://claude-gw.sandbox.aws.dev.opsfleet.com",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-8",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(xargs cat)"
+    ]
+  },
+  "disabledMcpjsonServers": [
+    "devcycle",
+    "clickup",
+    "playwright"
+  ],
+  "enabledMcpjsonServers": [
+    "pricing"
+  ]
+}

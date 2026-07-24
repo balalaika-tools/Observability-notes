@@ -20,7 +20,7 @@ Python application starts
 The examples use FastAPI, HTTPX, and OTLP/HTTP, but the same pattern applies to
 Flask, Django, Celery, workers, CLIs, and batch jobs.
 
-## The Python Mental Model
+## 🧭 The Python Mental Model
 
 In Python, there are three layers you need to keep separate:
 
@@ -36,7 +36,7 @@ owns the SDK configuration.
 If no SDK provider is configured, API calls become no-ops. This lets shared
 libraries add spans without deciding your backend.
 
-## Code-Based vs Zero-Code Instrumentation
+## 📐 Code-Based vs Zero-Code Instrumentation
 
 Python supports two common setup styles.
 
@@ -50,10 +50,12 @@ your app also calls `trace.set_tracer_provider()`, you can end up with double
 instrumentation, no-op providers, duplicate spans, or configuration that silently
 loses data. Pick one owner for provider setup.
 
+> ⚠️ **Watch out:** Mixing zero-code and code-based setup in the same process silently produces duplicate spans or discarded telemetry — pick one approach and let it own provider initialization.
+
 These notes mostly use code-based setup because it is easier to reason about in
 application code. A zero-code section appears later in this file.
 
-## Install Packages
+## 🔌 Install Packages
 
 Install only what you use. A typical FastAPI service that emits traces and
 metrics over OTLP/HTTP and correlates logs needs:
@@ -86,7 +88,7 @@ The package set should match your deployment. Do not install every
 instrumentation package "just in case"; each instrumentation hooks imports or
 library internals and should be intentional.
 
-## Environment Configuration
+## 🌐 Environment Configuration
 
 Use environment variables for deployment-specific values:
 
@@ -215,6 +217,8 @@ path behavior:
 This rule is a common cause of `404` responses. For a standard Collector
 receiver, this signal-specific setting is normally correct:
 
+> ⚠️ **Watch out:** Setting `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to a bare host:port (without `/v1/traces`) sends to the root path `/` and gets a `404` — the signal-specific variable is used as-is, not treated as a base URL.
+
 ```bash
 export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=\
 http://otel-collector:4318/v1/traces
@@ -304,7 +308,7 @@ Central routing keeps backend credentials, retries, redaction, sampling, and
 destination changes out of every application. If you split signals directly
 from applications, make ownership of those concerns explicit.
 
-## Startup Order
+## 🔄 Startup Order
 
 Startup order is a common source of subtle bugs.
 
@@ -378,6 +382,8 @@ Another common mistake is calling `FastAPIInstrumentor.instrument_app(app)`
 inside the FastAPI lifespan. Lifespan runs after the server has started the
 application; that is too late to safely add instrumentation middleware and may
 raise a middleware-stack error.
+
+> ⚠️ **Watch out:** Never call `FastAPIInstrumentor.instrument_app(app)` inside the lifespan — the server's middleware stack is already frozen by that point and the call will fail or silently have no effect.
 
 ### Good: Instrument First, Create Runtime Clients In Lifespan
 
@@ -462,6 +468,8 @@ Closing application resources before OTel matters. A client's `close()` call
 or a worker's final operation may finish spans; shutting down the providers
 first can discard that final telemetry.
 
+> 💡 **Key insight:** Shut down application clients and workers before calling `shutdown_otel()` — a client's close or a worker's final message may still be finishing spans when providers go down, and those spans vanish silently.
+
 ### Acceptable: A Module-Level Client Created In The Right Order
 
 Lifespan ownership is usually clearer, but a module-level client can still be
@@ -509,7 +517,7 @@ In that mode, do not also call `configure_otel()` or process-wide
 clients and lifespan cleanup; the launcher owns provider and auto-
 instrumentation setup.
 
-## Configure Traces And Metrics
+## 🛠️ Configure Traces And Metrics
 
 Create one startup module. Keep it idempotent so tests, reloaders, or worker
 forks do not configure providers twice.
@@ -626,7 +634,7 @@ What this does:
   code appends `/v1/traces` or `/v1/metrics`.
 - `shutdown_otel()` clears its stored handles before shutdown, so a repeated call is a no-op. This guide invokes it explicitly from the FastAPI lifespan or a script `finally` block rather than also registering `atexit`.
 
-## Add Auto-Instrumentation
+## 🔌 Add Auto-Instrumentation
 
 Use instrumentation libraries for framework and library telemetry. They handle
 server spans, client spans, propagation, and common semantic attributes.
@@ -673,7 +681,7 @@ extracts incoming trace context automatically.
 Manual propagation is still useful for queues, custom transports, tests, and
 places where you want exact control. See [04_multi_service_examples.md](04_multi_service_examples.md).
 
-## Add Manual Spans
+## 🛠️ Add Manual Spans
 
 Auto-instrumentation knows framework calls. It does not know your business
 steps. Add manual spans around operations that explain latency, errors, or
@@ -721,7 +729,7 @@ def attach_request_context(tenant_tier: str) -> None:
         span.set_attribute("app.tenant.tier", tenant_tier)
 ```
 
-## Add Custom Metrics
+## 📊 Add Custom Metrics
 
 Create instruments once, usually at module load time. Record measurements in
 request paths with low-cardinality attributes.
@@ -813,7 +821,7 @@ Traces can tolerate some high-cardinality searchable data if the backend and
 privacy model allow it. Metrics usually cannot. Metric attributes create time
 series, so be strict.
 
-## Observable Gauges
+## 📊 Observable Gauges
 
 Use an observable gauge when the value is read at collection time rather than
 recorded inline.
@@ -841,7 +849,7 @@ The callback runs when the SDK collects metrics. Keep it fast and reliable. Do
 not call slow or fragile dependencies in gauge callbacks unless you can tolerate
 collection failures.
 
-## Correlate Logs With Traces
+## 🔗 Correlate Logs With Traces
 
 OpenTelemetry log correlation is different from OTel log export.
 
@@ -886,7 +894,7 @@ Bad log fields:
 - retrieved document text;
 - personal data unless explicitly permitted.
 
-## Optional OTel Log Export
+## 📤 Optional OTel Log Export
 
 The OTel logs signal is stable in the specification, but Python log API/SDK
 support is still listed as Development in the language status. Treat Python log
@@ -911,7 +919,7 @@ structured application logs -> log agent/backend
 trace and span IDs in log fields -> correlation with traces
 ```
 
-## Zero-Code Instrumentation
+## 🔌 Zero-Code Instrumentation
 
 Zero-code instrumentation removes framework instrumentor calls and most SDK
 setup from application code. Two commands have different jobs:
@@ -985,7 +993,9 @@ Use zero-code when you want broad automatic coverage quickly. Use code-based
 setup when you need precise provider configuration, custom processors, explicit
 metric views, or controlled shutdown.
 
-## Background Workers And Queues
+> 💡 **Key insight:** Zero-code gives framework coverage for free, but it cannot create `rag.retrieve`, `agent.plan`, or any business-domain span — those always need manual instrumentation in application code.
+
+## 🔄 Background Workers And Queues
 
 Workers need the same provider setup as web services:
 
@@ -1015,7 +1025,7 @@ If a queued job is causally connected to one request, use propagated context as
 the parent. If it is intentionally decoupled, delayed, batched, or fan-in/fan-
 out, use span links instead of forcing a misleading parent-child relationship.
 
-## CLI Jobs And Batch Scripts
+## 🔄 CLI Jobs And Batch Scripts
 
 Short-lived programs often lose telemetry because the process exits before the
 batch processor exports.
@@ -1039,7 +1049,7 @@ if __name__ == "__main__":
 For scripts, consider a shorter batch delay or explicit shutdown after the work
 finishes. Console exporters are useful while developing a job locally.
 
-## Tests
+## 🛠️ Tests
 
 Avoid exporting telemetry to real backends from unit tests. Use one of these
 patterns:
@@ -1055,7 +1065,7 @@ If your production setup module registers global providers, make tests
 idempotent and isolated. Global OTel state is process-wide, so test suites can
 interfere with themselves if they repeatedly configure providers.
 
-## Troubleshooting Python Telemetry
+## 🔍 Troubleshooting Python Telemetry
 
 No spans:
 
@@ -1096,7 +1106,7 @@ Logs not correlated:
 - Does your formatter include trace and span fields?
 - Does the log backend parse those fields?
 
-## Common Python Pitfalls
+## ⚠️ Common Python Pitfalls
 
 - Configuring the SDK after importing or creating framework clients.
 - Creating a new `TracerProvider` in every module.
@@ -1112,7 +1122,7 @@ Logs not correlated:
 - Appending OTLP/HTTP signal paths to an OTLP/gRPC target.
 - Assuming Python OTel log export has the same maturity as trace-log correlation.
 
-## Minimal Production Checklist
+## ✅ Minimal Production Checklist
 
 - `service.name`, `service.version`, instance ID, and environment are set.
 - Providers are configured once at process startup.

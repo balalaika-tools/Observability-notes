@@ -12,7 +12,7 @@ This example has:
 
 Use bootstrap profile A from [README.md](README.md) in both processes. Each process initializes the Langfuse trace provider/exporter and OTLP metric reader before instrumenting FastAPI or HTTPX. Set a different `OTEL_SERVICE_NAME` in each process and the same `LANGFUSE_RELEASE` / `LANGFUSE_TRACING_ENVIRONMENT` deployment values.
 
-## Architecture
+## 🏗️ Architecture
 
 ```text
 client
@@ -29,7 +29,9 @@ client
 
 The Langfuse client is constructed with `should_export_span=lambda span: True` in the shared bootstrap so the FastAPI and HTTPX spans that connect the services are not filtered out. Do not configure a second global trace provider in either process.
 
-## Gateway Service
+> ⚠️ **Watch out:** Configuring a second global trace provider in either service creates duplicate spans and splits trace context — the Langfuse client already owns the provider.
+
+## 🛠️ Gateway Service
 
 ```python
 # gateway_service.py
@@ -185,7 +187,11 @@ async def answer(
 
 Retries are safe because `request_id` is generated once and the agent service deduplicates successful results. Do not blindly retry non-idempotent tool calls. For write tools, use an operation-specific idempotency key at the tool boundary or require human confirmation.
 
-## Agent Service
+> 💡 **Key insight:** Generating `request_id` once before retries and deduplicating on the server side makes the whole request safe to replay without executing write operations twice.
+
+> ⚠️ **Watch out:** Do not replay write-side tool calls automatically — they need a tool-level idempotency key or explicit human confirmation, not the same retry logic as read-only requests.
+
+## 🛠️ Agent Service
 
 The model decides whether to call an allowed tool or return a final answer. `MAX_STEPS` bounds model decision iterations; tool names and arguments are validated before execution.
 
@@ -447,7 +453,7 @@ def run_agent(request: RunRequest) -> dict:
 
 The account result is no longer discarded: when selected, it becomes a tool message used by the next model decision. A failed search, account lookup, or model call records an error observation and an operational metric. Tool-call metrics are emitted once, after the final outcome is known.
 
-## Failure Policy
+## 🔍 Failure Policy
 
 | Failure | Retry | Client result | Idempotency rule |
 | --- | --- | --- | --- |
@@ -461,7 +467,7 @@ The account result is no longer discarded: when selected, it becomes a tool mess
 
 Set an end-to-end deadline shorter than the public proxy timeout. Retry budgets must fit within it; otherwise retries convert a fast error into a slow error.
 
-## Correlation and Alerts
+## 🔔 Correlation and Alerts
 
 Verify that the gateway server span, HTTP client span, agent server span, Langfuse observations, and logs share one trace ID. Baggage carries only opaque user/session identity and bounded trace attributes; authorization-sensitive account identity travels in an authenticated internal request.
 

@@ -2,7 +2,7 @@
 
 Last verified against official Langfuse documentation on 2026-07-20.
 
-## Mental Model
+## 🧭 Mental Model
 
 Langfuse starts from OpenTelemetry's trace model and turns it into an AI engineering record. OpenTelemetry can tell you that a request spent 820 ms in an outbound HTTP call. Langfuse can tell you that the call was a generation using a specific model and prompt version, consumed a certain number of tokens, produced a specific answer, received negative user feedback, and regressed after a release.
 
@@ -25,7 +25,7 @@ The most important design choice is where information belongs:
 - Put reproducible examples in datasets.
 - Put operational health in metrics and logs outside Langfuse when it is not LLM-specific.
 
-## What Langfuse Is
+## 📌 What Langfuse Is
 
 Langfuse is a production platform for AI engineering:
 
@@ -38,7 +38,7 @@ Langfuse is a production platform for AI engineering:
 
 Langfuse is built on OpenTelemetry. A Langfuse observation is an OpenTelemetry span with Langfuse-specific attributes and types.
 
-## Lifecycle: From Request to Improvement
+## 🔄 Lifecycle: From Request to Improvement
 
 1. A user message, background job, or agent task starts.
 2. The application creates a root trace/observation such as `rag.answer`.
@@ -62,7 +62,7 @@ The lifecycle matters because each object answers a different debugging question
 | Can we reproduce and compare fixes? | Dataset and experiment |
 | Did a release change quality, latency, or cost? | Metrics and trace dimensions |
 
-## Core Objects
+## 📦 Core Objects
 
 ### Trace
 
@@ -139,6 +139,8 @@ Generations are where most LLM debugging starts: prompt, model, retrieved contex
 
 Langfuse can infer usage when it has a tokenizer and can infer cost when usage plus a matching model-price definition are available. Provider/SDK-supplied usage is preferred to inferred usage. User-supplied `usage_details` and `cost_details` take precedence over inferred values; supplied cost is used verbatim, so provide it only for an authoritative provider charge or custom agreement. Usage detail buckets must be mutually exclusive or totals and inferred cost can be double-counted.
 
+> ⚠️ **Watch out:** If usage detail buckets overlap, token totals and inferred cost will be silently double-counted with no error from Langfuse.
+
 Layered explanation:
 
 - Beginner intuition: a generation is the model call receipt.
@@ -187,6 +189,8 @@ Score data types:
 | `TEXT` | string | reviewer notes |
 
 Use scores for things that can change after tracing: user feedback, human review, LLM-as-judge results, regression checks, and dataset evaluations. Use tags for describing what a trace is.
+
+> 💡 **Key insight:** Scores and tags are not interchangeable — using tags for quality labels silently blocks quality dashboards, experiment comparisons, and release-gate analytics.
 
 Layered explanation:
 
@@ -251,6 +255,8 @@ Avoid metadata with unbounded cardinality:
 - secrets or credentials
 
 For raw OpenTelemetry ingestion, top-level filterable trace metadata should use `langfuse.trace.metadata.<key>` attributes. Standard OTel attributes are still captured but may land under catch-all metadata and be less useful for Langfuse filtering.
+
+> ⚠️ **Watch out:** Generic OTel attributes without the `langfuse.trace.metadata.<key>` prefix land in catch-all metadata and cannot be used as Langfuse dashboard filters.
 
 Layered explanation:
 
@@ -351,7 +357,7 @@ Layered explanation:
 - Production implications: dataset quality determines whether release gates catch meaningful regressions.
 - Common mistakes: including only easy examples, failing to preserve source trace links, and letting expected outputs become stale.
 
-## Langfuse Metrics
+## 📊 Langfuse Metrics
 
 Langfuse metrics are derived from observability and evaluation traces. They are strongest for:
 
@@ -362,7 +368,7 @@ Langfuse metrics are derived from observability and evaluation traces. They are 
 
 Use custom dashboards and the metrics API for product and AI quality questions. Use OpenTelemetry metrics for infrastructure alerting and SLOs.
 
-## End-to-End Trace Example
+## 🗺️ End-to-End Trace Example
 
 This compact shape gives future debuggers enough evidence without turning Langfuse into a raw data lake:
 
@@ -414,7 +420,7 @@ This compact shape gives future debuggers enough evidence without turning Langfu
 
 Avoid copying this literally into every service. Use it as a minimum review shape: identity, workflow, versioning, step evidence, model usage, and quality.
 
-## Tradeoffs and Decision Points
+## 📐 Tradeoffs and Decision Points
 
 | Decision | Prefer this | Tradeoff |
 | --- | --- | --- |
@@ -425,7 +431,7 @@ Avoid copying this literally into every service. Use it as a minimum review shap
 | Scores vs tags | Scores for quality judgments, tags for classification | Misusing tags for quality blocks evaluation analytics. |
 | Dataset inclusion | Representative, reviewed failures and common paths | Random dumps of production data create noisy regression tests. |
 
-## Troubleshooting the Data Model
+## 🔍 Troubleshooting the Data Model
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
@@ -436,7 +442,7 @@ Avoid copying this literally into every service. Use it as a minimum review shap
 | Quality dashboards disagree across teams | Score names or value meanings are inconsistent | Define score configs and evaluator versions; document score semantics. |
 | Production failures are not reproducible | Interesting traces never become dataset items | Add a triage step to promote failures into datasets with source trace IDs. |
 
-## How Langfuse Relates to OpenTelemetry
+## 🔗 How Langfuse Relates to OpenTelemetry
 
 | OpenTelemetry concept | Langfuse concept |
 | --- | --- |
@@ -450,7 +456,7 @@ Avoid copying this literally into every service. Use it as a minimum review shap
 
 The practical rule: use OpenTelemetry to represent distributed work consistently, then use Langfuse fields to make LLM behavior understandable.
 
-## Naming Guidelines
+## 🏷️ Naming Guidelines
 
 Use stable, low-cardinality names:
 
@@ -469,7 +475,7 @@ Avoid embedding request-specific values:
 
 Put variable details in input, output, metadata, or span attributes depending on sensitivity and query needs.
 
-## Minimal Trace Shape for Production LLM Apps
+## 🗺️ Minimal Trace Shape for Production LLM Apps
 
 Every important LLM trace should answer:
 
@@ -482,7 +488,7 @@ Every important LLM trace should answer:
 - Was it good? (scores, feedback, guardrail results)
 - What changed after deploys? (release/version dimensions)
 
-## Data Model Checklist
+## ✅ Data Model Checklist
 
 - Define stable trace names for each product workflow.
 - Define observation names and types for retrieval, tools, generations, agents, guardrails, evaluators, and persistence steps.

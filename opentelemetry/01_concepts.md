@@ -25,7 +25,7 @@ OpenTelemetry does not replace your backend. It standardizes what your code
 emits and how telemetry moves to tools such as Jaeger, Prometheus, Grafana,
 Datadog, Honeycomb, Elastic, or Langfuse.
 
-## What OpenTelemetry Is Not
+## 📌 What OpenTelemetry Is Not
 
 It is important to be precise:
 
@@ -53,7 +53,7 @@ The reason this is powerful is separation of concerns. Application code should
 describe what happened. Pipeline configuration should decide where that data
 goes. Backends should store, query, visualize, and alert on it.
 
-## The Problem OTel Solves
+## 🧭 The Problem OTel Solves
 
 Without OTel, observability often looks like this:
 
@@ -89,7 +89,7 @@ That gives you:
 - one pipeline layer where you can batch, redact, sample, transform, and route;
 - freedom to change or add backends without rewriting application code.
 
-## The End-To-End Lifecycle
+## 🔄 The End-To-End Lifecycle
 
 A concrete request makes the architecture easier to understand. Imagine a
 FastAPI `chat-api` service receives `POST /chat`, calls a retrieval service,
@@ -145,7 +145,7 @@ The glue is not magic. It is mainly:
 - propagation headers: usually W3C `traceparent`, `tracestate`, and `baggage`;
 - SDK and Collector pipelines that export the data consistently.
 
-## The Six Layers
+## 📦 The Six Layers
 
 Every OpenTelemetry setup has the same conceptual layers, even if a small local
 demo collapses some of them.
@@ -162,7 +162,7 @@ demo collapses some of them.
 When notes or docs say "configure OpenTelemetry", ask which layer they mean.
 Many confusions come from mixing these layers together.
 
-## Signals
+## 📡 Signals
 
 OpenTelemetry supports multiple signals. For application observability, the
 main three are traces, metrics, and logs. Baggage is context that can travel
@@ -416,6 +416,8 @@ The LLM child is `ERROR`, but the root HTTP span remains `UNSET` and records
 `http.response.status_code=202`. That is correct here: the application handled
 the provider failure and successfully accepted asynchronous work. A parent's
 status describes the parent operation, not the worst status among its children.
+
+> 💡 **Key insight:** A parent span's status reflects its own outcome, not the worst status of any child — a request that gracefully handles a failed provider call and returns 202 should remain UNSET, not inherit the child's ERROR.
 
 The consumer span has a different trace ID and no parent, but contains this
 relationship:
@@ -968,7 +970,9 @@ every service in the chain. Do not put secrets, API keys, emails, raw prompts,
 retrieved documents, access tokens, or personal data in baggage. Treat incoming
 baggage as untrusted unless you control the caller.
 
-## API, SDK, And Instrumentation
+> ⚠️ **Watch out:** Baggage is forwarded to every downstream service in the call chain — never put secrets, tokens, emails, or prompts in it, and treat baggage arriving from untrusted callers as potentially adversarial.
+
+## 🔌 API, SDK, And Instrumentation
 
 OpenTelemetry separates the API from the SDK.
 
@@ -1017,6 +1021,8 @@ trace.set_tracer_provider(provider)
 If no SDK is configured, API calls are no-ops. This is intentional. A library
 can safely depend on `opentelemetry-api` and create spans without forcing an
 exporter or backend on every application that imports it.
+
+> 💡 **Key insight:** A shared library can add full instrumentation by depending only on opentelemetry-api — the application that configures the SDK decides where telemetry goes, with zero overhead in libraries that are imported without one.
 
 ### Providers
 
@@ -1091,7 +1097,7 @@ Manual instrumentation fills the business gaps:
 Use both. Auto-instrumentation gives coverage. Manual instrumentation gives
 meaning.
 
-## Resources
+## 🏷️ Resources
 
 A resource describes the entity that produced telemetry. Every production
 service should set `service.name` explicitly.
@@ -1131,7 +1137,7 @@ Resources are attached to telemetry by the provider. Once a provider is created
 with a resource, telemetry from tracers and meters from that provider carries
 that resource.
 
-## Context Propagation
+## 🔗 Context Propagation
 
 Context propagation is what turns separate spans from separate processes into
 one trace.
@@ -1199,7 +1205,7 @@ Common causes:
 - services use incompatible propagator configuration;
 - incoming context is extracted after the server span has already been created.
 
-## Semantic Conventions
+## 🏷️ Semantic Conventions
 
 Semantic conventions are standard names for common telemetry. They are why
 backends can understand traces and metrics from many languages and libraries.
@@ -1229,7 +1235,7 @@ Do not invent names that conflict with official conventions. Do not use
 backend-specific names in general application instrumentation unless the data is
 intentionally backend-specific.
 
-## Exporters
+## 📤 Exporters
 
 Exporters send telemetry out of the SDK or Collector.
 
@@ -1261,7 +1267,7 @@ but production systems usually benefit from a Collector because it centralizes
 routing, retries, redaction, sampling, batching, credentials, and backend
 configuration.
 
-## Processors, Readers, And Samplers
+## 🔄 Processors, Readers, And Samplers
 
 Telemetry usually does not go straight from API call to network request. The SDK
 has signal-specific components in between.
@@ -1335,7 +1341,9 @@ to reach the same sampling decision point.
 Sampling affects traces. It should not be your only source of request counts,
 error rates, or SLO metrics. Emit metrics separately.
 
-## The Collector
+> ⚠️ **Watch out:** Sampled traces cannot produce accurate request counts, error rates, or SLO metrics — always emit metrics independently, or your alerts will fire on noise from sampling math rather than real incidents.
+
+## 🔀 The Collector
 
 The OpenTelemetry Collector is a telemetry proxy. It can receive telemetry in
 several formats, process it, and export it to one or more backends.
@@ -1401,7 +1409,7 @@ Common production reasons to use a Collector:
 - protect backends with batching, retry, and queueing;
 - observe the telemetry pipeline itself.
 
-## Backends
+## 🗄️ Backends
 
 Backends are where telemetry becomes useful to humans and automation:
 
@@ -1431,7 +1439,7 @@ They work well together. A common pattern is to send rich LLM traces to
 Langfuse and send operational traces, metrics, and logs to general observability
 backends.
 
-## Signal Correlation
+## 🔗 Signal Correlation
 
 The signals answer different questions:
 
@@ -1457,7 +1465,7 @@ This is why correlation matters. Without shared resource attributes, trace IDs,
 semantic names, and low-cardinality dimensions, every backend becomes a separate
 island.
 
-## Environment Variables Worth Knowing
+## 🌐 Environment Variables Worth Knowing
 
 Many SDKs and instrumentations support standard environment variables. Exact
 support varies by language, but these are common:
@@ -1480,7 +1488,7 @@ support varies by language, but these are common:
 Prefer environment configuration for deployment-specific values. Prefer code
 for application-specific manual spans and metric instruments.
 
-## Common Design Rules
+## 📐 Common Design Rules
 
 ### Where To Put Data
 
@@ -1566,7 +1574,7 @@ If you need rich LLM payload observability, make an explicit decision about
 where that data goes, how it is masked, who can access it, and how long it is
 retained.
 
-## Common Misunderstandings
+## ⚠️ Common Misunderstandings
 
 ### "The exporter is the backend"
 
@@ -1611,7 +1619,7 @@ operations, product concepts, LLM prompt flow, retrieval strategy, quality
 signals, or domain-specific outcomes. Add manual instrumentation where the
 business meaning lives.
 
-## A Minimal Production Shape
+## 🗺️ A Minimal Production Shape
 
 For a production service, aim for this baseline:
 
@@ -1641,7 +1649,7 @@ Backends
   LLM-specific analysis in Langfuse when needed
 ```
 
-## Troubleshooting Checklist
+## ✅ Troubleshooting Checklist
 
 No telemetry appears:
 
@@ -1684,7 +1692,7 @@ LLM traces are not useful:
 - Are retrieval, reranking, tool execution, and guardrails separate spans?
 - Are metrics emitted separately for latency, errors, tokens, and quality events?
 
-## How To Read The Rest Of These Notes
+## 🧭 How To Read The Rest Of These Notes
 
 This page is the conceptual map. The rest of the OpenTelemetry notes deepen
 specific parts of the map:

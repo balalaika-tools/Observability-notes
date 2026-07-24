@@ -2,7 +2,7 @@
 
 Last verified against official Langfuse and OpenTelemetry documentation on 2026-07-24.
 
-## Mental Model
+## 🧭 Mental Model
 
 Raw OpenTelemetry ingestion is the interoperability path into Langfuse. For a vendor-neutral implementation, applications emit normal OpenTelemetry spans and send OTLP only to an OpenTelemetry Collector. Standard semantic conventions and organization-owned attributes form the application contract; destination-specific attributes, credentials, endpoints, and exporters belong in Collector configuration.
 
@@ -20,6 +20,8 @@ application spans
 
 The application does not know whether the general backend is Groundcover, AWS X-Ray, Jaeger, Tempo, or another OTLP-compatible destination. Replacing a backend changes Collector configuration, not instrumentation code.
 
+> 💡 **Key insight:** With this architecture, swapping Langfuse for a different observability backend — or adding one — requires only a Collector config change, not a code deployment.
+
 Langfuse can ingest OpenTelemetry traces directly over OTLP/HTTP. Use this when:
 
 - your service is not Python or JavaScript/TypeScript;
@@ -29,7 +31,7 @@ Langfuse can ingest OpenTelemetry traces directly over OTLP/HTTP. Use this when:
 
 This path does not provide the Langfuse SDK's convenience methods for prompt management, datasets, experiments, or scoring. Services or workers that use those APIs become intentionally Langfuse-aware; keep that decision separate from the vendor-neutral tracing path.
 
-## Vendor-Neutral Application Contract
+## 📐 Vendor-Neutral Application Contract
 
 Framework independence and backend independence are separate:
 
@@ -83,7 +85,7 @@ Prefer a standard semantic convention over an equivalent `app.*` attribute. Use 
 
 Vendor-neutral does not mean every backend provides the same experience from the same raw attribute. In Langfuse, unmapped span attributes remain inspectable under catch-all metadata, but their nested keys are not directly filterable. The Langfuse pipeline therefore copies selected neutral attributes into Langfuse's first-class schema without changing the source contract.
 
-## Lifecycle of a Raw OTLP Trace
+## 🔄 Lifecycle of a Raw OTLP Trace
 
 1. Your service starts a root span for the user-visible workflow.
 2. The service records standard OTel attributes plus documented `app.*` workflow and business dimensions.
@@ -98,9 +100,11 @@ Vendor-neutral does not mean every backend provides the same experience from the
 
 The hard part is not exporting bytes. It is preserving a complete trace while maintaining one stable application schema and applying backend-specific mappings only at destination boundaries.
 
-## Langfuse Endpoint in the Collector
+## 🔌 Langfuse Endpoint in the Collector
 
 Langfuse supports OTLP over HTTP with JSON or protobuf. OTLP/gRPC is not supported.
+
+> ⚠️ **Watch out:** Configuring an OTLP/gRPC exporter pointed at Langfuse will silently fail — Langfuse only accepts OTLP/HTTP.
 
 In the vendor-neutral architecture, configure the base endpoint on the Collector's Langfuse exporter, not in the application environment:
 
@@ -112,7 +116,7 @@ exporters:
 
 The `otlphttp` exporter appends `/v1/traces`. A direct, signal-specific exporter instead uses `https://cloud.langfuse.com/api/public/otel/v1/traces`. Use the correct base URL for your Langfuse region or self-hosted instance. Current Langfuse Cloud regions include EU (`https://cloud.langfuse.com`), US (`https://us.cloud.langfuse.com`), Japan (`https://jp.cloud.langfuse.com`), and HIPAA (`https://hipaa.cloud.langfuse.com`).
 
-## Langfuse Authentication in the Collector
+## 🔒 Langfuse Authentication in the Collector
 
 Langfuse uses Basic Auth where the username is the public key and the password is the secret key. Inject their base64-encoded `public_key:secret_key` value into the Collector secret `LANGFUSE_AUTH_STRING`:
 
@@ -134,7 +138,7 @@ Security rules:
 - Use TLS to Langfuse and TLS/mTLS or network policy between applications and Collectors.
 - Treat OTel headers as credentials when they contain Langfuse Basic Auth.
 
-## Direct Python Exporter: Vendor-Coupled Alternative
+## 🛠️ Direct Python Exporter: Vendor-Coupled Alternative
 
 The following direct exporter is useful for a small proof of concept, but it is not the recommended implementation when backend independence is a requirement. It places the Langfuse endpoint, authentication, and ingestion behavior in application configuration. In the vendor-neutral design, the application instead uses a normal OTLP exporter pointed at the Collector.
 
@@ -191,7 +195,7 @@ finally:
 
 `BatchSpanProcessor` exports asynchronously. Without `force_flush()` or `shutdown()`, the last batch from a CLI, test, worker, or serverless invocation can remain in memory when the process exits. In long-running services, call `shutdown()` once from the process lifespan hook. For the vendor-neutral production path, configure the application exporter with the Collector's OTLP endpoint and keep destination authentication, redaction, retry, batching, and routing in the Collector.
 
-## Langfuse Destination Mapping Reference
+## 🔗 Langfuse Destination Mapping Reference
 
 Raw OpenTelemetry spans become Langfuse observations. The following attributes map fields into first-class Langfuse concepts, but in the vendor-neutral design the Collector adds them; application code does not.
 
@@ -212,7 +216,7 @@ Layered explanation:
 - Production implications: attribute names become a contract across services and dashboards.
 - Common mistakes: adding vendor attributes in application code, relying on arbitrary OTel attributes to become filterable metadata, and sending arrays/maps through exporters that do not support them.
 
-## Trace-Level Mapping
+## 🔗 Trace-Level Mapping
 
 Common trace-level attributes:
 
@@ -238,7 +242,7 @@ Layered explanation:
 - Production implications: use a consistent neutral propagation strategy at the root of every request and perform Langfuse enrichment after propagation.
 - Common mistakes: setting correlation attributes only on the root span, mapping them only on a generation span, or storing values as nested metadata that cannot be filtered.
 
-## Observation Mapping
+## 📦 Observation Mapping
 
 Common observation attributes:
 
@@ -269,7 +273,7 @@ Layered explanation:
 - Production implications: accurate observation mapping drives trace readability, token/cost charts, and model-level comparisons.
 - Common mistakes: missing model or usage data, using only legacy GenAI fields in new code, and putting step-specific metadata on the trace.
 
-## Propagating Trace Attributes with Baggage
+## 🔗 Propagating Trace Attributes with Baggage
 
 OpenTelemetry trace context connects spans across services. Baggage can carry selected neutral correlation dimensions so downstream services can copy the same fields onto their spans before the Collector performs destination-specific mapping.
 
@@ -332,7 +336,7 @@ Recommended production options:
 
 Langfuse SDK propagation helpers are appropriate for the intentionally vendor-coupled SDK and framework paths described in [06_framework_integrations.md](06_framework_integrations.md). Do not use them in a service whose tracing contract must remain backend-independent.
 
-## Collector-Owned Routing and Vendor Mapping
+## 📐 Collector-Owned Routing and Vendor Mapping
 
 A common production pattern sends ordinary operational traces to the general tracing backend and sends complete LLM/agent workflow traces to Langfuse. The general backend can also receive the complete GenAI stream when operators need end-to-end service diagnostics there.
 
@@ -412,6 +416,8 @@ GenAI services send all spans for a GenAI workflow to port 4327/4328; ordinary w
 
 If one service mixes GenAI and non-GenAI workflows and cannot choose an ingress endpoint per workflow, route by complete trace rather than by individual span. Propagate a neutral root marker such as `app.telemetry.category="genai"` to all relevant spans, or evaluate it in a trace-aware component after the trace has been assembled. A span-level filter that keeps only spans containing `gen_ai.request.model` will discard roots, HTTP spans, retrievers, tools, and guardrails and break the workflow tree.
 
+> ⚠️ **Watch out:** Filtering by individual span attributes (like model name) instead of by complete trace routes the LLM leaf spans to Langfuse while silently dropping the root, retriever, and tool spans needed to understand them.
+
 Architecture responsibilities:
 
 | Component | Responsibility |
@@ -425,7 +431,7 @@ Architecture responsibilities:
 
 Use Collector routing when platform teams need centralized backend selection or cost control. SDK-level `should_export_span` is part of a Langfuse-coupled implementation and is not the right boundary for the vendor-neutral path.
 
-## Langfuse-Coupled Raw-OTLP Dataset Experiment
+## 📁 Langfuse-Coupled Raw-OTLP Dataset Experiment
 
 This section is outside the vendor-neutral tracing boundary. Langfuse dataset identity, experiment attributes, and score APIs are product-specific features, so a worker that uses them is intentionally Langfuse-aware. Keep such code in a dedicated evaluation component rather than leaking its contract into general application instrumentation.
 
@@ -574,7 +580,7 @@ finally:
 
 Register `ExperimentBaggageSpanProcessor` before starting any spans. For a Langfuse-managed dataset, use the dataset and item IDs returned by Langfuse and set every item's `version` to the exact fetched dataset version timestamp. Local datasets may use stable local correlation IDs but must omit item version. Input, actual output, and expected output belong on the item root; experiment/item identity belongs in baggage so child spans participate in the same experiment.
 
-## Post-Transform OTLP Shape at the Langfuse Boundary
+## 🗺️ Post-Transform OTLP Shape at the Langfuse Boundary
 
 The application does not build this vendor-enriched payload. The Collector produces it after `transform/langfuse`, and the conceptual shape helps debug the Langfuse boundary:
 
@@ -617,7 +623,7 @@ The application does not build this vendor-enriched payload. The Collector produ
 
 The real OTLP encoding may be protobuf or JSON. Before the transform, the same span contains the neutral source attributes; after the transform, it also contains the required Langfuse mapping attributes.
 
-## Mapping Pitfalls
+## ⚠️ Mapping Pitfalls
 
 - Sending OTLP/gRPC to Langfuse. Use OTLP/HTTP.
 - Missing Basic Auth or using secret/public keys in the wrong order.
@@ -631,7 +637,7 @@ The real OTLP encoding may be protobuf or JSON. Before the transform, the same s
 - Using attribute path segments named `__proto__`, `constructor`, or `prototype`. Langfuse silently drops those segments; rename them during normalization, for example to `proto_name`, `constructor_name`, or `prototype_name`.
 - Treating Langfuse as a metrics backend for all OTel metrics. Langfuse is trace and LLM workflow focused; send operational metrics to a metrics backend.
 
-## Troubleshooting
+## 🔍 Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
@@ -645,7 +651,7 @@ The real OTLP encoding may be protobuf or JSON. Before the transform, the same s
 | User/session filters miss spans | Neutral correlation attributes were not propagated to all relevant spans | Use neutral baggage plus explicit allowlist copying before Collector mapping. |
 | Sensitive headers/documents appear | Redaction processor missing or ordered too late | Redact before exporting to Langfuse and logs; add tests for representative payloads. |
 
-## OTLP Production Checklist
+## ✅ OTLP Production Checklist
 
 - Point applications only at trusted Collector OTLP receivers.
 - Keep vendor endpoints, credentials, headers, and attribute mapping out of application code.
@@ -661,7 +667,7 @@ The real OTLP encoding may be protobuf or JSON. Before the transform, the same s
 - Route operational metrics to a metrics backend and logs to a log backend.
 - Validate Collector config and test both exported shapes in staging: the APM payload must remain vendor-neutral, and the Langfuse payload must contain the expected first-class mappings.
 
-## Official References
+## 🔌 Official References
 
 - Langfuse OpenTelemetry integration: <https://langfuse.com/integrations/native/opentelemetry>
 - Langfuse v4 custom OTEL ingestion migration: <https://langfuse.com/integrations/native/opentelemetry/migration-to-v4>

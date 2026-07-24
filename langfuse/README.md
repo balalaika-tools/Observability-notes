@@ -6,7 +6,7 @@ Langfuse is an observability, evaluation, prompt management, and metrics platfor
 
 This section assumes you already understand the OpenTelemetry basics in [../opentelemetry/README.md](../opentelemetry/README.md). Start here when you want to use Langfuse in production Python applications.
 
-## Mental Model
+## 🧭 Mental Model
 
 Langfuse is the LLM behavior ledger for an application. It records what the user or system asked for, which workflow ran, which model calls, retrievals, tools, agents, and guardrails happened, what they cost, whether they were good, and which release or prompt version produced them.
 
@@ -39,7 +39,7 @@ product request
 
 When something goes wrong, start with metrics or user feedback, open the relevant Langfuse traces, classify the failure, turn representative examples into dataset items, run experiments, and ship the fix with release/version markers.
 
-## Reading Path
+## 🗺️ Reading Path
 
 | File | What it covers |
 | --- | --- |
@@ -52,7 +52,7 @@ When something goes wrong, start with metrics or user feedback, open the relevan
 
 Read the guide in order if you are designing a new rollout. Jump to the integration or production file when you are upgrading an existing service.
 
-## Which Integration Should You Use?
+## 📐 Which Integration Should You Use?
 
 | Situation | Recommended path |
 | --- | --- |
@@ -70,7 +70,9 @@ Decision points:
 - Use raw OTLP when you need language/runtime neutrality or central Collector routing.
 - Use both SDK and OpenTelemetry carefully in the same process only when you understand which spans each exporter sends. Duplicate model spans make costs and debugging noisy.
 
-## Shared Terminology
+> ⚠️ **Watch out:** Running both the Langfuse SDK exporter and a separate OTLP exporter in the same process for the same model calls silently doubles your token count and cost figures in dashboards.
+
+## 🏷️ Shared Terminology
 
 Use these terms consistently across the guide:
 
@@ -88,7 +90,7 @@ Use these terms consistently across the guide:
 | Version | The logical workflow, prompt, chain, agent, or evaluator version. |
 | Environment | Deployment context such as `dev`, `staging`, or `prod`. |
 
-## Production Mental Model
+## 🧭 Production Mental Model
 
 Use Langfuse as the LLM observability and evaluation system, not as a replacement for your whole telemetry stack.
 
@@ -108,7 +110,9 @@ Application
 
 The production setup uses each signal deliberately. Langfuse explains LLM and agent behavior and can notify on supported observation/score thresholds. The external metrics and incident stack owns infrastructure SLOs, unsupported signals, paging policy, and advanced escalation. Logs provide exact operational evidence.
 
-## End-to-End Lifecycle
+> 💡 **Key insight:** Langfuse answers "what happened in the LLM workflow and was it good?" — it is not a general-purpose alerting, logging, or infrastructure monitoring system, and trying to make it one creates blind spots.
+
+## 🔄 End-to-End Lifecycle
 
 1. A user request, scheduled job, or agent task enters your system.
 2. The application creates a root trace/observation with stable workflow name, release, environment, user/session IDs, tags, and safe metadata.
@@ -121,7 +125,7 @@ The production setup uses each signal deliberately. Langfuse explains LLM and ag
 
 The main design goal is not "capture everything." It is "capture enough safe context that a future engineer can explain a bad answer, reproduce it, and know whether the fix helped."
 
-## Production Architecture Shapes
+## 🗺️ Production Architecture Shapes
 
 | Shape | Use when | Responsibilities |
 | --- | --- | --- |
@@ -131,7 +135,7 @@ The main design goal is not "capture everything." It is "capture enough safe con
 | Model gateway with LiteLLM or similar | Many apps call models through one provider abstraction | Gateway captures provider calls and cost; applications should still pass user/session/workflow attributes and add business spans where needed. |
 | Offline evaluation worker | You run datasets, evaluators, or batch scoring outside request path | Worker runs experiments, records traces and scores, flushes before exit, and writes release-gate results to CI/CD or dashboards. |
 
-## Production Readiness Themes
+## ✅ Production Readiness Themes
 
 - Configuration: set credentials, base URL, environment, release, sample rate, and debug flags from environment/secret management.
 - Security: keep Langfuse keys out of code, rotate them like other service credentials, and keep Collector receivers private.
@@ -141,7 +145,7 @@ The main design goal is not "capture everything." It is "capture enough safe con
 - Environment separation: use separate projects or strict environment fields when prod/dev access, retention, or compliance policies differ.
 - Testing: include tracing smoke tests, dataset experiments for prompt/model changes, and dashboard/alert validation in staging.
 
-## Official References
+## 🔌 Official References
 
 - Langfuse SDK overview: <https://langfuse.com/docs/observability/sdk/overview>
 - Langfuse instrumentation: <https://langfuse.com/docs/observability/sdk/instrumentation>
@@ -157,7 +161,7 @@ The main design goal is not "capture everything." It is "capture enough safe con
 - Python SDK reference: <https://python.reference.langfuse.com/langfuse>
 - Langfuse integrations: <https://langfuse.com/integrations>
 
-## Guide Checklist
+## ✅ Guide Checklist
 
 - Pick one primary ingestion path per service: SDK, framework integration, raw OTLP, or gateway.
 - Name traces by product workflow, not request-specific values.

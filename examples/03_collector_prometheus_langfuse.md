@@ -10,7 +10,7 @@ This example uses the OpenTelemetry Collector as a production routing layer:
 - logs go to a log backend;
 - alert rules run from metrics, while Langfuse is used for investigation and quality workflows.
 
-## Collector Configuration
+## 🔀 Collector Configuration
 
 ```yaml
 extensions:
@@ -405,6 +405,8 @@ when no trace backend has the trace. See
 for head-sampling filters, tail-aligned buffering tradeoffs, and the required
 relationship between error logs and span status.
 
+> 💡 **Key insight:** The tail sampler applies only to `traces/langfuse` — the general traces pipeline is unaffected, so traces rejected from Langfuse may still appear in the general backend.
+
 These lists are deny-by-key second lines of defense. Application code must allowlist captured content before it creates spans, especially on the richer Langfuse path. Add keys for every captured header and instrumentation library, then test canary secrets in span attributes, span events, exception data, and log bodies.
 
 `UnderscoreEscapingWithoutSuffixes` is explicit: dots and unsupported characters become underscores, while unit and counter-type suffixes are not added. Histogram structural series still use `_bucket`, `_count`, and `_sum`. The PromQL below is written for that strategy. If you choose the default `UnderscoreEscapingWithSuffixes`, regenerate and test every series name instead of copying these rules.
@@ -415,7 +417,9 @@ Validate Collector config before deployment:
 otelcol validate --config collector.yaml
 ```
 
-## Langfuse Authentication and Region
+## 🔌 Langfuse Authentication and Region
+
+> ⚠️ **Watch out:** Store the auth string in a secret manager, not a ConfigMap or committed `.env` file — it encodes your full Langfuse ingestion credentials.
 
 `LANGFUSE_AUTH_STRING` is Base64 encoding of the existing `public_key:secret_key` pair. It is not a third credential. Create it without a trailing newline and inject it through the deployment secret manager:
 
@@ -436,9 +440,11 @@ export LANGFUSE_OTEL_ENDPOINT="https://cloud.langfuse.com/api/public/otel"
 # Self-hosted: https://langfuse.example.com/api/public/otel
 ```
 
+> 💡 **Key insight:** `LANGFUSE_AUTH_STRING` is your existing public/secret key pair Base64-encoded — it is not a new credential to provision or rotate independently.
+
 Store the keys and encoded value in a secret manager, not a ConfigMap or committed `.env` file. Restrict the storage directory for `file_storage`; it contains telemetry buffered during outages. The `x-langfuse-ingestion-version: 4` header opts raw OTLP spans into Langfuse Cloud Fast Preview so v2 views update in real time.
 
-## Application Environment
+## 🗺️ Application Environment
 
 Applications export to the Collector, not directly to every backend.
 
@@ -453,6 +459,8 @@ export OTEL_SEMCONV_STABILITY_OPT_IN="http"
 ```
 
 `OTEL_SEMCONV_STABILITY_OPT_IN=http` selects the stable HTTP metric and attribute names used by the rules below. During a migration, `http/dup` emits old and stable telemetry together and therefore requires deduplication; do not leave it enabled accidentally.
+
+> ⚠️ **Watch out:** Do not leave `OTEL_SEMCONV_STABILITY_OPT_IN=http/dup` enabled in production — it emits duplicate telemetry that must be deduplicated before alerting on it.
 
 The Collector tail-sampling policy above keeps complete LLM traces when they
 match important values or thresholds:
@@ -540,12 +548,14 @@ Use `drop-explicit-no-sample` only for traces you are comfortable losing even if
 another policy would keep them. If errors must always win, remove that drop
 policy.
 
+> ⚠️ **Watch out:** The `drop-explicit-no-sample` policy runs before all keep policies — setting `app.do_not_sample=true` drops traces that error or cost policies would otherwise retain.
+
 If a Python service uses the Langfuse SDK directly, it can still export Langfuse traces itself. Choose one path per service to avoid duplicate spans:
 
 - SDK direct export: easiest for Python LLM code.
 - Collector export: best when platform teams centralize telemetry.
 
-## Alert Rules
+## 🔔 Alert Rules
 
 These rules match the configured `UnderscoreEscapingWithoutSuffixes` strategy and the stable HTTP semantic convention. Resource-to-telemetry conversion supplies `service_name` and `deployment_environment_name`. Inspect actual series before enabling pages.
 
@@ -767,7 +777,7 @@ groups:
           summary: "RAG empty retrieval rate is above 10%"
 ```
 
-## Quality Alerts from Langfuse
+## 🧪 Quality Alerts from Langfuse
 
 Use a native Langfuse Monitor when its observation/score metric, filters, and notification behavior cover the threshold. For a custom bridge, query Langfuse on a schedule and publish both a quality gauge and a monotonic `llm.quality.score.observations` counter incremented by the number of newly processed scores. Make the polling cursor and counter durable so restarts do not double-count windows.
 
@@ -805,7 +815,7 @@ Then alert on sustained drops:
           summary: "RAG answer relevance dropped below threshold"
 ```
 
-## Executable Policy and Rule Tests
+## ✅ Executable Policy and Rule Tests
 
 Validate sampling with a Collector test config that replaces the Langfuse exporter with `debug` and changes only `sample-five-percent` to 100 percent. The following generator emits one trace for every policy plus an unmatched trace. It uses explicit timestamps, so the latency case does not sleep for 16 seconds.
 
@@ -910,7 +920,7 @@ tests:
 
 Add fixtures for every rule: one firing case, one below-threshold case, one below-minimum-volume case, and one series from another service/environment that must not affect the result. These tests catch name-translation, label, denominator, and threshold errors that `promtool check rules` cannot.
 
-## Incident Workflow
+## 🔍 Incident Workflow
 
 When an alert fires:
 
@@ -922,7 +932,7 @@ When an alert fires:
 6. Run an experiment for the proposed fix.
 7. Deploy behind a release/version marker and watch both metrics and Langfuse dashboards.
 
-## Production Notes
+## ✅ Production Notes
 
 - Keep Collector receivers private; do not expose them publicly.
 - Use TLS/mTLS or network policy between applications and Collectors.

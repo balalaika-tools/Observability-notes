@@ -2,20 +2,21 @@
 
 OpenTelemetry is the vendor-neutral instrumentation layer for modern distributed systems. It gives you a standard way to create traces, metrics, logs, context propagation, and telemetry pipelines without tying application code to a single backend.
 
-This section is a beginner-to-production guide. It starts with the mental model, then moves into Python examples, multi-service propagation, metrics, production collector patterns, alerting, and the GenAI conventions used by LLM and agent systems.
+This section is a beginner-to-production guide. It starts with the mental model, then moves into Python examples, multi-service propagation, metrics, production collector patterns, deployment, alerting, and the GenAI conventions used by LLM and agent systems.
 
-## Reading Path
+## 🧭 Reading Path
 
 | File | Purpose |
 | --- | --- |
 | [01_concepts.md](01_concepts.md) | The full OTel mental model: signals, context, SDKs, exporters, Collector pipelines, backends, and common pitfalls. |
 | [02_python_instrumentation.md](02_python_instrumentation.md) | Practical Python setup for traces, metrics, logs, exporters, and auto-instrumentation. |
 | [03_production_architecture.md](03_production_architecture.md) | Collector topologies, deployment patterns, sampling, security, and operations. |
+| [deployment/README.md](deployment/README.md) | Image and distribution choices, Docker, Helm vs. Operator, Kubernetes Services, scaling, resilience, security, upgrades, and runbooks. |
 | [04_multi_service_examples.md](04_multi_service_examples.md) | Gateway-to-service tracing, W3C Trace Context, baggage, and signal correlation. |
 | [05_custom_metrics_alerting.md](05_custom_metrics_alerting.md) | Custom metric design, Prometheus-style export, SLOs, alerts, and runbooks. |
 | [06_genai_and_llm_observability.md](06_genai_and_llm_observability.md) | Current GenAI semantic conventions and how they apply to LLM and agent systems. |
 
-## When To Use OpenTelemetry Directly
+## 📐 When To Use OpenTelemetry Directly
 
 Use raw OpenTelemetry instrumentation when:
 
@@ -50,7 +51,7 @@ OpenTelemetry Collector
   |-- logs -> log backend
 ```
 
-## Official References Used
+## 📌 Official References Used
 
 This guide was checked on July 20, 2026. Core semantic-convention guidance is
 anchored to `v1.43.0`; the faster-moving GenAI material is separately anchored

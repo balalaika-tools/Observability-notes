@@ -2,7 +2,7 @@
 
 Last verified against official Langfuse Python SDK documentation on 2026-07-20.
 
-## Mental Model
+## 🧭 Mental Model
 
 The current Langfuse Python SDK is v4. Import from `langfuse`, not from the legacy `langfuse.decorators` module.
 
@@ -22,7 +22,7 @@ It solves application-level trace shape: what the workflow did, which model call
 
 Use the SDK when you can edit the Python code. Use [03_otel_ingestion_and_mapping.md](03_otel_ingestion_and_mapping.md) when the service is not Python/JS, when a platform team requires raw OTLP, or when a Collector owns routing.
 
-## Install
+## 🛠️ Install
 
 ```bash
 pip install langfuse
@@ -36,7 +36,7 @@ For a typical LLM service you may also install provider clients and OpenTelemetr
 pip install openai httpx fastapi uvicorn opentelemetry-instrumentation-fastapi opentelemetry-instrumentation-httpx
 ```
 
-## Configure
+## 🛠️ Configure
 
 Set credentials in the environment:
 
@@ -70,7 +70,7 @@ Production setup rules:
 - Set `LANGFUSE_RELEASE` to the deployed artifact and `LANGFUSE_TRACING_ENVIRONMENT` to `prod`, `staging`, or `dev`.
 - Treat `LANGFUSE_TRACING_ENABLED=false` as a temporary kill switch, not a permanent privacy control.
 
-## Initialize
+## 🛠️ Initialize
 
 ```python
 from langfuse import get_client
@@ -95,7 +95,7 @@ langfuse = Langfuse(
 
 Constructor arguments override environment values for that client instance. In production, prefer environment variables for credentials and deployment-specific settings, and use constructor arguments only when the process intentionally talks to multiple projects or needs test-specific overrides.
 
-## Singleton and Multi-Project Use
+## 🔌 Singleton and Multi-Project Use
 
 `get_client()` uses a singleton pattern. In normal single-project services, calling it from many modules returns the same client and avoids duplicate exporters.
 
@@ -106,6 +106,8 @@ langfuse = get_client()
 ```
 
 Multi-project use is experimental. If more than one project client exists in the same process, pass `public_key` when retrieving a client. Without an explicit project key, the SDK returns a disabled client to avoid cross-project data leakage.
+
+> ⚠️ **Watch out:** In multi-project mode, calling `get_client()` without a `public_key` returns a silently disabled client — traces disappear with no error.
 
 ```python
 from langfuse import Langfuse, get_client
@@ -149,7 +151,7 @@ response = client.chat.completions.create(
 
 For decorators, pass `langfuse_public_key=` to the top-level observed function call. For LangChain, create `CallbackHandler(public_key="pk-lf-project-a")`. Test a deliberately missing-key call and assert it is rejected or absent from every project. If an instrumentation cannot carry the key, isolate projects in separate processes instead of relying on filters to prevent cross-project disclosure.
 
-## Context Manager Instrumentation
+## 🛠️ Context Manager Instrumentation
 
 The context manager is the clearest way to instrument production code because parent-child relationships are explicit and automatic.
 
@@ -250,7 +252,7 @@ with propagate_attributes(prompt=prompt):
 
 The propagated prompt attaches only to generation observations. It does not link root, retriever, tool, or generic span observations. An explicit prompt on a generation takes precedence over the propagated prompt. Do not propagate `prompt` when `prompt.is_fallback` is true: a local fallback has no persisted Langfuse prompt version to link.
 
-## Decorator Instrumentation
+## 🛠️ Decorator Instrumentation
 
 Use `@observe()` for stable functions where function boundaries match observation boundaries.
 
@@ -286,7 +288,7 @@ Layered explanation:
 - Production implications: decorators work best for stable, reusable boundaries like retrievers, tools, guards, and evaluators.
 - Common mistakes: decorating sensitive functions without disabling capture, using decorators on huge low-value helpers, or mixing old `langfuse.decorators` imports with v4 imports.
 
-## Manual Observations
+## 🛠️ Manual Observations
 
 Manual observations are useful for background tasks or lifecycles that do not fit a `with` block. End them explicitly.
 
@@ -313,7 +315,7 @@ Layered explanation:
 - Production implications: use them for batch jobs, queues, and callback-style lifecycles where a context manager is awkward.
 - Common mistakes: forgetting `.end()`, losing parent-child links, or using manual spans where a context manager would be clearer.
 
-## Trace and Observation IDs
+## 🛠️ Trace and Observation IDs
 
 Store trace IDs when another system must attach data later: user feedback, human review, async evaluation, support tickets, or incident links.
 
@@ -340,7 +342,7 @@ def answer_for_ui(question: str) -> dict:
 
 Use `get_current_observation_id()` when an evaluator or feedback item should attach to a specific generation, retriever, tool, or guardrail observation. Use `get_trace_url()` in internal logs or incident comments when people need a direct Langfuse link.
 
-## Cross-Service Attribute Propagation
+## 🔗 Cross-Service Attribute Propagation
 
 For distributed tracing, use OpenTelemetry context propagation for trace IDs. If downstream Langfuse spans must inherit `user_id`, `session_id`, tags, or metadata, propagate them as baggage.
 
@@ -388,7 +390,7 @@ Important mechanics:
 
 See [03_otel_ingestion_and_mapping.md](03_otel_ingestion_and_mapping.md) for the raw OpenTelemetry version of this pattern and [examples/02_multi_service_agent.md](../examples/02_multi_service_agent.md) for a gateway/agent example.
 
-## Custom Trace IDs
+## 🛠️ Custom Trace IDs
 
 Use a deterministic Langfuse trace ID when an external system already owns the request ID and you need stable correlation or idempotent batch processing.
 
@@ -412,7 +414,7 @@ with langfuse.start_as_current_observation(
 
 Trace IDs must be 32 lowercase hexadecimal characters. `create_trace_id(seed=...)` creates a valid deterministic ID from an arbitrary string.
 
-## Updating Current Observations
+## 🛠️ Updating Current Observations
 
 Use current-observation helpers when lower-level code should enrich the active span without receiving the observation object.
 
@@ -432,7 +434,7 @@ def validate_answer(answer: str) -> bool:
 
 Use `update_current_generation()` from code that runs inside an active generation and needs generation-specific fields such as usage, cost, model, or completion start time.
 
-## Capture, Redaction, and Filtering
+## 🔒 Capture, Redaction, and Filtering
 
 The SDK can capture inputs and outputs, but your application owns the privacy decision. Decide capture policy before rollout:
 
@@ -494,7 +496,7 @@ langfuse = Langfuse(
 
 Filtering is powerful but dangerous. Dropping a parent span can create orphaned observations, and dropping non-LLM business spans can remove the context that explains a generation.
 
-## Scores in Application Code
+## 🧪 Scores in Application Code
 
 Use `score_current_trace()` for inline user feedback or guardrail outcomes on the active trace.
 
@@ -530,9 +532,11 @@ langfuse.create_score(
 
 Use deterministic `score_id` values for idempotent evaluators that may retry.
 
-## Flush and Shutdown
+## 🛠️ Flush and Shutdown
 
 The SDK sends telemetry asynchronously. In long-running web services, normal process shutdown hooks are usually enough. In scripts, workers, tests, and serverless functions, flush before exit.
+
+> ⚠️ **Watch out:** In scripts and serverless functions, skipping `flush()` means the last batch of telemetry is silently discarded when the process exits.
 
 ```python
 from langfuse import get_client
@@ -555,7 +559,7 @@ Short-lived process checklist:
 - Call `flush()` before exit.
 - Call `shutdown()` when the process is truly ending and the client should close resources.
 
-## Debugging and Sampling
+## 🔍 Debugging and Sampling
 
 Enable debug logs only while troubleshooting:
 
@@ -579,6 +583,8 @@ langfuse = Langfuse(sample_rate=0.1)
 
 `LANGFUSE_SAMPLE_RATE` is a head-sampling decision. It is made before the request finishes, so it cannot know about a later exception, thumbs-down score, groundedness result, or safety evaluator outcome. Do not claim that a 10-percent SDK sample will later "keep all failures."
 
+> 💡 **Key insight:** Head sampling is irreversible — a score attached to an unsampled trace is never sent, and no later feedback can recover a trace the SDK already discarded.
+
 Choose an implementable retention mechanism:
 
 - Keep `LANGFUSE_SAMPLE_RATE=1` for candidate traffic, then use an external trace buffer/tail-sampling Collector that can decide from final span status and completion attributes.
@@ -601,7 +607,7 @@ Sampling implications:
 - If you sample in the Collector, preserve complete traces. Partial traces are hard to debug.
 - Tail sampling can retain completed errors and safety attributes only when all spans reach the same decision point before its window closes.
 
-## Production Architecture Patterns
+## 🗺️ Production Architecture Patterns
 
 | Pattern | Shape | Notes |
 | --- | --- | --- |
@@ -611,7 +617,7 @@ Sampling implications:
 | Multi-service | Gateway root -> HTTP trace context/baggage -> downstream child observations | Requires HTTP instrumentation or manual W3C propagation. |
 | Experiment runner | Dataset item -> task trace -> evaluator scores -> dataset run | Use deterministic score IDs and stable run names. |
 
-## Troubleshooting
+## 🔍 Troubleshooting
 
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
@@ -624,7 +630,7 @@ Sampling implications:
 | Token/cost charts missing | Generation usage was not recorded | Add `usage_details` or use an integration that captures provider usage. |
 | Debug logging is too noisy | `LANGFUSE_DEBUG` left on | Disable it after troubleshooting. |
 
-## Production Checklist
+## ✅ Production Checklist
 
 - Set `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_BASE_URL` from secret management.
 - Call `auth_check()` at service startup when failing fast is acceptable.
@@ -641,7 +647,7 @@ Sampling implications:
 - Verify default span filtering keeps the parent spans needed to understand traces.
 - Keep operational metrics and logs in their own telemetry stack.
 
-## Official References
+## 🔌 Official References
 
 - SDK overview: <https://langfuse.com/docs/observability/sdk/overview>
 - SDK instrumentation: <https://langfuse.com/docs/observability/sdk/instrumentation>

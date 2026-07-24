@@ -12,7 +12,7 @@ This example shows a single Python service that:
 
 Use the direct SDK bootstrap from [README.md](README.md). Set `LANGFUSE_RELEASE` and `LANGFUSE_TRACING_ENVIRONMENT` before constructing the client.
 
-## Shape of the Trace
+## 🔄 Shape of the Trace
 
 ```text
 rag.answer
@@ -21,7 +21,7 @@ rag.answer
   evaluator.citation_check
 ```
 
-## RAG Code
+## 🛠️ RAG Code
 
 ```python
 import os
@@ -260,7 +260,11 @@ def answer_question(question: str, *, user_id: str, session_id: str) -> dict:
 
 The model-call duration is recorded in `finally`, so timeouts and provider errors are part of latency distributions. Failures also increment a counter and mark the Langfuse generation as an error. This avoids dashboards that report only successful-call latency.
 
-## Safe Feedback Endpoint
+> 💡 **Key insight:** Recording `operation_duration` in `finally` means provider errors and timeouts count toward latency distributions — omitting this makes tail latency appear artificially low.
+
+## 🔒 Safe Feedback Endpoint
+
+> ⚠️ **Watch out:** Never write a score for a caller-supplied trace ID — validate ownership against the authenticated user's own application record first.
 
 Do not expose a helper that writes a score for any caller-supplied trace ID. Authorize against the application record that stored the answer, not against baggage or a value echoed by the browser.
 
@@ -325,9 +329,11 @@ def record_feedback(
 
 Persist the idempotency key and request outcome if the application must return the same HTTP response across retries. A deterministic score ID prevents duplicate Langfuse scores when a request is retried after an uncertain network result.
 
-## What `citation_present` Does Not Prove
+## ⚠️ What `citation_present` Does Not Prove
 
 This evaluator checks only whether at least one retrieved document ID appears as a substring in the answer.
+
+> ⚠️ **Watch out:** An ID appearing as a substring does not confirm the answer correctly attributes the source — use this score only as a cheap formatting signal, not a groundedness check.
 
 - False positive: the answer says "Unlike `[doc_001]`, this claim has no source." The ID is present, but it does not support the claim.
 - False negative: the answer correctly paraphrases the retrieved source but uses a footnote format that omits the raw document ID.
@@ -335,7 +341,7 @@ This evaluator checks only whether at least one retrieved document ID appears as
 
 Use it as a cheap formatting signal. For groundedness, evaluate claim-to-source entailment against the exact retrieved passages, require structured citation spans, and calibrate the evaluator on human-reviewed examples.
 
-## What to Alert On
+## 🔔 What to Alert On
 
 Export OpenTelemetry metrics and alert on:
 
