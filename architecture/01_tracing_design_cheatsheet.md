@@ -129,6 +129,65 @@ Keep names stable and values bounded.
 
 `user.id`, `session.id`, and opaque tenant IDs may be useful on traces, but must not become metric labels.
 
+## 🔗 Baggage Across Services
+
+Use baggage only for small, allowlisted request facts that must be available in
+more than one service. Trace context connects spans; baggage carries additional
+values; span attributes make those values searchable. These are separate steps.
+
+```text
+first trusted service
+  -> authenticate and derive trusted values
+  -> set them on the already-running root SERVER span
+  -> attach them as baggage
+  -> instrumented client injects trace context + baggage
+  -> downstream server extracts both before starting its SERVER span
+  -> baggage span processor copies allowlisted values onto new spans
+```
+
+Recommended baggage-to-attribute keys:
+
+| Baggage key | Span attribute | Why propagate it |
+| --- | --- | --- |
+| `session.id` | `session.id` | Correlate one authorized session across service spans. |
+| `app.trace.dimension.tenant_tier` | Same key | Compare bounded service tiers. |
+| `app.trace.dimension.feature` | Same key | Identify the product path without high-cardinality payloads. |
+| `app.trace.dimension.experiment` | Same key | Compare a bounded experiment variant across the whole trace. |
+
+Implementation rules:
+
+- Set `OTEL_PROPAGATORS=tracecontext,baggage` consistently. This is the Python
+  default, but explicit deployment configuration prevents service drift.
+- Define one allowlisted `SpanProcessor` implementation in the shared telemetry
+  package. Register one instance on the SDK `TracerProvider` in every service
+  process where baggage should become span attributes.
+- Register the processor after the provider exists and before the service
+  accepts requests or starts background spans. With
+  `opentelemetry-instrument`, add it to the provider created by the agent; do
+  not create a second provider.
+- The processor runs at span start. It enriches downstream `SERVER` spans
+  because baggage is extracted first, and it enriches all later local spans.
+- The first service usually creates baggage after its root `SERVER` span has
+  started. Set those attributes directly on `trace.get_current_span()`, then
+  attach the baggage so the processor can handle later spans.
+- Do not manually call `inject()` or `extract()` for FastAPI/HTTPX when their
+  instrumentations already propagate context. Use manual propagation for
+  unsupported transports, custom carriers, and focused tests.
+- Drop or sanitize caller-supplied baggage at an untrusted ingress. Never
+  propagate secrets, raw prompts, documents, email addresses, or unrestricted
+  user input.
+
+Registration shape:
+
+```python
+provider = trace.get_tracer_provider()
+provider.add_span_processor(AllowlistedBaggageSpanProcessor())
+```
+
+The processor is an application SDK component, not a Collector processor. See
+[Multi-Service Examples](../opentelemetry/04_multi_service_examples.md) for the
+complete gateway, downstream, and manual-transport patterns.
+
 ## 🔗 Collector-Side Langfuse Mapping
 
 Langfuse directly understands model, usage, user/session, status, and environment fields. Transform only schema gaps and filterable business dimensions.
@@ -227,6 +286,10 @@ Also emit `gen_ai.client.operation.time_to_first_chunk` for aggregate monitoring
 
 - Propagate W3C trace context across HTTP, queues, tools, and workers.
 - Propagate only allowlisted, non-sensitive baggage.
+- Register the baggage span processor once per service process before requests
+  or background work begin.
+- Set baggage-derived attributes directly on the first service's already-running
+  root span.
 - Copy trace-wide filter dimensions onto every relevant observation.
 - Preserve the root and parents when routing to the agent backend.
 - Set span status and low-cardinality `error.type` on failures.
@@ -243,5 +306,6 @@ Also emit `gen_ai.client.operation.time_to_first_chunk` for aggregate monitoring
 
 - [Detailed OTLP ingestion and mapping](../langfuse/03_otel_ingestion_and_mapping.md)
 - [Detailed GenAI observability](../opentelemetry/06_genai_and_llm_observability.md)
+- [Multi-service propagation and baggage](../opentelemetry/04_multi_service_examples.md)
 - [OpenTelemetry GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai)
 - [Langfuse OpenTelemetry attribute mapping](https://langfuse.com/integrations/native/opentelemetry)
