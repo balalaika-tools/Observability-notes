@@ -490,11 +490,14 @@ building instrumentation itself, or in a focused propagation test:
 from opentelemetry.propagate import extract, inject
 
 
-metadata: dict[str, str] = {}
-inject(metadata)
-custom_transport.send(payload, metadata=metadata)
+outgoing_carrier: dict[str, str] = {}
+inject(outgoing_carrier)
 
-parent_ctx = extract(received_metadata)
+# `send()` performs the transport; `inject()` only populated the carrier.
+custom_transport.send(payload, metadata=outgoing_carrier)
+
+incoming_carrier = received_metadata
+parent_ctx = extract(incoming_carrier)
 with tracer.start_as_current_span(
     "custom_transport.process",
     context=parent_ctx,
@@ -592,7 +595,9 @@ prompts, or full queries to metric attributes.
 
 ## 🔄 Propagation Through Queues
 
-Queue propagation uses message headers or metadata:
+Queue propagation uses a carrier stored in message headers or metadata. The
+carrier is only the serialized propagation data; `queue.publish()` performs the
+actual transport:
 
 ```python
 from opentelemetry.propagate import extract, inject
@@ -608,14 +613,15 @@ def publish_job(queue, payload: dict) -> None:
             "messaging.operation.type": "publish",
         },
     ) as producer:
-        headers: dict[str, str] = {}
+        carrier: dict[str, str] = {}
         # Inject from the active PRODUCER span, not its parent request span.
-        inject(headers)
-        queue.publish(payload, headers=headers)
+        inject(carrier)
+        queue.publish(payload, headers=carrier)
 
 
 def consume_job(message) -> None:
-    parent_ctx = extract(message.headers)
+    carrier = message.headers
+    parent_ctx = extract(carrier)
     with tracer.start_as_current_span(
         "orders process",
         context=parent_ctx,
@@ -639,9 +645,10 @@ POST /chat
 
 Use this when the worker job is causally part of the same request.
 
-Call `inject(headers)` inside the `PRODUCER` span, not before it, so the
+Call `inject(carrier)` inside the `PRODUCER` span, not before it, so the
 consumer sees the producer as its parent. Injecting from an outer span skips the
-queue boundary and produces a misleading trace shape.
+queue boundary and produces a misleading trace shape. `inject()` only mutates
+`carrier`; `queue.publish(..., headers=carrier)` is the operation that sends it.
 
 ## 🔗 Span Links For Decoupled Work
 
@@ -664,7 +671,8 @@ def process_batch(messages: list) -> None:
     links: list[Link] = []
 
     for message in messages:
-        message_ctx = extract(message.headers)
+        carrier = message.headers
+        message_ctx = extract(carrier)
         span_context = trace.get_current_span(message_ctx).get_span_context()
         if span_context.is_valid:
             links.append(Link(span_context))

@@ -142,7 +142,8 @@ The glue is not magic. It is mainly:
 - a resource identity: `service.name`, service version, environment, instance;
 - instrumentation scopes: which library or module emitted the telemetry;
 - semantic conventions: common attribute names such as `http.route` or `gen_ai.request.model`;
-- propagation headers: usually W3C `traceparent`, `tracestate`, and `baggage`;
+- propagation fields carried in request or message metadata: usually W3C
+  `traceparent`, `tracestate`, and `baggage`;
 - SDK and Collector pipelines that export the data consistently.
 
 ## 📦 The Six Layers
@@ -504,7 +505,7 @@ class QueueMessage:
     message_id: str
     job_id: str
     body: dict[str, Any]
-    headers: dict[str, str]
+    carrier: dict[str, str]
 
 
 def fake_vector_search(query: str) -> list[dict[str, Any]]:
@@ -644,8 +645,10 @@ def publish_result(
         },
     ) as span:
         time.sleep(0.005)
-        headers: dict[str, str] = {}
-        propagate.inject(headers)
+        carrier: dict[str, str] = {}
+        # Serialization only: the application still has to transport this
+        # carrier with the message.
+        propagate.inject(carrier)
         span.add_event(
             "message.published",
             {
@@ -659,7 +662,7 @@ def publish_result(
         message_id=message_id,
         job_id=job_id,
         body=result,
-        headers=headers,
+        carrier=carrier,
     )
 
 
@@ -680,7 +683,7 @@ def persist_result(result: dict[str, Any]) -> None:
 
 
 def consume_message(message: QueueMessage) -> None:
-    extracted = propagate.extract(message.headers)
+    extracted = propagate.extract(message.carrier)
     producer_context = trace.get_current_span(
         extracted
     ).get_span_context()
@@ -1159,8 +1162,9 @@ that resource.
 
 ## 🔗 Context Propagation
 
-Context propagation is what turns separate spans from separate processes into
-one trace.
+Context propagation carries causal identity across process boundaries. The
+receiver can use it as a parent to continue one trace or as a `Link` from a new
+trace.
 
 Inside one process, OpenTelemetry stores the active span in an execution
 context. When code creates a new span, it becomes a child of the active span
@@ -1168,6 +1172,30 @@ unless you specify otherwise.
 
 Across processes, that context must be serialized into a carrier such as HTTP
 headers, queue message metadata, or gRPC metadata.
+
+> **The near-miss**: `inject()` sounds like it sends context somewhere. It does
+> no I/O. It only serializes the selected propagation fields into the mutable
+> carrier you provide; application or library code must transport that carrier.
+
+A **carrier** is a caller-owned mutable representation that can hold propagation
+fields; the caller may be application code or an instrumentation library. With
+the usual W3C propagators, those fields include `traceparent`, optional
+`tracestate`, and `baggage` when the baggage propagator is configured. The
+carrier is not a second OpenTelemetry network channel.
+
+Keep propagation and telemetry export as two different network paths:
+
+```text
+application traffic
+caller ── HTTP / SQS / Kafka + carrier metadata ──> callee
+
+telemetry traffic
+caller and callee ── OTLP spans / metrics / logs ──> Collector or backend
+```
+
+`traceparent` rides with the application request or message. Completed spans
+are exported separately, usually through OTLP. Neither `inject()` nor
+`extract()` contacts the Collector.
 
 For HTTP, the standard trace context headers are:
 
@@ -1182,32 +1210,91 @@ The basic operation is:
 ```text
 caller
   current span exists
-  inject context into outbound headers
-  send request
+  propagate.inject(carrier)
+    -> serialize context into propagation fields
+  application/library maps carrier to transport metadata
+    -> HTTP headers, SQS MessageAttributes, Kafka headers, ...
+  transport sends request or message
 
 callee
-  extract context from inbound headers
+  application/library reads transport metadata into a carrier
+  propagate.extract(carrier)
+    -> deserialize fields into an OTel Context
   start server span with remote parent
 ```
 
-In Python, manual propagation looks like this:
+Assuming the SDK is configured, this same-process simulation makes the
+serialization boundary visible:
 
 ```python
+from opentelemetry import trace
 from opentelemetry.propagate import extract, inject
 
-headers: dict[str, str] = {}
-inject(headers)
+tracer = trace.get_tracer("example.propagation")
 
-# Send headers to downstream service.
+with tracer.start_as_current_span("caller") as caller:
+    outgoing_carrier: dict[str, str] = {}
+    inject(outgoing_carrier)
 
-ctx = extract(incoming_headers)
-with tracer.start_as_current_span("worker.process", context=ctx):
-    process_message()
+# `inject()` mutated the dictionary; it did not send it.
+assert "traceparent" in outgoing_carrier
+print(sorted(outgoing_carrier))
+
+# A dictionary copy stands in for an HTTP client, broker, or RPC library
+# transporting the serialized fields to another process.
+incoming_carrier = dict(outgoing_carrier)
+incoming_ctx = extract(incoming_carrier)
+
+with tracer.start_as_current_span(
+    "worker.process",
+    context=incoming_ctx,
+) as worker:
+    assert (
+        worker.get_span_context().trace_id
+        == caller.get_span_context().trace_id
+    )
+    print("continued trace:", True)
+```
+
+Expected output includes `traceparent` in the first line and
+`continued trace: True` in the second. If `traceparent` is absent, there was no
+valid current span or the configured propagator does not inject W3C Trace
+Context.
+
+`extract()` also performs no I/O and does not automatically attach its result as
+the current context. The caller must use the returned `Context` explicitly as a
+parent, attach it, or read its `SpanContext` to create a link.
+
+The same serialized meaning uses different transport representations:
+
+| Transport | Where the carrier travels |
+| --- | --- |
+| HTTP | Request headers such as `traceparent`. |
+| gRPC | Call metadata. |
+| Kafka | Record headers, usually through a Kafka-specific setter/getter. |
+| SQS | `MessageAttributes`, through an SQS-specific setter/getter because values are nested objects rather than plain strings. |
+
+The concrete SQS getter/setter is shown in
+[Python Instrumentation](02_python_instrumentation.md).
+
+For example, an HTTP client passes the carrier as real HTTP headers:
+
+```python
+with tracer.start_as_current_span("reserve inventory"):
+    outgoing_carrier: dict[str, str] = {}
+    inject(outgoing_carrier)
+
+    response = httpx.post(
+        "https://inventory.internal/reserve",
+        headers=outgoing_carrier,
+    )
 ```
 
 Most HTTP framework/client instrumentations do this automatically. Manual
 `inject()` and `extract()` are still useful for custom transports, queues,
-tests, or code where you need explicit control.
+tests, or code where you need explicit control. A transport-specific
+instrumentation still follows the same model; it merely owns the carrier
+adapter and the send/receive calls for you.
 
 Broken propagation symptoms:
 

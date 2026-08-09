@@ -1028,7 +1028,8 @@ Workers need the same provider setup as web services:
 worker starts
   -> configure OTel
   -> instrument queue/client libraries
-  -> extract context from message headers
+  -> read the message carrier from headers or attributes
+  -> extract context from that carrier
   -> create consumer/process spans
   -> flush on shutdown
 ```
@@ -1051,7 +1052,8 @@ from opentelemetry.propagate import extract
 
 
 def handle_message(message) -> None:
-    ctx = extract(message.headers)
+    carrier = message.headers
+    ctx = extract(carrier)
     with tracer.start_as_current_span(
         "worker.process_message",
         context=ctx,
@@ -1070,7 +1072,8 @@ from opentelemetry.trace import Link
 
 
 def handle_message(message) -> None:
-    incoming_ctx = extract(message.headers)
+    carrier = message.headers
+    incoming_ctx = extract(carrier)
     producer_ctx = trace.get_current_span(
         incoming_ctx
     ).get_span_context()
@@ -1092,7 +1095,8 @@ producer trace ID, the extracted or current context became its parent. If an
 automatic consumer span also appears, manual root creation did not undo it;
 both the instrumentation and the handler currently own the boundary.
 
-The generic examples above assume a string-to-string header carrier. Boto3 SQS
+The generic examples above use `message.headers` as the transport field, then
+name its contents `carrier`. They assume a string-to-string carrier. Boto3 SQS
 stores propagated fields inside nested `MessageAttributes`, so its carrier
 adapter is required even when the automatic hooks are disabled:
 
