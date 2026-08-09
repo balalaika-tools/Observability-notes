@@ -209,6 +209,35 @@ service.version="2026.07.24-1"                  langfuse.release="2026.07.24-1"
 
 For raw OTLP, encode structured input/output values as JSON strings if the exporter does not support nested values.
 
+### Per-Call Input Fidelity
+
+The repeated-history behavior is not specific to Langfuse. In the OpenTelemetry
+GenAI conventions, `gen_ai.input.messages` means the chat history provided to
+one model invocation, in the order sent. If a stateless agent resends the full
+history for every model call, provider-faithful inference spans repeat that
+history before any Langfuse mapping happens.
+
+OTel content capture is opt-in, and instrumentations may allow the input to be
+filtered or truncated. A compact capture is therefore possible, but it must not
+be presented as the complete model request:
+
+- Keep `gen_ai.input.messages` in the standard message-array schema even when
+  only a delta or truncated view is retained.
+- Add an organization-owned field such as
+  `app.gen_ai.input.capture_mode="delta"` so the Collector and reviewers know
+  that the payload is incomplete.
+- Use `gen_ai.conversation.compacted=true` only when the context sent to the
+  model was actually compacted, not when telemetry alone was shortened.
+- Do not assume every backend version promotes
+  `gen_ai.input.messages` into its first-class input field. Test the pinned
+  Langfuse version and, when necessary, map the selected value explicitly to
+  `langfuse.observation.input` only in the Langfuse destination pipeline.
+
+This lets one neutral application contract support two Langfuse views: exact
+per-call input for debugging/replay, or a deliberately labeled compact view for
+human review. The root observation can still carry the user message and final
+answer, while tool observations carry arguments/results.
+
 Layered explanation:
 
 - Beginner intuition: attributes are the labels and payloads Langfuse uses to understand a span.
@@ -632,6 +661,7 @@ The real OTLP encoding may be protobuf or JSON. Before the transform, the same s
 - Renaming or deleting neutral attributes during Langfuse mapping instead of copying them into destination fields.
 - Setting trace attributes only on one span and expecting complete Langfuse metrics.
 - Using legacy `gen_ai.system` for new instrumentation instead of `gen_ai.provider.name`.
+- Treating a filtered `gen_ai.input.messages` payload as the complete model request, or using `gen_ai.conversation.compacted` for telemetry-only truncation.
 - Sending raw prompts, retrieved documents, or user data without privacy review.
 - Filtering out the root span in the Collector.
 - Using attribute path segments named `__proto__`, `constructor`, or `prototype`. Langfuse silently drops those segments; rename them during normalization, for example to `proto_name`, `constructor_name`, or `prototype_name`.
@@ -650,6 +680,7 @@ The real OTLP encoding may be protobuf or JSON. Before the transform, the same s
 | Cross-service trace splits into multiple traces | W3C trace context not propagated/extracted | Instrument HTTP clients/servers or manually inject/extract context. |
 | User/session filters miss spans | Neutral correlation attributes were not propagated to all relevant spans | Use neutral baggage plus explicit allowlist copying before Collector mapping. |
 | Sensitive headers/documents appear | Redaction processor missing or ordered too late | Redact before exporting to Langfuse and logs; add tests for representative payloads. |
+| Generation input looks complete but cannot reproduce the call | Instrumentation emitted only a delta or truncated message list without a capture marker | Preserve the standard message-array schema and add a bounded `app.gen_ai.input.capture_mode`; retain full input only where policy permits replay. |
 
 ## ✅ OTLP Production Checklist
 
@@ -676,3 +707,4 @@ The real OTLP encoding may be protobuf or JSON. Before the transform, the same s
 - OpenTelemetry Collector telemetry transformations: <https://opentelemetry.io/docs/collector/transforming-telemetry/>
 - OpenTelemetry Collector transform processor: <https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/transformprocessor>
 - OpenTelemetry GenAI semantic conventions: <https://github.com/open-telemetry/semantic-conventions-genai>
+- OpenTelemetry GenAI spans, pinned revision: <https://github.com/open-telemetry/semantic-conventions-genai/blob/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a/docs/gen-ai/gen-ai-spans.md>

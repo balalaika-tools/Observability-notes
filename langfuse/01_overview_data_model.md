@@ -1,6 +1,6 @@
 # Langfuse Overview and Data Model
 
-Last verified against official Langfuse documentation on 2026-07-20.
+Last verified against official Langfuse documentation on 2026-07-24.
 
 ## 🧭 Mental Model
 
@@ -136,6 +136,28 @@ A generation is a special observation for model calls. It should include:
 - provider and request metadata when useful
 
 Generations are where most LLM debugging starts: prompt, model, retrieved context, tool state, token usage, latency, and final output all meet there.
+
+In a provider-faithful trace, `generation.input` is the actual prompt or message array sent for that model call. A stateless agent therefore repeats earlier context on every call: the second generation usually contains the same system and conversation messages as the first, plus the assistant tool call and tool result. This is not Langfuse-specific. The OpenTelemetry GenAI conventions define `gen_ai.input.messages` as the chat history provided to one model invocation, in send order, so OTel-native instrumentations produce the same repeated-history shape before Langfuse ingestion. See the [OpenTelemetry GenAI content-capture guidance](../opentelemetry/06_genai_and_llm_observability.md#full-request-versus-filtered-telemetry).
+
+Langfuse does not require that representation. With manual instrumentation, you can make a frequently reviewed generation easier to scan by recording only the step's relevant input, such as the newest user message or an `input_delta` / `new_context` object:
+
+```python
+generation.update(
+    input={
+        "input_delta": [
+            {"role": "tool", "content": tool_result},
+        ]
+    },
+    output={
+        "role": "assistant",
+        "content": final_answer,
+    },
+)
+```
+
+This compact form reduces repeated history in the UI, but it is no longer an exact record of the model request and cannot support faithful replay by itself. Name the field so reviewers know it is a delta; keep the full request in approved metadata only when debugging or replay requires it and the privacy policy allows it. A practical default is reviewer-friendly user input and final output on the root observation, explicit arguments/results on tool observations, and full messages on generations only when exact model-call debugging is worth the duplication.
+
+The `input_delta` wrapper above is a Langfuse manual-observation shape, not the OpenTelemetry schema for `gen_ai.input.messages`. On a raw OTel span, keep a schema-valid ordered message array, use filtering/truncation only as an intentional capture policy, and add a bounded `app.gen_ai.input.capture_mode` marker so the compact value is not mistaken for the full request.
 
 Langfuse can infer usage when it has a tokenizer and can infer cost when usage plus a matching model-price definition are available. Provider/SDK-supplied usage is preferred to inferred usage. User-supplied `usage_details` and `cost_details` take precedence over inferred values; supplied cost is used verbatim, so provide it only for an authoritative provider charge or custom agreement. Usage detail buckets must be mutually exclusive or totals and inferred cost can be double-counted.
 

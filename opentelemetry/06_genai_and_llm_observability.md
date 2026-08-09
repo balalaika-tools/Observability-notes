@@ -15,7 +15,7 @@ attributes on spans." The goal is to make an LLM trace tell the story of one
 user request from the API boundary, through retrieval and model calls, through
 tool execution, and finally into Langfuse or another backend.
 
-This page was checked on July 20, 2026 against core OpenTelemetry semantic conventions `v1.43.0` and the dedicated `open-telemetry/semantic-conventions-genai` repository at commit `c26a2c21d1ee70d5231bd440c7b48d3c94ee506a` (2026-07-17). The dedicated repository depends on core semconv `v1.43.0` at that revision. GenAI conventions are still marked Development. Pin a release or commit in your own compatibility note; a check date without a revision cannot be reproduced after `main` changes.
+Last verified against OpenTelemetry GenAI semantic conventions v1.43.0 and semconv-genai commit c26a2c21 (2026-07-17) on 2026-07-24.
 
 ## 🧭 The Mental Model
 
@@ -117,6 +117,7 @@ GENAI_CACHE_READ_INPUT_TOKENS = "gen_ai.usage.cache_read.input_tokens"
 GENAI_CACHE_CREATION_INPUT_TOKENS = "gen_ai.usage.cache_creation.input_tokens"
 GENAI_TIME_TO_FIRST_CHUNK = "gen_ai.response.time_to_first_chunk"
 GENAI_CONVERSATION_ID = "gen_ai.conversation.id"
+GENAI_CONVERSATION_COMPACTED = "gen_ai.conversation.compacted"
 GENAI_OUTPUT_TYPE = "gen_ai.output.type"
 
 ERROR_TYPE = "error.type"
@@ -253,6 +254,7 @@ Common inference attributes:
 | Operation | `gen_ai.operation.name` |
 | Provider | `gen_ai.provider.name` |
 | Conversation or thread | `gen_ai.conversation.id` |
+| Effective model context was compacted | `gen_ai.conversation.compacted` |
 | Requested model | `gen_ai.request.model` |
 | Actual response model | `gen_ai.response.model` |
 | Requested output type | `gen_ai.output.type` |
@@ -386,6 +388,10 @@ Notes:
 - `gen_ai.operation.name`, `gen_ai.provider.name`, and `gen_ai.request.model`
   are set at span creation time so a sampler can use them.
 - Prompt and output content are controlled by `capture_content`.
+- When content capture is enabled, this example records the same `messages`
+  sequence passed to the provider. If the caller passes accumulated chat
+  history on every agent step, earlier messages are repeated on every inference
+  span by design.
 - The span name uses the low-cardinality operation and model, not a prompt or
   user-specific label.
 - `error.type` is low-cardinality. Use exception class names or provider error
@@ -511,6 +517,43 @@ span.set_attribute(
 Do not pull a `system`-role message out of a provider's chat-history array just
 to populate this field. In that API shape it remains a role-bearing entry in
 `gen_ai.input.messages`, as the inference example shows.
+
+### Full Request Versus Filtered Telemetry
+
+`gen_ai.input.messages` is scoped to one inference operation, not to the whole
+trace. Its standard meaning is the chat history provided to the model, with
+messages in the order they were sent. A provider-faithful stateless agent trace
+therefore repeats context across calls:
+
+```text
+inference 1 input = [system, user]
+inference 2 input = [system, user, assistant(tool_call), tool(result)]
+```
+
+This duplication comes from the OpenTelemetry GenAI model-call semantics before
+the data reaches Langfuse or another backend.
+
+The content attributes are opt-in, and the conventions explicitly allow an
+instrumentation to offer filtering or truncation. Choose the representation
+deliberately:
+
+| Capture policy | `gen_ai.input.messages` | Consequence |
+| --- | --- | --- |
+| No content | Omitted; this is the OTel default | Keeps model, usage, timing, and errors without prompt content. |
+| Provider-faithful | Full message list actually sent for that call | Supports exact debugging and replay but repeats history and increases privacy, size, and storage risk. |
+| Filtered or delta view | Selected messages, still in the standard message-array schema and original order | Reduces volume and review noise but is not a complete record of the model request. |
+
+The standard attribute does not define an `input_delta` wrapper. If telemetry
+keeps only new context, preserve the standard list of `{role, parts}` messages
+and add a documented organization-owned marker such as
+`app.gen_ai.input.capture_mode="delta"` plus an omitted-message count when it is
+known. That prevents a backend or reviewer from mistaking the filtered view for
+a replayable request.
+
+Do not set `gen_ai.conversation.compacted=true` merely because telemetry was
+filtered. That field means the effective conversation context used by the model
+was itself compacted, for example by summarizing older turns before the request.
+Telemetry-only filtering and model-input compaction are different operations.
 
 Production policy should answer:
 
@@ -1076,6 +1119,9 @@ Test the instrumentation like product code. At minimum, verify:
 - streaming spans record time to first chunk;
 - prompt/output capture is disabled by default;
 - prompt/output capture can be enabled intentionally;
+- full capture preserves the exact per-call message order;
+- filtered or delta capture preserves the message schema and emits a capture-mode marker;
+- `gen_ai.conversation.compacted` is absent unless the model input itself was compacted;
 - baggage or tenant metadata does not leak into metrics;
 - Langfuse metadata fields use the right prefix for filtering;
 - local Collector routing sends traces and metrics to the expected places.
@@ -1112,6 +1158,8 @@ header, and redaction mistakes that unit tests cannot see.
 | No token metrics | Cost and prompt growth are invisible. | Record usage attributes and token metrics when available. |
 | No streaming first-chunk metric | Streaming UX is invisible. | Record time to first chunk. |
 | Full content sent everywhere | Privacy and cost risk. | Route content only to approved backends. |
+| Filtered input looks like a full request | Reviewers cannot replay the call and may diagnose the wrong context. | Preserve the standard message schema and add a bounded capture-mode marker. |
+| Telemetry truncation sets `gen_ai.conversation.compacted` | Dashboards incorrectly report that the model received compacted context. | Set it only when the effective model input was compacted. |
 | Convention strings everywhere | Future updates are painful. | Use a small constants/helper module. |
 | Assuming Langfuse filters every OTel attribute | Important metadata becomes hard to search. | Use `langfuse.trace.metadata.*` and `langfuse.observation.metadata.*`. |
 | Treating GenAI conventions as fully stable | Future changes cause drift. | Track convention check date and isolate names. |
@@ -1131,6 +1179,9 @@ For a new LLM service:
 - emit GenAI duration and token metrics or equivalent application metrics;
 - keep metrics low-cardinality;
 - keep prompt and output capture disabled by default;
+- choose and document `none`, `full`, `delta`, or `truncated` input capture;
+- mark filtered content with an organization-owned capture-mode attribute and
+  preserve the standard message-array schema;
 - add explicit Langfuse input/output capture when allowed;
 - use Langfuse metadata prefixes for fields that need to be filterable;
 - route traces, metrics, and logs through a Collector in production;

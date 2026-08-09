@@ -73,6 +73,7 @@ Use only fields available at the relevant boundary.
 | --- | --- |
 | Workflow | `gen_ai.operation.name="invoke_workflow"`, `gen_ai.workflow.name`, `error.type` on failure |
 | Agent | `gen_ai.operation.name="invoke_agent"`, `gen_ai.provider.name`, `gen_ai.agent.name`, `gen_ai.agent.id`, `gen_ai.agent.version`, optional `gen_ai.agent.description`, `gen_ai.conversation.id`, and request model when one model defines the agent |
+| Conversation context | `gen_ai.conversation.id`; `gen_ai.conversation.compacted=true` only when the model received compacted context |
 | Inference | `gen_ai.operation.name`, `gen_ai.provider.name`, `server.address`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons` |
 | Streaming | `gen_ai.request.stream`, `gen_ai.response.time_to_first_chunk` in seconds |
 | Usage | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens`, `gen_ai.usage.reasoning.output_tokens` |
@@ -93,6 +94,22 @@ Sensitive, opt-in fields:
 - `gen_ai.retrieval.documents`
 
 Capture these only after redaction, size limits, and a documented retention decision.
+
+`gen_ai.input.messages` belongs to each inference span. A faithful capture
+contains the messages actually sent on that call, so stateless agent loops
+naturally repeat earlier history on later inference spans. OTel content capture
+is opt-in and instrumentations may expose filtering or truncation:
+
+| Mode | Use |
+| --- | --- |
+| `none` | Default production-safe baseline: omit prompt/output content. |
+| `full` | Exact debugging or replay: keep the complete per-call message list. |
+| `delta` or `truncated` | Lower-volume review: keep a schema-valid, ordered subset and mark it as incomplete with an organization-owned `app.*` attribute. |
+
+Do not put an `input_delta` wrapper object into `gen_ai.input.messages`; the
+standard field must remain a message array. Also do not use
+`gen_ai.conversation.compacted` to describe telemetry truncation. Set it only
+when the model itself received compacted conversation context.
 
 Minimal inference example:
 
@@ -125,6 +142,8 @@ Keep names stable and values bounded.
 | `app.outcome` | `success`, `error`, `timeout`, `blocked` |
 | `app.agent.stop_reason` | `completed`, `step_limit`, `guardrail`, `cancelled` |
 | `app.agent.fallback.used` | `true` or `false` |
+| `app.gen_ai.input.capture_mode` | `none`, `full`, `delta`, `truncated` |
+| `app.gen_ai.input.omitted_message_count` | Number of messages omitted from telemetry, when known |
 | `app.observation.completion_started_at` | Absolute ISO-8601 first-chunk timestamp |
 
 `user.id`, `session.id`, and opaque tenant IDs may be useful on traces, but must not become metric labels.
@@ -294,6 +313,7 @@ Also emit `gen_ai.client.operation.time_to_first_chunk` for aggregate monitoring
 - Preserve the root and parents when routing to the agent backend.
 - Set span status and low-cardinality `error.type` on failures.
 - Redact content before backend-specific fan-out.
+- Document whether inference inputs are omitted, full, delta-only, or truncated; never present a filtered view as a replayable request.
 - Tail-sample by complete trace, never by isolated GenAI leaves.
 
 > 💡 **Key insight:** Tail-sampling isolated GenAI leaf spans discards the root span and sibling context that make a trace debuggable — always sample the complete trace.
