@@ -208,7 +208,7 @@ A span represents one operation or unit of work. Important span fields are:
 | `kind` | Role of the span: `SERVER`, `CLIENT`, `INTERNAL`, `PRODUCER`, or `CONSUMER`. |
 | timestamps | Start time, end time, and duration. |
 | attributes | Key-value metadata such as route, model, DB system, outcome. |
-| events | Timestamped happenings inside the span, such as an exception or retry. |
+| events (legacy) | Timestamped records embedded in the span. The recording API is being deprecated; new instrumentation should emit named log records correlated with the span instead. |
 | links | References to related spans that are not parent-child. Useful for queues and batch work. |
 | status | Whether the operation ended in error. |
 
@@ -240,7 +240,7 @@ Span kind helps trace backends understand the boundary between services. For an
 HTTP call, the caller usually has a `CLIENT` span and the callee usually has a
 `SERVER` span. They share a trace ID, but each service owns its own span.
 
-#### Span Attributes, Events, And Links
+#### Span Attributes, Log-Based Events, And Links
 
 Use attributes for searchable facts about the operation:
 
@@ -254,17 +254,25 @@ rag.retrieval.strategy = hybrid
 rag.top_k = 5
 ```
 
-Use events for timestamped details inside a span:
+OpenTelemetry is [deprecating the Span Event API](https://opentelemetry.io/blog/2026/deprecating-span-events/). Existing span events remain valid in OTLP and backends may continue to render them on span timelines, but new instrumentation should not call `Span.add_event()` or `Span.record_exception()`.
+
+Use a **log-based event** for a named occurrence that needs its own timestamp. It is a `LogRecord` with a non-empty `event_name`; when emitted inside an active span, its trace and span IDs preserve correlation:
 
 ```text
-event: retry.scheduled
+LogRecord event_name: app.provider.retry.scheduled
+  trace_id = 4bf9...
+  span_id = 7e31...
   retry.attempt = 2
   retry.delay_ms = 250
 
-event: exception
+LogRecord event_name: app.provider.request.exception
+  trace_id = 4bf9...
+  span_id = 7e31...
   exception.type = TimeoutError
   exception.message = request timed out
 ```
+
+Use an ordinary log record when the message is diagnostic but does not define a stable event schema. Use a span attribute when the value describes the operation as a whole and does not need its own timestamp.
 
 Use links when there is a relationship but not a direct parent-child hierarchy.
 For example, a batch job that processes 100 messages may link to the producing
@@ -277,7 +285,7 @@ request. This teaching example deliberately includes:
 
 - a successful HTTP request with a failed child operation;
 - nested internal and client spans;
-- attributes, events, an exception, and span status;
+- attributes, span status, and correlated log-based events;
 - a queue producer and a consumer in a new trace;
 - a span link between the two traces;
 - resource and instrumentation-scope metadata.
@@ -348,44 +356,8 @@ exporters have a language-specific debug format.
     "app.outcome": "provider_failed",
     "error.type": "ProviderTimeoutError"
   },
-  "events": [
-    {
-      "name": "request.sent",
-      "timestamp": "2026-07-23T10:15:30.520Z",
-      "attributes": {
-        "retry.attempt": 1
-      }
-    },
-    {
-      "name": "retry.scheduled",
-      "timestamp": "2026-07-23T10:15:31.300Z",
-      "attributes": {
-        "retry.next_attempt": 2,
-        "retry.delay_ms": 200,
-        "retry.reason": "provider_timeout"
-      }
-    },
-    {
-      "name": "request.sent",
-      "timestamp": "2026-07-23T10:15:31.500Z",
-      "attributes": {
-        "retry.attempt": 2
-      }
-    },
-    {
-      "name": "exception",
-      "timestamp": "2026-07-23T10:15:32.590Z",
-      "attributes": {
-        "exception.type": "ProviderTimeoutError",
-        "exception.message": "Bedrock request timed out on attempt 2",
-        "exception.stacktrace": "Traceback (most recent call last): ...",
-        "exception.escaped": false
-      }
-    }
-  ],
   "links": [],
   "dropped_attributes_count": 0,
-  "dropped_events_count": 0,
   "dropped_links_count": 0,
   "resource": {
     "service.name": "chat-api",
@@ -399,6 +371,37 @@ exporters have a language-specific debug format.
 }
 ```
 
+The retry and exception timeline is exported through the logs signal rather than embedded in the span. This is also a normalized teaching representation:
+
+```json
+[
+  {
+    "event_name": "app.provider.retry.scheduled",
+    "timestamp": "2026-07-23T10:15:31.300Z",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "7e31fbd423ab9c11",
+    "severity_text": "INFO",
+    "attributes": {
+      "retry.next_attempt": 2,
+      "retry.delay_ms": 200,
+      "retry.reason": "provider_timeout"
+    }
+  },
+  {
+    "event_name": "app.provider.request.exception",
+    "timestamp": "2026-07-23T10:15:32.590Z",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "span_id": "7e31fbd423ab9c11",
+    "severity_text": "ERROR",
+    "attributes": {
+      "exception.type": "ProviderTimeoutError",
+      "exception.message": "Bedrock request timed out on attempt 2",
+      "exception.stacktrace": "Traceback (most recent call last): ..."
+    }
+  }
+]
+```
+
 Read it in layers:
 
 | Layer | Fields | Meaning |
@@ -407,11 +410,11 @@ Read it in layers:
 | Operation | `name`, `kind` | What happened and whether this process acted as server, client, internal code, producer, or consumer. |
 | Time | Start and end timestamps | The measured interval. Duration is normally derived from these timestamps rather than assigned by application code. |
 | Description | Attributes | Searchable facts about the operation as a whole. |
-| Timeline | Events | Timestamped facts that happened during the operation. |
+| Timeline | Correlated log-based events | Named, timestamped facts emitted through the logs signal with the span's trace context. |
 | Non-tree relationships | Links | Causal references that do not imply a parent-child interval. |
-| Outcome | Status | Whether this operation failed. The exception event explains the failure; status classifies the final outcome. |
+| Outcome | Status | Whether this operation failed. The correlated exception log explains the failure; status classifies the final outcome. |
 | Emitter identity | Resource and instrumentation scope | Which service emitted the span and which code created it. |
-| Data loss | Dropped counts | Whether SDK limits caused attributes, events, or links to be discarded. |
+| Data loss | Dropped counts | Whether SDK limits discarded span attributes or links. Log records have their own attribute limits and dropped count. |
 
 The LLM child is `ERROR`, but the root HTTP span remains `UNSET` and records
 `http.response.status_code=202`. That is correct here: the application handled
@@ -448,6 +451,10 @@ SQS, LLM, and database instrumentations. It keeps the infrastructure fake so
 the span mechanics remain visible. It uses `SimpleSpanProcessor` only to make
 console output deterministic for a short-lived demo; production services
 normally use `BatchSpanProcessor` and OTLP.
+
+This simulation verifies the trace side and intentionally does not configure a
+logs provider. The correlated `LogRecord` implementation shown above is built
+with structlog in [Python Instrumentation](02_python_instrumentation.md#emit-named-log-based-events-through-structlog).
 
 Use Python 3.11 or later:
 
@@ -550,13 +557,12 @@ def retrieve_documents(query: str) -> list[dict[str, Any]]:
                 "http.response.status_code", 200
             )
 
-        retrieval_span.add_event(
-            "reranking.completed",
-            {
-                "rag.documents.before": 20,
-                "rag.documents.after": len(documents),
-                "rag.reranker.model": "cohere-rerank-v3",
-            },
+        retrieval_span.set_attribute("rag.documents.before_rerank", 20)
+        retrieval_span.set_attribute(
+            "rag.documents.after_rerank", len(documents)
+        )
+        retrieval_span.set_attribute(
+            "rag.reranker.model", "cohere-rerank-v3"
         )
         retrieval_span.set_attribute(
             "rag.documents.returned", len(documents)
@@ -580,33 +586,22 @@ def call_llm_with_retry(prompt: str) -> str | None:
         },
     ) as span:
         for attempt in (1, 2):
-            span.add_event(
-                "request.sent", {"retry.attempt": attempt}
-            )
+            span.set_attribute("retry.current_attempt", attempt)
             try:
                 return fake_llm_call(attempt)
             except ProviderTimeoutError as exc:
                 if attempt == 1:
-                    span.add_event(
-                        "retry.scheduled",
-                        {
-                            "retry.next_attempt": 2,
-                            "retry.delay_ms": 5,
-                            "retry.reason": "provider_timeout",
-                        },
+                    span.set_attribute("retry.next_attempt", 2)
+                    span.set_attribute("retry.delay_ms", 5)
+                    span.set_attribute(
+                        "retry.reason", "provider_timeout"
                     )
                     time.sleep(0.005)
                     continue
 
-                # The exception is handled inside this span, so record both
-                # its details and the operation's final status explicitly.
-                span.record_exception(
-                    exc,
-                    attributes={
-                        "retry.attempt": attempt,
-                        "exception.escaped": False,
-                    },
-                )
+                # The exception is handled here, so the span must receive
+                # explicit failure semantics. Send the stack trace through
+                # the correlated logs pipeline, not as a span event.
                 span.set_attribute("retry.count", attempt - 1)
                 span.set_attribute(
                     "app.outcome", "provider_failed"
@@ -649,13 +644,9 @@ def publish_result(
         # Serialization only: the application still has to transport this
         # carrier with the message.
         propagate.inject(carrier)
-        span.add_event(
-            "message.published",
-            {
-                "messaging.message.body.size": len(
-                    str(result).encode()
-                )
-            },
+        span.set_attribute(
+            "messaging.message.body.size",
+            len(str(result).encode()),
         )
 
     return QueueMessage(
@@ -712,10 +703,7 @@ def consume_message(message: QueueMessage) -> None:
             "app.job.id": message.job_id,
         },
     ) as span:
-        span.add_event(
-            "message.received",
-            {"messaging.message.delivery_count": 1},
-        )
+        span.set_attribute("messaging.message.delivery_count", 1)
         persist_result(message.body)
 
 
@@ -732,9 +720,8 @@ def handle_chat_request(query: str) -> QueueMessage:
             "server.address": "chat-api",
         },
     ) as root_span:
-        root_span.add_event(
-            "request.validated",
-            {"validation.schema": "chat-request-v2"},
+        root_span.set_attribute(
+            "app.validation.schema", "chat-request-v2"
         )
         documents = retrieve_documents(query)
         answer = call_llm_with_retry(
@@ -746,9 +733,8 @@ def handle_chat_request(query: str) -> QueueMessage:
                 "status": "provider_failed",
                 "answer": None,
             }
-            root_span.add_event(
-                "llm.unavailable",
-                {"fallback.action": "publish_failure_result"},
+            root_span.set_attribute(
+                "app.fallback.action", "publish_failure_result"
             )
         else:
             result = {"status": "completed", "answer": answer}
@@ -756,10 +742,7 @@ def handle_chat_request(query: str) -> QueueMessage:
         message = publish_result(job_id=job_id, result=result)
         root_span.set_attribute("http.response.status_code", 202)
         root_span.set_attribute("app.job.id", job_id)
-        root_span.add_event(
-            "response.created",
-            {"response.mode": "async"},
-        )
+        root_span.set_attribute("app.response.mode", "async")
         return message
 
 
@@ -781,7 +764,7 @@ will not match the illustrative IDs above. Verify these invariants instead:
 
 - the first five spans share one trace ID and follow the shown parent IDs;
 - every span has its own span ID;
-- the LLM span has an exception event and `ERROR` status;
+- the LLM span has `error.type`, retry attributes, and `ERROR` status;
 - the root span remains `UNSET` with HTTP status `202`;
 - the consumer has a new trace ID, no parent, and one link to the producer;
 - the database span is a child of the consumer;
@@ -792,12 +775,15 @@ will not match the illustrative IDs above. Verify these invariants instead:
 
 The SDK generates IDs, captures start and end times, calculates parentage from
 the active context, and tracks limit-related dropped counts. Instrumentation
-chooses the operation name and kind and adds domain attributes and events.
+chooses the operation name and kind and adds domain attributes.
 Provider setup supplies the resource; `get_tracer()` supplies the
 instrumentation scope. Status can be explicit, or the Python context manager
-can record an escaped exception and set `ERROR` automatically. If code catches
-an exception inside the span, as this demo does for retry handling, record the
-exception and final error status explicitly.
+can set `ERROR` for an escaping exception. Its default exception recording
+still creates a legacy span event, so new instrumentation should pass
+`record_exception=False` when exceptions may escape and emit the exception
+through the correlated logs pipeline. If code catches an exception inside the
+span, as this demo does for retry handling, set the final status and
+low-cardinality `error.type` explicitly.
 
 In a real service, let each instrumentation own only the protocol semantics you
 actually want. FastAPI/ASGI can own inbound HTTP spans, HTTPX instrumentation
@@ -856,6 +842,101 @@ MeterProvider
                       -> metric reader
                            -> exporter
 ```
+
+Do not collapse the instrument, metric stream, and data point into one object.
+The instrument is the API object that records measurements. The SDK aggregates
+those measurements into a metric stream, and OTLP exports data points from that
+stream. In the
+[OTel metrics data model](https://opentelemetry.io/docs/specs/otel/metrics/data-model/),
+a metric stream contains more than attributes:
+
+| Part | Typical fields | What it tells the backend |
+| --- | --- | --- |
+| Identity | Resource, instrumentation scope, `name`, `description`, `unit` | Who emitted the metric and what the measurement means. |
+| Aggregation contract | Data type plus, where applicable, temporality and monotonicity | Whether values are a gauge, sum, histogram, delta, or cumulative total. |
+| Data points | Timestamp or time window plus the numeric payload | The actual value or aggregate for one collection interval. |
+| Attributes | A key-value set on each data point | The dimensions that identify an individual time series within the metric stream. |
+| Correlation and state | Optional exemplars and data-point flags | A sampled link to trace context, or an explicit marker such as "no recorded value". |
+
+The numeric payload depends on the data type. A `Gauge` point carries the last
+sampled value. A `Sum` point carries a value over a delta or cumulative time
+window and the stream says whether the sum is monotonic. A `Histogram` point
+compresses many measurements into `count`, `sum`, and optional buckets,
+`min`, and `max`.
+
+Here is one normalized teaching representation of an exported histogram. It is
+not literal OTLP JSON; real OTLP nests the same information under
+`ResourceMetrics` and `ScopeMetrics`, represents timestamps in Unix
+nanoseconds, and uses protocol field names:
+
+```json
+{
+  "resource": {
+    "service.name": "chat-api",
+    "service.instance.id": "chat-api-7d9f"
+  },
+  "scope": {
+    "name": "opentelemetry.instrumentation.fastapi",
+    "version": "0.65b0"
+  },
+  "metric": {
+    "name": "http.server.request.duration",
+    "description": "Duration of HTTP server requests.",
+    "unit": "s",
+    "data": {
+      "type": "Histogram",
+      "aggregation_temporality": "DELTA",
+      "data_points": [
+        {
+          "start_time": "2026-08-09T10:15:20Z",
+          "time": "2026-08-09T10:15:30Z",
+          "attributes": {
+            "http.request.method": "POST",
+            "http.route": "/chat",
+            "http.response.status_code": 200,
+            "url.scheme": "https"
+          },
+          "count": 4,
+          "sum": 1.42,
+          "min": 0.20,
+          "max": 0.62,
+          "explicit_bounds": [0.10, 0.25, 0.50, 1.00],
+          "bucket_counts": [0, 2, 1, 1, 0],
+          "exemplars": [
+            {
+              "time": "2026-08-09T10:15:28.420Z",
+              "value": 0.62,
+              "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+              "span_id": "7e31fbd423ab9c11",
+              "filtered_attributes": {}
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+```
+
+Read this point as: during the ten-second delta window, this service observed
+four successful `POST /chat` requests with a total duration of `1.42 s`. There
+are five bucket counts because four explicit boundaries create five ranges;
+the counts add up to `count`. The `0.62 s` exemplar is already included in the
+histogram aggregates and gives the backend one representative trace to open.
+It does not make `trace_id` a metric attribute.
+
+The boundaries above are deliberately shortened to make the structure visible.
+For the actual `http.server.request.duration` instrument, follow its
+[semantic convention](https://opentelemetry.io/docs/specs/semconv/http/http-metrics/#metric-httpserverrequestduration)
+and use SDK Views when different buckets are justified by the SLO. An absent
+exemplar does not mean the metric failed: exemplar sampling, trace sampling,
+SDK support, and backend support all affect whether one is available.
+
+Each exact attribute set produces a separate time series. A second point with
+`http.response.status_code=500`, for example, is not another field on this
+series; it belongs to a different series under the same metric stream. This is
+why request IDs, trace IDs, user IDs, and raw URLs must not be metric
+attributes.
 
 Common instruments:
 
@@ -933,8 +1014,11 @@ Use structured logs in production:
 }
 ```
 
-Use span events for events that are only meaningful inside a trace. Use logs
-for operational records you may want to query independently.
+Use named log records for point-in-time events, whether they are meaningful only
+inside one trace or need to be queried independently. Set `event_name` for a
+stable event schema; leave it empty for ordinary diagnostic logs. Emitting the
+record while a span is active supplies trace correlation without embedding the
+record in the span payload.
 
 Correlation is an identifier match, not a retention guarantee. A log can carry
 valid `trace_id` and `span_id` values even when sampling or backend retention
@@ -1607,7 +1691,7 @@ for application-specific manual spans and metric instruments.
 | User/session/tenant context needed downstream | Baggage, if safe and small. |
 | Business category for filtering | Span or metric attribute, if low-cardinality. |
 | Exact user input or prompt | Usually not general OTel attributes; use explicit, protected LLM observability storage if allowed. |
-| Error stack trace | Log record and span exception event. |
+| Error stack trace | Correlated exception log event; put only `error.type` and status on the span. |
 | Alertable totals and rates | Metrics. |
 | Example request investigation | Traces. |
 

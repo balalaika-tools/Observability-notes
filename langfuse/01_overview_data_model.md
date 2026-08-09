@@ -174,6 +174,14 @@ Layered explanation:
 
 An event is a point-in-time observation. Use it for something meaningful that happened but does not need duration tracking.
 
+This Langfuse observation type is not the OpenTelemetry Span Event API. The
+OTel API is being deprecated in favor of named log records, while Langfuse
+[`event` remains a supported observation type](https://langfuse.com/docs/observability/features/observation-types).
+The [Langfuse OTLP endpoint](https://langfuse.com/integrations/native/opentelemetry)
+ingests traces rather than the OTel logs signal; use the Langfuse SDK when the
+marker must appear as a Langfuse event observation, and send vendor-neutral
+OTel log-based events to a logs backend.
+
 Examples:
 
 - routing decision made;

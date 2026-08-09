@@ -693,7 +693,11 @@ tracer = trace.get_tracer(__name__)
 
 
 def retrieve_documents(query: str, top_k: int) -> list[dict]:
-    with tracer.start_as_current_span("rag.retrieve") as span:
+    with tracer.start_as_current_span(
+        "rag.retrieve",
+        # Prevent the context manager from creating a legacy span event.
+        record_exception=False,
+    ) as span:
         span.set_attribute("rag.retrieval.strategy", "hybrid")
         span.set_attribute("rag.top_k", top_k)
 
@@ -713,7 +717,7 @@ Span design rules:
 | --- | --- |
 | Use stable names. | `rag.retrieve`, not `retrieve user 123`. |
 | Put bounded facts in attributes. | `rag.top_k=5`, `rag.retrieval.strategy=hybrid`. |
-| Record exceptions and set error status. | Let `start_as_current_span()` record an escaping exception and error status by default; add low-cardinality `error.type` once. |
+| Record failures without span events. | Pass `record_exception=False`, add low-cardinality `error.type`, and re-raise so the context manager still sets `ERROR`; emit exception details as a correlated log-based event at the owning logging boundary. |
 | Avoid sensitive content. | Do not store raw prompts, documents, access tokens, or emails. |
 | Use semantic conventions where possible. | `http.route`, `gen_ai.request.model`, `db.system.name`. |
 
@@ -876,12 +880,56 @@ created inside an active span can include trace and span identifiers. In
 production, many teams use structured JSON logging and add those fields to their
 formatter instead of using the default OTel logging format.
 
-Good log fields:
+### Structlog Correlation When Logs Stay On Stdout
 
-- `trace_id`;
-- `span_id`;
-- `service.name`;
-- `event_name`;
+`structlog` does not need to pass through Python's standard-library formatter.
+If stdout or a file agent remains the log transport, add the active trace
+context in the processor chain:
+
+```python
+import structlog
+from opentelemetry import trace
+from opentelemetry.trace import format_span_id, format_trace_id
+
+
+def add_otel_trace_context(_, __, event_dict):
+    context = trace.get_current_span().get_span_context()
+    if context.is_valid:
+        event_dict["trace_id"] = format_trace_id(context.trace_id)
+        event_dict["span_id"] = format_span_id(context.span_id)
+        event_dict["trace_sampled"] = context.trace_flags.sampled
+    return event_dict
+
+
+structlog.configure(
+    processors=[
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        add_otel_trace_context,
+        structlog.processors.JSONRenderer(),
+    ]
+)
+
+log = structlog.get_logger("chat-api").bind(
+    **{"service.name": "chat-api"}
+)
+
+with tracer.start_as_current_span("rag.retrieve"):
+    log.info("retrieval completed", **{"rag.returned_documents": 5})
+```
+
+The JSON line should contain 32 lowercase hex characters in `trace_id` and 16
+in `span_id`. If the fields are missing, the call happened outside an active
+span or a renderer ran before `add_otel_trace_context`. This processor provides
+correlation only: it does not create an OTel logs pipeline.
+
+Most operational logs need the first three fields below. Add the others only
+when they are bounded, safe, and useful:
+
+- **`trace_id`**;
+- **`span_id`**;
+- **`service.name`**;
+- `event_name` for a named OTel event, not as a substitute for the message;
 - bounded request context such as route, model, provider, outcome;
 - local error details and stack traces.
 
@@ -899,6 +947,16 @@ Bad log fields:
 The OTel logs signal is stable in the specification, but Python log API/SDK
 support is still listed as Development in the language status. Treat Python log
 export as an evolving area and validate it carefully before standardizing on it.
+
+Instrumentations will migrate exceptions gradually. When an installed
+instrumentation implements the
+[exception signal transition](https://opentelemetry.io/docs/specs/semconv/exceptions/exceptions-logs/),
+use
+`OTEL_SEMCONV_EXCEPTION_SIGNAL_OPT_IN=logs` to request log-only exception
+events. `logs/dup` emits both representations for a temporary compatibility
+test, but doubles volume and sensitive-data exposure. Unsupported
+instrumentations ignore the setting, so verify the exported signals after every
+upgrade rather than assuming the variable changed their behavior.
 
 If you do use OTel log export, keep it separate in your mental model:
 
@@ -918,6 +976,186 @@ For many Python services, this is enough:
 structured application logs -> log agent/backend
 trace and span IDs in log fields -> correlation with traces
 ```
+
+### Emit Named Log-Based Events Through Structlog
+
+A correlated JSON log is not automatically an OpenTelemetry **Event**. In the
+[OTel data model](https://opentelemetry.io/docs/specs/otel/logs/data-model/), an
+Event is a `LogRecord` whose top-level `event_name` is non-empty. Do not emulate
+that field with an `event.name` attribute; backends and compatibility transforms
+may not recognize it as an Event.
+
+Python 1.44 supports `event_name` on `Logger.emit()`. The official
+[`opentelemetry-instrumentation-structlog`](https://github.com/open-telemetry/opentelemetry-python-contrib/tree/main/instrumentation/opentelemetry-instrumentation-structlog)
+package can export ordinary structlog calls as correlated OTel logs. In its
+initial `0.65b0` release, however, it maps structlog's `event` value to the log
+body and does not populate the top-level OTel `event_name`. Use the small
+processor below when the record must be a true named Event.
+
+Install compatible packages together:
+
+```bash
+pip install \
+  'opentelemetry-api>=1.44,<2' \
+  'opentelemetry-sdk>=1.44,<2' \
+  'opentelemetry-exporter-otlp-proto-http>=1.44,<2' \
+  'structlog>=25,<26'
+```
+
+This baseline exports named events to the console so the result is visible. It
+assumes tracing already uses the same `resource` and `tracer` created earlier
+in this chapter:
+
+```python
+from time import time_ns
+from typing import Any
+
+import structlog
+from opentelemetry._logs import SeverityNumber, get_logger, set_logger_provider
+from opentelemetry.context import get_current
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import (
+    ConsoleLogRecordExporter,
+    SimpleLogRecordProcessor,
+)
+
+
+logger_provider = LoggerProvider(resource=resource)
+logger_provider.add_log_record_processor(
+    SimpleLogRecordProcessor(ConsoleLogRecordExporter())
+)
+set_logger_provider(logger_provider)
+
+
+class OtelEventProcessor:
+    """Turn selected structlog calls into named OTel LogRecords."""
+
+    _severity = {
+        "debug": SeverityNumber.DEBUG,
+        "info": SeverityNumber.INFO,
+        "warning": SeverityNumber.WARN,
+        "error": SeverityNumber.ERROR,
+        "critical": SeverityNumber.FATAL,
+    }
+    _severity_text = {
+        "warning": "WARN",
+        "critical": "FATAL",
+    }
+
+    def __init__(self, provider: LoggerProvider) -> None:
+        self._logger = get_logger(
+            "chat-api.events", logger_provider=provider
+        )
+
+    def __call__(
+        self,
+        _logger: Any,
+        method_name: str,
+        event_dict: dict[str, Any],
+    ) -> dict[str, Any]:
+        event_name = event_dict.pop("otel_event_name", None)
+        if event_name is None:
+            return event_dict
+
+        level = str(event_dict.get("level", method_name)).lower()
+        attributes = {
+            key: value
+            for key, value in event_dict.items()
+            if key not in {"event", "level", "timestamp", "exception"}
+        }
+        if "exception" in event_dict:
+            attributes["exception.stacktrace"] = event_dict["exception"]
+
+        self._logger.emit(
+            # Events require the occurrence time, not only observed time.
+            timestamp=time_ns(),
+            event_name=str(event_name),
+            body=event_dict.get("event"),
+            severity_number=self._severity.get(
+                level, SeverityNumber.INFO
+            ),
+            severity_text=self._severity_text.get(level, level.upper()),
+            attributes=attributes,
+            # This is what attaches trace_id, span_id, and trace flags.
+            context=get_current(),
+        )
+
+        # The named event already entered the OTel pipeline. Do not also emit
+        # it to stdout, where a log agent could ingest a duplicate.
+        raise structlog.DropEvent
+
+
+structlog.configure(
+    processors=[
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.format_exc_info,
+        OtelEventProcessor(logger_provider),
+        add_otel_trace_context,
+        structlog.processors.JSONRenderer(),
+    ]
+)
+
+log = structlog.get_logger("chat-api")
+
+with tracer.start_as_current_span(
+    "provider.request", record_exception=False
+) as span:
+    try:
+        call_provider()
+    except TimeoutError as exc:
+        span.set_attribute("error.type", type(exc).__name__)
+        log.error(
+            "provider request timed out",
+            otel_event_name="app.provider.request.exception",
+            exc_info=True,
+            **{
+                "error.type": type(exc).__name__,
+                "exception.type": type(exc).__qualname__,
+                "server.address": "provider.example.com",
+            },
+        )
+        raise
+```
+
+The console exporter should show one log record with
+`event_name=app.provider.request.exception` and non-zero `trace_id` and
+`span_id`. If `event_name` is empty, the call bypassed this processor. If the IDs
+are zero, it ran outside the span's active context.
+
+For production, construct the provider with batching and OTLP/HTTP instead of
+adding the console processor:
+
+```python
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+
+logger_provider = LoggerProvider(resource=resource)
+logger_provider.add_log_record_processor(
+    BatchLogRecordProcessor(OTLPLogExporter())
+)
+set_logger_provider(logger_provider)
+```
+
+Configure the provider once at startup and call `logger_provider.shutdown()`
+on process shutdown. The `DropEvent` is deliberate: if you want both direct
+OTLP and stdout copies, remove it only after confirming that stdout is not also
+collected into the same backend. Otherwise every named event appears twice.
+
+Route this exporter to a logs backend or to the Collector's logs pipeline. The
+[Langfuse OTLP endpoint](https://langfuse.com/integrations/native/opentelemetry)
+currently ingests traces, not the OTel logs signal, so it is not a destination
+for these log-based events. If the same occurrence must appear as a Langfuse
+`event` observation, create that observation through the Langfuse SDK as a
+separate product-observability decision.
+
+Use this mechanism for checkpoints, state changes, and exceptions that need a
+stable schema and their own timestamp. Use an ordinary structlog record for
+free-form diagnostics, and a span attribute for a fact that describes the
+whole operation. Event names must be stable; put request IDs, user IDs, model
+names, and other varying values in attributes.
 
 ## 🔌 Zero-Code Instrumentation
 
@@ -1233,6 +1471,12 @@ Logs not correlated:
 - Does your formatter include trace and span fields?
 - Does the log backend parse those fields?
 
+Named log events look like ordinary logs or appear twice:
+
+- Is top-level OTel `event_name` populated, rather than only an `event.name` attribute?
+- Does `OtelEventProcessor` run before the renderer?
+- Are both direct OTLP export and stdout collection ingesting the same record?
+
 ## ⚠️ Common Python Pitfalls
 
 - Configuring the SDK after importing or creating framework clients.
@@ -1252,6 +1496,8 @@ Logs not correlated:
   OTLP/HTTP endpoint.
 - Appending OTLP/HTTP signal paths to an OTLP/gRPC target.
 - Assuming Python OTel log export has the same maturity as trace-log correlation.
+- Using an `event.name` attribute instead of the top-level LogRecord `event_name`.
+- Exporting the same structlog event directly over OTLP and through a stdout log agent.
 
 ## ✅ Minimal Production Checklist
 

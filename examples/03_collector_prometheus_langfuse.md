@@ -84,18 +84,11 @@ processors:
         action: delete
       - key: llm.completions
         action: delete
-  transform/redact_events:
+  transform/redact_logs:
     error_mode: propagate
-    trace_statements:
-      - context: spanevent
+    log_statements:
+      - context: log
         statements:
-          - delete_key(attributes, "http.request.header.authorization")
-          - delete_key(attributes, "http.request.header.cookie")
-          - delete_key(attributes, "http.response.header.set_cookie")
-          - delete_key(attributes, "db.query.text")
-          - delete_key(attributes, "db.statement")
-          - delete_key(attributes, "exception.message")
-          - delete_key(attributes, "exception.stacktrace")
           - delete_key(attributes, "gen_ai.system_instructions")
           - delete_key(attributes, "gen_ai.input.messages")
           - delete_key(attributes, "gen_ai.output.messages")
@@ -108,11 +101,6 @@ processors:
           - delete_key(attributes, "langfuse.trace.output")
           - delete_key(attributes, "llm.prompts")
           - delete_key(attributes, "llm.completions")
-  transform/redact_log_bodies:
-    error_mode: propagate
-    log_statements:
-      - context: log
-        statements:
           - set(body, "[REDACTED_BY_DEFAULT]") where body != nil
   tail_sampling/langfuse:
     decision_wait: 30s
@@ -374,12 +362,12 @@ service:
   pipelines:
     traces/main:
       receivers: [otlp]
-      processors: [memory_limiter, resource, attributes/redact_common, attributes/redact_payloads, transform/redact_events, batch]
+      processors: [memory_limiter, resource, attributes/redact_common, attributes/redact_payloads, batch]
       exporters: [otlp/main_traces]
 
     traces/langfuse:
       receivers: [otlp]
-      processors: [memory_limiter, resource, attributes/redact_common, transform/redact_events, tail_sampling/langfuse, batch]
+      processors: [memory_limiter, resource, attributes/redact_common, tail_sampling/langfuse, batch]
       exporters: [otlphttp/langfuse]
 
     metrics:
@@ -389,11 +377,11 @@ service:
 
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, resource, attributes/redact_common, transform/redact_log_bodies, batch]
+      processors: [memory_limiter, resource, attributes/redact_common, transform/redact_logs, batch]
       exporters: [otlp/logs]
 ```
 
-The general trace backend receives `attributes/redact_payloads`; Langfuse does not, because masked LLM payloads are useful there. Both paths still remove credentials, database statements, exception messages, and sensitive event attributes. The logs pipeline replaces bodies entirely in this safe-default template because the span `attributes` processor cannot rewrite log bodies. Replace that rule only with a tested structured-log allowlist.
+The general trace backend receives `attributes/redact_payloads`; Langfuse does not, because masked LLM payloads are useful there. Both trace paths still remove credentials, database statements, and exception fields. Named events use the logs pipeline, which removes sensitive event attributes and replaces bodies entirely in this safe-default template. Replace that rule only with a tested structured-log allowlist.
 
 The tail sampler in this configuration belongs only to `traces/langfuse`.
 The `logs` pipeline does not receive its keep/drop decision. A log can therefore
@@ -407,7 +395,7 @@ relationship between error logs and span status.
 
 > 💡 **Key insight:** The tail sampler applies only to `traces/langfuse` — the general traces pipeline is unaffected, so traces rejected from Langfuse may still appear in the general backend.
 
-These lists are deny-by-key second lines of defense. Application code must allowlist captured content before it creates spans, especially on the richer Langfuse path. Add keys for every captured header and instrumentation library, then test canary secrets in span attributes, span events, exception data, and log bodies.
+These lists are deny-by-key second lines of defense. Application code must allowlist captured content before it creates spans or log events, especially on the richer Langfuse path. Add keys for every captured header and instrumentation library, then test canary secrets in span attributes, log-event attributes and bodies, and exception data.
 
 `UnderscoreEscapingWithoutSuffixes` is explicit: dots and unsupported characters become underscores, while unit and counter-type suffixes are not added. Histogram structural series still use `_bucket`, `_count`, and `_sum`. The PromQL below is written for that strategy. If you choose the default `UnderscoreEscapingWithSuffixes`, regenerate and test every series name instead of copying these rules.
 

@@ -317,7 +317,7 @@ without an owner and tests.
 - [ ] TLS/authentication matches every trust boundary.
 - [ ] Backend credentials are least-privilege, rotatable, and separately owned.
 - [ ] Container, ServiceAccount, RBAC, host access, NetworkPolicy, and egress follow least privilege.
-- [ ] Sensitive-data tests cover attributes, events, log bodies, exceptions, prompts, tool arguments, and outputs.
+- [ ] Sensitive-data tests cover span attributes, log-event attributes and bodies, exceptions, prompts, tool arguments, and outputs.
 - [ ] Debug endpoints and exporters are disabled or tightly restricted.
 
 ### Operations

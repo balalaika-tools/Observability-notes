@@ -96,6 +96,7 @@ Deploying OpenTelemetry Collectors:
 - Use `LANGFUSE_BASE_URL`, not legacy `LANGFUSE_HOST`, in new code.
 - Langfuse OTLP ingestion uses OTLP/HTTP and Basic Auth; OTLP/gRPC is not supported by Langfuse ingestion.
 - Use current GenAI semantic convention names such as `gen_ai.provider.name`, `gen_ai.operation.name`, and `gen_ai.usage.*`.
+- Do not add new span events. OpenTelemetry is deprecating `Span.add_event()` and `Span.record_exception()` in favor of named log records correlated with the active span.
 - Send operational metrics to a metrics backend for alerts. Use Langfuse for LLM traces, generations, scores, datasets, quality analytics, cost, and workflow investigation.
 - Treat baggage as an allowlisted propagation mechanism, not as a place for secrets or arbitrary user data.
 - Pin the Collector image and chart independently, validate the exact distribution's component set, and use trace-ID-aware routing before scaling a tail-sampling tier.
@@ -104,6 +105,8 @@ Deploying OpenTelemetry Collectors:
 
 - OpenTelemetry docs: <https://opentelemetry.io/docs/>
 - OpenTelemetry Python docs: <https://opentelemetry.io/docs/languages/python/>
+- OpenTelemetry span-event deprecation: <https://opentelemetry.io/blog/2026/deprecating-span-events/>
+- OpenTelemetry event semantic conventions: <https://opentelemetry.io/docs/specs/semconv/general/events/>
 - OpenTelemetry Collector docs: <https://opentelemetry.io/docs/collector/>
 - OpenTelemetry GenAI semantic conventions: <https://github.com/open-telemetry/semantic-conventions-genai>
 - Langfuse docs: <https://langfuse.com/docs>

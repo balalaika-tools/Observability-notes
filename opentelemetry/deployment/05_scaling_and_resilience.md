@@ -86,7 +86,7 @@ upgrade.
 Do not copy a universal "spans per Collector" number. Capacity depends on:
 
 - signal mix and serialized record size;
-- attributes, events, log body size, and metric cardinality;
+- span attributes and links, log-event attributes and bodies, and metric cardinality;
 - receivers and exporters;
 - transform, redaction, enrichment, and sampling work;
 - batch and queue settings;

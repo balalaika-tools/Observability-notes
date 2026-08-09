@@ -129,7 +129,7 @@ LANGFUSE_OBSERVATION_OUTPUT = "langfuse.observation.output"
 This looks boring, which is exactly the point. When the convention evolves, one
 module changes instead of every LLM call site.
 
-Use one error pattern for every GenAI operation in this chapter. Put a low-cardinality `error.type` on the failed span, then re-raise. Python's `start_as_current_span()` defaults record the escaping exception and set error status, so the examples do not also call `record_exception()` or put `str(exc)` in status. If an instrumentation disables `record_exception` or `set_status_on_exception`, it must take over both responsibilities exactly once.
+Use one error pattern for every GenAI operation in this chapter. Put a low-cardinality `error.type` on the failed span, pass `record_exception=False`, then re-raise. The Python context manager still sets error status because `set_status_on_exception` remains enabled, but it does not create the legacy exception span event. Emit exception details once through the correlated logs pipeline at the owning service boundary; do not put `str(exc)` in span status.
 
 ## 🏷️ Operation Vocabulary
 
@@ -335,6 +335,7 @@ def complete_chat(
         f"chat {model}",
         kind=SpanKind.CLIENT,
         attributes=attributes,
+        record_exception=False,
     ) as span:
         start = time.perf_counter()
 
@@ -396,7 +397,7 @@ Notes:
   user-specific label.
 - `error.type` is low-cardinality. Use exception class names or provider error
   codes, not full error messages.
-- `start_as_current_span()` records an escaping exception and sets error status by default. The `except` block adds only `error.type` and re-raises, so it does not create a duplicate exception event or put raw exception text in status.
+- `record_exception=False` prevents a legacy exception span event. The re-raised exception still makes the context manager set `ERROR`; the `except` block adds only bounded `error.type`, while the service logging boundary owns the exception log event and stack trace.
 - This wrapper is where provider-specific response parsing belongs.
 
 ## 🔄 Streaming
@@ -437,6 +438,7 @@ def stream_chat(client, messages: list[dict], *, model: str):
             "gen_ai.request.model": model,
             "gen_ai.request.stream": True,
         },
+        record_exception=False,
     ) as span:
         start = time.perf_counter()
         first_chunk_at: float | None = None
@@ -621,6 +623,7 @@ def embed_texts(client, texts: list[str], *, model: str) -> list[list[float]]:
             "gen_ai.request.model": model,
             "app.embedding.input_count": len(texts),
         },
+        record_exception=False,
     ) as span:
         try:
             response = client.embeddings.create(model=model, input=texts)
@@ -658,6 +661,7 @@ def retrieve_documents(vector_store, query_vector: list[float], *, top_k: int):
             "gen_ai.data_source.id": data_source_id,
             "gen_ai.retrieval.top_k": top_k,
         },
+        record_exception=False,
     ) as span:
         try:
             docs = vector_store.search(query_vector, top_k=top_k)
@@ -696,6 +700,7 @@ with tracer.start_as_current_span(
         "app.rerank.input_count": len(docs),
         "app.rerank.strategy": "cross_encoder_v2",
     },
+    record_exception=False,
 ) as span:
     ranked_docs = rerank(query, docs)
     span.set_attribute("app.rerank.output_count", len(ranked_docs))
@@ -731,6 +736,7 @@ def execute_tool(tool_registry, call) -> dict:
             "gen_ai.tool.call.id": call.id,
             "gen_ai.tool.type": "function",
         },
+        record_exception=False,
     ) as span:
         try:
             result = tool_registry[tool_name](**call.arguments)
@@ -777,6 +783,7 @@ def run_support_agent(request: SupportRequest) -> AgentAnswer:
             "gen_ai.agent.name": "support_agent",
             "gen_ai.workflow.name": "support_rag",
         },
+        record_exception=False,
     ) as span:
         try:
             plan = make_plan(request)
@@ -802,6 +809,7 @@ def run_support_workflow(request: SupportRequest) -> AgentAnswer:
             "gen_ai.operation.name": "invoke_workflow",
             "gen_ai.workflow.name": "support_rag",
         },
+        record_exception=False,
     ) as span:
         try:
             return run_support_agent(request)
@@ -961,6 +969,7 @@ with tracer.start_as_current_span(
         "langfuse.trace.metadata.tenant_tier": "enterprise",
         "langfuse.observation.metadata.prompt_version": "support-v42",
     },
+    record_exception=False,
 ) as span:
     ...
 ```
@@ -1108,6 +1117,12 @@ Use trace correlation fields in logs so an operator can jump from a log line to
 the trace. Keep raw prompt and output capture in Langfuse or a controlled
 payload store, not in broad application logs.
 
+For point-in-time GenAI checkpoints and exceptions, emit a named OTel
+`LogRecord` with `event_name` while the relevant span is active. The record then
+keeps its own timestamp, severity, and event attributes plus the current trace
+and span IDs. The runnable structlog processor and its duplicate-ingestion guard
+are in [Python Instrumentation](02_python_instrumentation.md#emit-named-log-based-events-through-structlog).
+
 ## 🛠️ Testing Instrumentation
 
 Test the instrumentation like product code. At minimum, verify:
@@ -1116,6 +1131,7 @@ Test the instrumentation like product code. At minimum, verify:
 - LLM calls are child spans of the request or workflow;
 - model, provider, operation, and token attributes are present;
 - errors set span status and `error.type`;
+- manual exception paths do not create span events and emit exception details through correlated logs;
 - streaming spans record time to first chunk;
 - prompt/output capture is disabled by default;
 - prompt/output capture can be enabled intentionally;

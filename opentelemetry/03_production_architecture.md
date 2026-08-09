@@ -283,19 +283,6 @@ processors:
       - key: exception.stacktrace
         action: delete
 
-  transform/drop_event_secrets:
-    error_mode: propagate
-    trace_statements:
-      - context: spanevent
-        statements:
-          - delete_key(attributes, "http.request.header.authorization")
-          - delete_key(attributes, "http.request.header.cookie")
-          - delete_key(attributes, "http.response.header.set_cookie")
-          - delete_key(attributes, "db.query.text")
-          - delete_key(attributes, "db.statement")
-          - delete_key(attributes, "exception.message")
-          - delete_key(attributes, "exception.stacktrace")
-
   transform/redact_apm:
     error_mode: propagate
     trace_statements:
@@ -313,7 +300,8 @@ processors:
           - delete_key(attributes, "langfuse.trace.output")
           - delete_key(attributes, "llm.prompts")
           - delete_key(attributes, "llm.completions")
-      - context: spanevent
+    log_statements:
+      - context: log
         statements:
           - delete_key(attributes, "gen_ai.system_instructions")
           - delete_key(attributes, "gen_ai.input.messages")
@@ -327,9 +315,6 @@ processors:
           - delete_key(attributes, "langfuse.trace.output")
           - delete_key(attributes, "llm.prompts")
           - delete_key(attributes, "llm.completions")
-    log_statements:
-      - context: log
-        statements:
           - set(body, "[REDACTED_BY_COLLECTOR]") where body != nil
 
   batch:
@@ -363,12 +348,12 @@ service:
   pipelines:
     traces/langfuse:
       receivers: [otlp]
-      processors: [memory_limiter, resource/add_environment, attributes/drop_secrets, transform/drop_event_secrets, batch]
+      processors: [memory_limiter, resource/add_environment, attributes/drop_secrets, batch]
       exporters: [otlphttp/langfuse]
 
     traces/apm:
       receivers: [otlp]
-      processors: [memory_limiter, resource/add_environment, attributes/drop_secrets, transform/drop_event_secrets, transform/redact_apm, batch]
+      processors: [memory_limiter, resource/add_environment, attributes/drop_secrets, transform/redact_apm, batch]
       exporters: [otlphttp/traces]
 
     metrics:
@@ -382,9 +367,9 @@ service:
       exporters: [otlphttp/logs]
 ```
 
-This is the advertised destination-specific split in executable form. The same receiver feeds two trace pipelines. Langfuse receives approved, application-masked LLM input/output after universal secret fields are removed. The general APM backend receives the same trace shape, timing, status, model, and usage attributes after payload fields and sensitive event attributes are removed. The log example suppresses every body and retains only structured allowlisted attributes; replace that conservative rule only after defining and testing a log-body masker.
+This is the advertised destination-specific split in executable form. The same receiver feeds two trace pipelines. Langfuse receives approved, application-masked LLM input/output after universal secret fields are removed. The general APM backend receives the same trace shape, timing, status, model, and usage attributes after payload fields are removed. Named events now travel through the logs pipeline, where the same sensitive payload attributes are removed and every body is suppressed by default. Replace that conservative body rule only after defining and testing a log-body masker.
 
-"Rich" never means raw. Mask or allowlist question, prompt, document, tool, account, and output content in the application before it enters a span. Collector deletion by key cannot find a secret embedded inside an otherwise allowed JSON string. Test both destinations with canary API keys, emails, authorization headers, exception messages, span events, legacy LLM keys, Langfuse root/observation payloads, and log bodies.
+"Rich" never means raw. Mask or allowlist question, prompt, document, tool, account, and output content in the application before it enters a span or log event. Collector deletion by key cannot find a secret embedded inside an otherwise allowed JSON string. Test both destinations with canary API keys, emails, authorization headers, exception messages, log-event attributes and bodies, legacy LLM keys, and Langfuse root/observation payloads.
 
 > ⚠️ **Watch out:** Collector `attributes` processors delete by key name only — a secret embedded inside a JSON string value passes through untouched; mask or redact sensitive content in application code before it enters a span attribute.
 
@@ -693,20 +678,25 @@ tracer = trace.get_tracer(__name__)
 
 
 def call_provider_safely():
-    with tracer.start_as_current_span("provider.request") as span:
+    with tracer.start_as_current_span(
+        "provider.request", record_exception=False
+    ) as span:
         try:
             return call_provider()
         except Exception as exc:
-            span.record_exception(exc)
             span.set_status(Status(StatusCode.ERROR))
             span.set_attribute("error.type", type(exc).__qualname__)
+            # The log pipeline owns the exception details and stack trace.
             logger.exception("provider call failed")
             return None
 ```
 
-An escaped exception may be recorded and marked `ERROR` automatically by an SDK
-context manager. When code catches the exception inside the span, as above,
-record the exception and final status explicitly if the operation truly failed.
+An SDK context manager can still create a legacy exception span event when an
+exception escapes. New manual instrumentation should pass
+`record_exception=False`, keep `set_status_on_exception=True`, and emit the
+exception through the correlated logs pipeline. When code catches the exception
+inside the span, as above, set the final span status explicitly if the operation
+truly failed and let the structured exception log carry the stack trace.
 Do not mark every span as failed merely because it emitted an error-level log: a
 successful fallback can make the containing operation successful even though a
 child operation failed.
@@ -989,7 +979,7 @@ Traces are incomplete:
 - tail sampling tier does not receive all spans for a trace;
 - SDK shuts down before spans flush;
 - a service exports to a different Collector or backend;
-- span limits drop large attributes or events.
+- span limits drop large attributes or links, or log-record limits drop event attributes.
 
 Metrics are expensive:
 
