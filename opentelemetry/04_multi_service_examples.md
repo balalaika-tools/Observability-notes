@@ -655,7 +655,7 @@ Sometimes a queued job is related but not a direct child:
 Use span links.
 
 ```python
-from opentelemetry import trace
+from opentelemetry import context as otel_context, trace
 from opentelemetry.propagate import extract
 from opentelemetry.trace import Link
 
@@ -669,12 +669,42 @@ def process_batch(messages: list) -> None:
         if span_context.is_valid:
             links.append(Link(span_context))
 
-    with tracer.start_as_current_span("worker.process_batch", links=links) as span:
+    with tracer.start_as_current_span(
+        "worker.process_batch",
+        # `None` would reuse the current context. An explicit empty context
+        # guarantees that this linked operation starts a new trace.
+        context=otel_context.Context(),
+        kind=trace.SpanKind.CONSUMER,
+        links=links,
+    ) as span:
         span.set_attribute("messaging.batch.message_count", len(messages))
         process_messages(messages)
 ```
 
 Links say "related to these contexts" without pretending there is one parent.
+The empty `Context()` is what makes `worker.process_batch` a root span. In the
+Python API, omitting `context` or passing `None` uses the current context; if a
+queue instrumentation has already activated a consumer span, the batch span
+would otherwise become its child and remain in that trace.
+
+Verify the exported shape rather than only checking that `links` is populated:
+
+```text
+worker.process_batch
+  trace_id != every producer trace_id
+  parent_span_id = empty
+  links = one producer SpanContext per message with valid propagated context
+```
+
+⚠️ `Context()` only controls the parent of the manual span. It cannot remove an
+automatic `CONSUMER` span that was created before `process_batch()` ran. If the
+instrumentation already emits the root-plus-links topology you want, use that
+span instead of creating a duplicate. If it emits different semantics, disable
+that queue instrumentation in the worker process and let the handler own
+extraction, root creation, links, and the consumer span. Keep unrelated HTTP,
+database, and client instrumentations enabled. The Python-specific ownership
+and selective-disable choices are covered in
+[Python Instrumentation](02_python_instrumentation.md).
 
 ## 🔄 Async Tasks And Threads
 
@@ -819,18 +849,25 @@ Logs do not correlate:
 - logs are emitted outside the active span;
 - background worker lost context.
 
-Queue jobs become root traces:
+Queue jobs have an unexpected trace shape:
 
-- producer did not inject context into message metadata;
-- consumer did not extract metadata;
-- broker stripped metadata;
-- job is intentionally decoupled and should use span links instead.
+- expected parent-child but got an unlinked root: producer injection, consumer
+  extraction, or broker metadata preservation failed;
+- expected a linked root but got the producer trace: the consumer reused the
+  extracted or current context as parent instead of passing an empty context;
+- expected one consumer span but got two: auto-instrumentation and manual code
+  both own the consumer boundary;
+- expected links but got none: the carrier did not contain a valid propagated
+  `SpanContext`, or the getter read the wrong message-attribute representation.
 
 ## ✅ Design Checklist
 
-- Use auto-instrumentation for standard HTTP/gRPC/database/queue clients.
+- Use auto-instrumentation for standard HTTP/gRPC/database/queue clients only
+  after its emitted parent/link semantics match the intended trace policy.
 - Add manual spans around business operations.
-- Use manual `inject()` and `extract()` only where auto-instrumentation does not apply.
+- Use manual `inject()` and `extract()` where auto-instrumentation does not
+  apply or where the queue boundary deliberately needs custom parent/link
+  semantics.
 - Create trusted application baggage at the first trusted service boundary.
 - Set baggage-derived attributes directly on that service's already-running
   `SERVER` span.
@@ -847,6 +884,10 @@ Queue jobs become root traces:
 ## 🔗 References
 
 - [OpenTelemetry Python propagation](https://opentelemetry.io/docs/languages/python/propagation/)
+- [OpenTelemetry Python tracing API](https://opentelemetry-python.readthedocs.io/en/stable/api/trace.html)
+- [OpenTelemetry Python agent configuration](https://opentelemetry.io/docs/zero-code/python/configuration/)
+- [OpenTelemetry Boto3 SQS instrumentation](https://opentelemetry-python-contrib.readthedocs.io/en/latest/instrumentation/boto3sqs/boto3sqs.html)
+- [OpenTelemetry Boto3 SQS 0.65b0 source](https://github.com/open-telemetry/opentelemetry-python-contrib/blob/v0.65b0/instrumentation/opentelemetry-instrumentation-boto3sqs/src/opentelemetry/instrumentation/boto3sqs/__init__.py)
 - [OpenTelemetry baggage](https://opentelemetry.io/docs/concepts/signals/baggage/)
 - [OpenTelemetry Python propagator API](https://opentelemetry-python.readthedocs.io/en/latest/api/propagate.html)
 - [OpenTelemetry Python `SpanProcessor` API](https://opentelemetry-python.readthedocs.io/en/latest/sdk/trace.html)

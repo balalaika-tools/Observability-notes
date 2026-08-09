@@ -796,11 +796,25 @@ can record an escaped exception and set `ERROR` automatically. If code catches
 an exception inside the span, as this demo does for retry handling, record the
 exception and final error status explicitly.
 
-In a real service, let FastAPI/ASGI, HTTPX, the queue client, and the database
-instrumentation create their protocol spans and propagate context. Keep manual
-spans for business operations such as `rag.retrieve`. Export with OTLP through
-a batch processor, and never put raw prompts, retrieved documents, queue
-payloads, credentials, or personal data into general-purpose attributes.
+In a real service, let each instrumentation own only the protocol semantics you
+actually want. FastAPI/ASGI can own inbound HTTP spans, HTTPX instrumentation
+outbound calls, and database instrumentation client spans. FastAPI
+instrumentation does not also instrument an SQS or Kafka boundary; messaging
+behavior comes from a separate queue instrumentation package.
+
+For queues, first choose between continuing the producer trace and starting a
+new trace with a link. If the queue instrumentation emits that exact topology,
+let it own injection, extraction, and consumer spans. If it does not, disable
+that queue instrumentor in the worker and own the boundary manually, as this
+simulation does. Starting an empty-context span inside an already automatic
+consumer span changes only the new span's parent; it does not erase the
+automatic span that was already exported. See
+[Python Instrumentation](02_python_instrumentation.md) for the concrete worker
+policy and selective-instrumentation examples.
+
+Keep manual spans for business operations such as `rag.retrieve`. Export with
+OTLP through a batch processor, and never put raw prompts, retrieved documents,
+queue payloads, credentials, or personal data into general-purpose attributes.
 The GenAI and messaging conventions evolve faster than core tracing, so pin
 the convention version used by instrumentation packages and recheck these
 names during upgrades.
@@ -1084,6 +1098,12 @@ Auto-instrumentation creates telemetry for common framework and library work:
 - common runtime or framework metrics;
 - trace context injection and extraction;
 - trace-log correlation.
+
+This coverage is additive, not transitive. Installing FastAPI instrumentation
+adds FastAPI/ASGI behavior; it does not make the framework instrument every
+client, database, or queue used by a route. Each library needs its own matching
+instrumentation, and each enabled instrumentation owns the span and propagation
+semantics at that boundary.
 
 Manual instrumentation fills the business gaps:
 

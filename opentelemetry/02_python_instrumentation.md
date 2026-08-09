@@ -971,6 +971,13 @@ spans, outbound HTTP client spans, SQLAlchemy database spans, and Redis client
 spans without calls such as `FastAPIInstrumentor.instrument_app(app)` in
 `app.py`.
 
+Auto-instrumentation is composed per installed instrumentation package. The
+FastAPI/ASGI instrumentation owns the inbound HTTP boundary: it extracts HTTP
+trace context and creates server spans. It does not also instrument SQS, Kafka,
+or another transport merely because the HTTP handler publishes a message.
+Queue injection, extraction, and consumer spans come from that queue library's
+instrumentation package, when one is installed and enabled.
+
 Disable an installed integration without uninstalling its package by using its
 instrumentor entry-point name:
 
@@ -978,6 +985,24 @@ instrumentor entry-point name:
 OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=urllib3,redis \
 opentelemetry-instrument uvicorn app:app
 ```
+
+The values are instrumentor entry-point names, not necessarily package-name
+suffixes. For example,
+[`opentelemetry-instrumentation-boto3sqs==0.65b0`](https://github.com/open-telemetry/opentelemetry-python-contrib/blob/v0.65b0/instrumentation/opentelemetry-instrumentation-boto3sqs/pyproject.toml)
+registers as `boto3`:
+
+```bash
+OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=boto3 \
+opentelemetry-instrument python worker.py
+```
+
+This disables that whole entry point in this process, not only its consumer
+side. It is appropriate for a worker that will manually own its SQS receive and
+process spans. If one process must keep automatic producer hooks but customize
+only consumer semantics, use the instrumentation's programmatic controls when
+they support that split; otherwise own both queue directions manually. FastAPI,
+HTTPX, and SQLAlchemy remain automatic because their entry points are still
+enabled.
 
 Do not normally activate the same integration both ways. Launching with
 `opentelemetry-instrument` while application code also calls that integration's
@@ -1011,19 +1036,113 @@ worker starts
 For long-running workers, configure once at process startup. For short-lived
 jobs, flush in `finally`.
 
+Choose the trace relationship before writing the handler:
+
+| Queue lifecycle | Parent of the consumer span | Use when |
+| --- | --- | --- |
+| Continued trace | Extracted producer context | One message continues the same causal operation and the resulting long trace is useful. |
+| New trace plus link | Empty context; extracted producer context becomes a `Link` | Work is delayed, independently retried, batched, fan-in/fan-out, or owned by a separate lifecycle. |
+
+For a continued trace, use the extracted context as parent:
+
 ```python
+from opentelemetry import trace
 from opentelemetry.propagate import extract
 
 
 def handle_message(message) -> None:
     ctx = extract(message.headers)
-    with tracer.start_as_current_span("worker.process_message", context=ctx):
+    with tracer.start_as_current_span(
+        "worker.process_message",
+        context=ctx,
+        kind=trace.SpanKind.CONSUMER,
+    ):
         process(message.payload)
 ```
 
-If a queued job is causally connected to one request, use propagated context as
-the parent. If it is intentionally decoupled, delayed, batched, or fan-in/fan-
-out, use span links instead of forcing a misleading parent-child relationship.
+For a separate worker lifecycle, extract the same carrier but use it only as a
+link:
+
+```python
+from opentelemetry import context as otel_context, trace
+from opentelemetry.propagate import extract
+from opentelemetry.trace import Link
+
+
+def handle_message(message) -> None:
+    incoming_ctx = extract(message.headers)
+    producer_ctx = trace.get_current_span(
+        incoming_ctx
+    ).get_span_context()
+    links = [Link(producer_ctx)] if producer_ctx.is_valid else []
+
+    with tracer.start_as_current_span(
+        "worker.process_message",
+        # `None` means "use current context", not "create a root".
+        context=otel_context.Context(),
+        kind=trace.SpanKind.CONSUMER,
+        links=links,
+    ):
+        process(message.payload)
+```
+
+Success is structural: the worker span has a new `trace_id`, no
+`parent_span_id`, and one valid link to the producer span. If it shares the
+producer trace ID, the extracted or current context became its parent. If an
+automatic consumer span also appears, manual root creation did not undo it;
+both the instrumentation and the handler currently own the boundary.
+
+The generic examples above assume a string-to-string header carrier. Boto3 SQS
+stores propagated fields inside nested `MessageAttributes`, so its carrier
+adapter is required even when the automatic hooks are disabled:
+
+```python
+from opentelemetry import propagate
+from opentelemetry.instrumentation.boto3sqs import (
+    Boto3SQSGetter,
+    Boto3SQSSetter,
+)
+
+
+incoming_ctx = propagate.extract(
+    message.get("MessageAttributes", {}),
+    getter=Boto3SQSGetter(),
+)
+
+outgoing_attributes: dict = {}
+propagate.inject(outgoing_attributes, setter=Boto3SQSSetter())
+sqs.send_message(
+    QueueUrl=queue_url,
+    MessageBody=body,
+    MessageAttributes=outgoing_attributes,
+)
+```
+
+The getter and setter only adapt the carrier representation; importing them
+does not enable automatic spans. Inject while the intended producer span is
+current, and use `incoming_ctx` only as a link when starting the empty-context
+consumer span. When polling manually, pass
+`MessageAttributeNames=list(propagate.get_global_textmap().fields)` to
+`receive_message()`; otherwise SQS does not return the propagated fields and the
+consumer silently produces no link.
+
+Queue instrumentation behavior is library- and version-specific. In
+`opentelemetry-instrumentation-boto3sqs==0.65b0`, `ReceiveMessage` creates a
+`CONSUMER` receive span; each processing span is its child, links to the
+extracted producer context, and becomes current while that message is iterated:
+
+```text
+Trace B
+SQS receive                         CONSUMER, root
+└── SQS process                     CONSUMER, link -> producer in Trace A
+```
+
+That is already a new worker trace with a causal link, but it is not identical
+to a single root `process` span. If that extra receive/process hierarchy is
+acceptable, use the automatic spans and do not add another consumer span. If
+you require `process` itself to be the root, disable the `boto3` instrumentor in
+the worker and use the manual boundary above. Recheck the emitted shape when
+upgrading; other queue integrations expose different semantics and controls.
 
 ## 🔄 CLI Jobs And Batch Scripts
 
@@ -1090,6 +1209,10 @@ Broken traces across services:
 - Are `traceparent` headers preserved by proxies?
 - Are both services using `tracecontext` propagator?
 - Is context lost when work moves to a thread, task, or queue?
+- Does the worker intentionally continue the producer trace or start a linked
+  trace, and does the emitted parent/link shape match that policy?
+- Do automatic and manual instrumentation both create a consumer span for the
+  same message?
 
 Missing metrics:
 
@@ -1111,6 +1234,10 @@ Logs not correlated:
 - Configuring the SDK after importing or creating framework clients.
 - Creating a new `TracerProvider` in every module.
 - Calling instrumentors repeatedly in reloaders or tests.
+- Treating `context=None` as an instruction to create a root span; it reuses
+  the current context.
+- Creating a manual queue-consumer span while an automatic instrumentor already
+  owns the same processing boundary.
 - Using `SimpleSpanProcessor` in production request paths.
 - Emitting metrics with high-cardinality attributes.
 - Putting raw prompts, request bodies, document contents, emails, or secrets in attributes.
@@ -1128,6 +1255,8 @@ Logs not correlated:
 - Providers are configured once at process startup.
 - Framework and client instrumentations are installed before clients are created.
 - All services use compatible propagators.
+- Each queue boundary has an explicit parent-or-link policy, verified from an
+  exported trace using the deployed instrumentation version.
 - Manual spans cover business operations, not every small helper function.
 - Metrics use bounded attributes and are emitted independently from traces.
 - Logs include trace and span IDs.
