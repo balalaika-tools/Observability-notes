@@ -1,8 +1,18 @@
 # Baggage
 
+**Do not open this file to decide whether baggage is needed.** That decision is
+made in `../discovery.md` §5, and the answer is no unless the user named values
+that must travel between services. This is an implementation guide, not a
+rationale for adding baggage.
+
 Baggage is a request-scoped key/value store that travels with trace context across service boundaries. It solves one problem: a fact decided in service A is needed by service B, and threading it through every function signature and every API contract in between is impractical.
 
 It is not needed to connect spans — trace context already does that.
+
+Baggage-propagated facts use ordinary `app.<domain>.<noun>` keys — the same key
+on the span as anywhere else, so one dashboard finds all of them. There is no
+separate namespace for "arrived via baggage"; see
+`../conventions/naming.md`, "The `app.*` registry".
 
 ---
 
@@ -38,6 +48,7 @@ Never: access tokens, API keys, email addresses, raw prompts, retrieved document
 
 Define one mapping in the shared telemetry package. It is both a contract and a filter — baggage has no integrity guarantee, and instrumentation forwards it to services you did not think about.
 
+<!-- complete-python-template -->
 ```python
 # observability/baggage.py
 from __future__ import annotations
@@ -49,9 +60,9 @@ from opentelemetry.sdk.trace import SpanProcessor
 
 BAGGAGE_TO_SPAN_ATTRIBUTE: dict[str, str] = {
     "session.id": "session.id",
-    "app.trace.dimension.tenant_tier": "app.trace.dimension.tenant_tier",
-    "app.trace.dimension.feature": "app.trace.dimension.feature",
-    "app.trace.dimension.experiment": "app.trace.dimension.experiment",
+    "app.tenant.tier": "app.tenant.tier",
+    "app.feature.name": "app.feature.name",
+    "app.experiment.variant": "app.experiment.variant",
 }
 
 
@@ -148,10 +159,10 @@ async def chat(request: Request) -> dict:
     with use_trusted_baggage(
         {
             "session.id": load_authorized_session(identity, ...),
-            "app.trace.dimension.tenant_tier": validate_enum(
+            "app.tenant.tier": validate_enum(
                 identity.tenant_tier, {"free", "pro", "enterprise"}
             ),
-            "app.trace.dimension.feature": "support_chat",
+            "app.feature.name": "support_chat",
         }
     ):
         return await handle_chat(request)
@@ -187,12 +198,20 @@ Also confirm that calls to third parties do not carry internal baggage.
 Send one request through two services and inspect the exported spans:
 
 ```
-gateway  SERVER   app.trace.dimension.tenant_tier=enterprise   (set directly)
-gateway  CLIENT   app.trace.dimension.tenant_tier=enterprise   (from processor)
-agent    SERVER   app.trace.dimension.tenant_tier=enterprise   (from processor)
-agent    INTERNAL app.trace.dimension.tenant_tier=enterprise   (from processor)
+gateway  SERVER   app.tenant.tier=enterprise   (set directly)
+gateway  CLIENT   app.tenant.tier=enterprise   (from processor)
+agent    SERVER   app.tenant.tier=enterprise   (from processor)
+agent    INTERNAL app.tenant.tier=enterprise   (from processor)
 ```
 
 All four share one `trace_id`. If the attribute appears on the gateway's spans but not the agent's, the agent has no processor registered. If it appears nowhere downstream, `OTEL_PROPAGATORS` is missing `baggage`, or the baggage was set after the outbound headers were injected.
 
-Then check the negative: no baggage value appears as a **metric** attribute. Baggage-derived dimensions on metrics is how a cardinality incident starts.
+Then check the negative: no baggage value appears as a **metric** attribute. Baggage-derived dimensions on metrics is how a cardinality incident starts. The one exception the naming rules already allow — `app.tenant.tier`, because it is a closed enum — is a metric label on its own merits, not because baggage carried it.
+
+---
+
+## Then
+
+- naming and the `app.*` registry: `../conventions/naming.md`
+- if a Collector maps these into a backend's own metadata: `../collector/production.md`
+- final checks: `../verification.md`

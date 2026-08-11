@@ -91,6 +91,31 @@ app.outcome                      success | error | timeout | blocked
 
 Keep the enum values for `app.outcome` fixed across the whole service. A metric that groups on it is only useful if the set is closed.
 
+### The `app.*` registry
+
+One fact gets one key. Four `app.*` domains for the same subject means four
+dashboards that each miss three quarters of the data, so the domains are fixed:
+
+| Domain | Owns | Examples |
+| --- | --- | --- |
+| `app.gen_ai.*` | model- and provider-level facts with no standard `gen_ai.*` equivalent | `app.gen_ai.usage.input_token_details`, `app.gen_ai.stream.chunk_count`, `app.gen_ai.input.capture_mode`, `app.gen_ai.request.attempt`, `app.gen_ai.upstream_provider`, `app.gen_ai.estimated_cost_usd` |
+| `app.agent.*` | facts about one agent **run**, not one model call | `app.agent.time_to_first_chunk`, `app.agent.step_count`, `app.agent.stop_reason`, `app.agent.fallback.used` |
+| `app.workflow.*` | a durable or multi-step run | `app.workflow.name`, `app.workflow.run.id`, `app.workflow.version` |
+| `app.job.*`, `app.worker.*`, `app.message.*` | scheduled, worker, and queue work | `app.job.type`, `app.worker.jobs`, `app.message.attempt` |
+| `app.gen_ai.tool.*` | tool facts with no standard `gen_ai.tool.*` equivalent | `app.gen_ai.tool.requested_name`, `app.gen_ai.tool.result_size_bytes` |
+| `app.retrieval.*`, `app.embedding.*`, `app.guardrail.*` | RAG and policy stages | `app.retrieval.result_count`, `app.guardrail.blocked` |
+| `app.tenant.*`, `app.feature.*`, `app.experiment.*` | bounded request segmentation, including anything baggage propagates | `app.tenant.tier`, `app.feature.name`, `app.experiment.variant` |
+| `app.<business-domain>.*` | everything the service's own domain owns | `app.pricing.product_count`, `app.exception.rule` |
+| `app.outcome`, `app.response.time_to_first_chunk` | deliberately flat, because they belong to no single domain | — |
+
+Two rules follow from the table:
+
+- **`app.llm.*` does not exist.** Model-adjacent facts live under
+  `app.gen_ai.*`, mirroring the standard namespace they extend.
+- **The tenant tier is `app.tenant.tier` everywhere** — span attribute, metric
+  label, baggage key, and whatever a Collector transform maps it into. A second
+  key for the same fact is not a namespace decision, it is a silent data split.
+
 ---
 
 ## Metric names and units
@@ -99,9 +124,18 @@ Metric names describe the measured thing; the instrument type describes how it i
 
 | Good | Problematic |
 | --- | --- |
-| `app.pricing.updates` | `app.pricing.counter` |
+| `app.pricing.updates` | `app.pricing.counter`, `app.pricing.updates.count` |
 | `app.worker.job.duration` (unit `s`) | `app.worker.job.latency_ms` recorded in seconds |
 | `app.retrieval.result_count` | `docs` |
+| `app.exceptions_processed` | `app.exceptions_processed.count` |
+
+**No `.count` suffix on an event counter.** A plural noun already says what is
+being counted, the unit annotation (`{job}`, `{update}`) says it again, and
+Prometheus appends `_total` on ingest — so `app.pricing.updates.count` arrives
+as `app_pricing_updates_count_total`. `.count` is only correct when the *measured
+quantity itself* is a count at a point in time, as in `app.retrieval.result_count`
+(a histogram of "how many documents came back"), not the number of times
+something happened.
 
 Units are UCUM, and the unit is part of the name's contract: `s` for durations (never `ms`), `By` for bytes, and braced annotations such as `{request}` `{token}` `{document}` `{job}` for dimensionless counts. A name whose suffix disagrees with its unit — `latency_ms` recorded in seconds — misleads every reader and every alert.
 

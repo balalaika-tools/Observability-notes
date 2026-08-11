@@ -216,7 +216,7 @@ Silent telemetry loss during an incident is worse than no telemetry, because you
 ## Security
 
 - Bind receivers to private networks; never expose OTLP, pprof, or zPages publicly.
-- TLS or mTLS across trust boundaries.
+- TLS or mTLS across trust boundaries — **including application → Collector**, not only Collector → backend. Telemetry carries route templates, error types, tenant tiers, and (when capture is on) prompts. Configure the receiver's `tls` block and point the application at `https://`; the SDK reads CA and client material from `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, and `OTEL_EXPORTER_OTLP_CLIENT_KEY`. If the Collector requires a shared token instead, it goes in `OTEL_EXPORTER_OTLP_HEADERS` and is a credential like any other.
 - Backend credentials from a secret store, injected only into the Collector — never into application containers.
 - Redact before data crosses a trust boundary.
 - Treat OTLP headers containing Basic Auth as credentials: not in ConfigMaps, not in committed `.env` files, not in CI logs.

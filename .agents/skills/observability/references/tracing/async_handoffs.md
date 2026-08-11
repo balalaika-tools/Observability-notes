@@ -37,3 +37,10 @@ decision, not an implementation detail.
 
 Verify parent/link policy from exported spans. An in-memory `links` list does
 not prove that an ambient context did not become the parent.
+
+## Then
+
+- broker transports and carrier adapters: `queue_messaging.md`
+- database-backed handoffs: `durable_work.md`
+- asserting the exported shape in tests: `../testing.md`
+- final checks: `../verification.md` §4

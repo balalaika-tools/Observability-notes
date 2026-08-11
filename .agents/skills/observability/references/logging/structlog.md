@@ -247,6 +247,7 @@ A correlated JSON log is not automatically an OpenTelemetry **Event**. In the OT
 
 Add this only if the project exports the OTel logs signal. If logs go to stdout and a log agent, the correlation above is sufficient.
 
+<!-- complete-python-template -->
 ```python
 from time import time_ns
 from typing import Any
@@ -339,6 +340,18 @@ The practical default is independent, importance-aware retention:
 traces  keep all failed and slow traces; sample normal traffic
 logs    keep WARN/ERROR; sample or drop noisy INFO/DEBUG
 ```
+
+"Sample or drop" needs a mechanism, and there are three — pick one deliberately:
+
+| Where | How | Cost |
+| --- | --- | --- |
+| Application | `make_filtering_bound_logger` at the configured level, and a per-event sampler for a known-noisy call site | Cheapest; the record never exists, so it cannot be recovered |
+| Collector logs pipeline | a `filter` processor on severity, or a sampling processor if the distribution supports one | Central and changeable without a deploy |
+| Log backend | retention rules per severity or stream | Full-fidelity ingest, so you pay for volume you then discard |
+
+Never route a log record through the trace sampler to make this decision. It
+operates on assembled traces, and it will drop the log of an operation whose
+span was sampled away — which is exactly the record you needed.
 
 And a corollary with teeth here specifically: because a tail policy keeps traces by **span status**, a failure that was logged but left its span `UNSET` is sampled away exactly when you need it — and the orphan log above is all that survives. `log.error(...)` does not set span status; see `../conventions/errors.md`, which owns that rule.
 

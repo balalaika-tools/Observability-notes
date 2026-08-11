@@ -10,8 +10,9 @@ Two neighbours own what it writes: token counts come from `../token_usage.md`, p
 
 - [Model and provider identity](#resolving-model-identity)
 - [`LLMResult` metadata](#reading-the-llmresult)
-- [Non-streaming callback](#non-streaming-callback)
-- [Streaming callback](#streaming-callback)
+- [The callback](#the-callback)
+- [Streaming](#streaming)
+- [How to attach it](#how-to-attach-it)
 - [Verification](#verify-before-moving-on)
 
 The code fences below are **consecutive partial fragments of one callback
@@ -126,10 +127,16 @@ def extract_response_metadata(response: Any) -> dict[str, Any]:
 
 ---
 
-## Non-streaming callback
+## The callback
+
+One handler covers both streaming and non-streaming models. It differs in three
+places only — the `gen_ai.request.stream` value, the `on_llm_new_token` hook,
+and where the captured output text comes from — so two classes would be ~90%
+identical code and two places to fix every future bug.
 
 ```python
 import time
+from typing import Any
 
 from langchain_core.callbacks import AsyncCallbackHandler
 from opentelemetry import trace
@@ -155,7 +162,10 @@ from observability.genai_content import (
     serialize_llm_result,
     serialize_text_output,
 )
-from observability.genai_metrics import record_model_operation
+from observability.genai_metrics import (
+    record_model_operation,
+    record_time_to_first_chunk,
+)
 from observability.genai_usage import set_usage_attributes
 
 tracer = trace.get_tracer(__name__)
@@ -163,13 +173,17 @@ settings = get_settings()
 MAX_CAPTURED_OUTPUT_CHARS = 32_768
 
 
-class OTelLLMCallback(AsyncCallbackHandler):
+class OTelModelCallback(AsyncCallbackHandler):
     """One span per physical model request.
 
     Sits below every middleware, so each retry attempt produces its own span.
+    Pass streaming=True for a model built with streaming=True; that only sets
+    `gen_ai.request.stream` and the chunk-count attribute. Everything the
+    stream actually produces is observed, not assumed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, streaming: bool = False) -> None:
+        self._streaming = streaming
         # Keyed by run_id: LangChain runs model calls concurrently.
         self._runs: dict[Any, dict[str, Any]] = {}
 
@@ -194,7 +208,7 @@ class OTelLLMCallback(AsyncCallbackHandler):
         attributes = {
             GENAI_OPERATION_NAME: "chat",
             GENAI_PROVIDER_NAME: provider,
-            GENAI_REQUEST_STREAM: False,
+            GENAI_REQUEST_STREAM: self._streaming,
         }
         if model:
             attributes[GENAI_REQUEST_MODEL] = model
@@ -229,148 +243,6 @@ class OTelLLMCallback(AsyncCallbackHandler):
             "started_at": time.perf_counter(),
             "model": model,
             "provider": provider,
-        }
-
-    async def on_llm_end(self, response, *, run_id, **kwargs) -> None:
-        run = self._runs.pop(run_id, None)
-        if run is None:
-            return
-        span = run["span"]
-
-        metadata = extract_response_metadata(response)
-        if "response_model" in metadata:
-            span.set_attribute(GENAI_RESPONSE_MODEL, metadata["response_model"])
-        if "response_id" in metadata:
-            span.set_attribute(GENAI_RESPONSE_ID, metadata["response_id"])
-        if "finish_reasons" in metadata:
-            span.set_attribute(GENAI_FINISH_REASONS, metadata["finish_reasons"])
-
-        # Extracted once, used twice: the span attributes and the token
-        # histogram must come from the same dict or they can drift apart.
-        usage = extract_usage_metadata(response)
-        set_usage_attributes(span, usage)
-
-        if settings.capture_ai_content:
-            span.set_attribute(GENAI_OUTPUT_MESSAGES, serialize_llm_result(response))
-
-        record_model_operation(
-            duration_s=time.perf_counter() - run["started_at"],
-            operation="chat",
-            provider=run["provider"],
-            request_model=run["model"],
-            response_model=metadata.get("response_model"),
-            usage=usage,
-        )
-        span.end()
-
-    async def on_llm_error(self, error, *, run_id, **kwargs) -> None:
-        run = self._runs.pop(run_id, None)
-        if run is None:
-            return
-        span = run["span"]
-
-        # No record_exception: see ../../../conventions/errors.md. The exception
-        # detail is logged once at the boundary that handles it.
-        span.set_status(Status(StatusCode.ERROR))
-        span.set_attribute(ERROR_TYPE, type(error).__name__)
-
-        record_model_operation(
-            duration_s=time.perf_counter() - run["started_at"],
-            operation="chat",
-            provider=run["provider"],
-            request_model=run["model"],
-            error_type=type(error).__name__,
-        )
-        span.end()
-```
-
-Three details that are not obvious:
-
-- **`start_span`, not `start_as_current_span`.** The callback returns before the model call completes, so there is no scope to attach. The span's parent is captured at creation from the then-current context, which is the agent span.
-- **`pop(run_id, None)`, always.** A run that never emits an end event must not raise a `KeyError` inside instrumentation. It leaks one span object instead — recoverable — rather than breaking the request.
-- **The metric is recorded on both paths.** Recording duration only on success gives an error rate computed against a denominator that excludes errors.
-
-### Span leaks
-
-If neither `on_llm_end` nor `on_llm_error` fires — a cancelled request, a provider integration that swallows the event — the span never ends and never exports. Add a guard when the agent runs long or handles cancellation:
-
-```python
-def abandon_runs_older_than(self, max_age_s: float) -> None:
-    now = time.perf_counter()
-    for run_id, run in list(self._runs.items()):
-        if now - run["started_at"] > max_age_s:
-            run = self._runs.pop(run_id, None)
-            if run:
-                run["span"].set_status(Status(StatusCode.ERROR))
-                run["span"].set_attribute(ERROR_TYPE, "abandoned")
-                if "chunk_count" in run:
-                    run["span"].set_attribute(
-                        "app.llm.stream.chunk_count", run["chunk_count"]
-                    )
-                record_model_operation(
-                    duration_s=now - run["started_at"],
-                    operation="chat",
-                    provider=run["provider"],
-                    request_model=run["model"],
-                    error_type="abandoned",
-                )
-                run["span"].end()
-```
-
-Call it from the outer agent wrapper's `finally`. A growing `self._runs` in a long-lived process is a memory leak as well as missing telemetry.
-
----
-
-## Streaming callback
-
-Streaming adds one thing that matters: **time to first chunk**, the latency the user actually perceives. It must come from `on_llm_new_token`, which fires on the real token stream — not from agent-level stream updates, which are step-granular and arrive much later.
-
-```python
-from observability.genai_attributes import GENAI_TIME_TO_FIRST_CHUNK
-from observability.genai_metrics import record_time_to_first_chunk
-
-
-class OTelStreamingLLMCallback(AsyncCallbackHandler):
-    def __init__(self) -> None:
-        self._runs: dict[Any, dict[str, Any]] = {}
-
-    async def on_chat_model_start(
-        self, serialized, messages, *, run_id, metadata=None, **kwargs
-    ) -> None:
-        model = resolve_request_model(serialized, metadata, kwargs)
-        provider = resolve_provider(metadata)
-        span_name_model = model or "unknown_model"
-
-        counters = current_counters()
-        if counters is not None:
-            counters.inference_calls += 1
-
-        attributes = {
-            GENAI_OPERATION_NAME: "chat",
-            GENAI_PROVIDER_NAME: provider,
-            GENAI_REQUEST_STREAM: True,
-        }
-        if model:
-            attributes[GENAI_REQUEST_MODEL] = model
-
-        span = tracer.start_span(
-            f"chat {span_name_model}",
-            kind=trace.SpanKind.CLIENT,
-            attributes=attributes,
-        )
-
-        if settings.capture_ai_content:
-            captured_input, batch_size = serialize_chat_model_input(messages)
-            span.set_attribute(GENAI_INPUT_MESSAGES, captured_input)
-            span.set_attribute("app.gen_ai.input.batch_size", batch_size)
-            if batch_size > 1:
-                span.set_attribute(APP_INPUT_CAPTURE_MODE, "truncated")
-
-        self._runs[run_id] = {
-            "span": span,
-            "started_at": time.perf_counter(),
-            "model": model,
-            "provider": provider,
             "first_chunk_seen": False,
             # Operational count is unconditional. Content is separate, bounded,
             # and absent when capture is disabled.
@@ -381,6 +253,7 @@ class OTelStreamingLLMCallback(AsyncCallbackHandler):
         }
 
     async def on_llm_new_token(self, token, *, run_id, chunk=None, **kwargs) -> None:
+        """Fires only for a streaming model. Owns time-to-first-chunk."""
         run = self._runs.get(run_id)
         if run is None:
             return
@@ -422,17 +295,32 @@ class OTelStreamingLLMCallback(AsyncCallbackHandler):
         if "finish_reasons" in metadata:
             span.set_attribute(GENAI_FINISH_REASONS, metadata["finish_reasons"])
 
+        # Extracted once, used twice: the span attributes and the token
+        # histogram must come from the same dict or they can drift apart.
         usage = extract_usage_metadata(response)
         set_usage_attributes(span, usage)
-        span.set_attribute("app.llm.stream.chunk_count", run["chunk_count"])
 
-        if run["captured_chunks"] is not None:
+        if self._streaming:
             span.set_attribute(
-                GENAI_OUTPUT_MESSAGES,
-                serialize_text_output("".join(run["captured_chunks"])),
+                "app.gen_ai.stream.chunk_count", run["chunk_count"]
             )
-            if run["capture_truncated"]:
-                span.set_attribute("app.gen_ai.output.capture_mode", "truncated")
+
+        if settings.capture_ai_content:
+            # Observed, not configured: if chunks actually arrived, the joined
+            # buffer is the response. Otherwise the LLMResult is.
+            if run["chunk_count"]:
+                span.set_attribute(
+                    GENAI_OUTPUT_MESSAGES,
+                    serialize_text_output("".join(run["captured_chunks"])),
+                )
+                if run["capture_truncated"]:
+                    span.set_attribute(
+                        "app.gen_ai.output.capture_mode", "truncated"
+                    )
+            else:
+                span.set_attribute(
+                    GENAI_OUTPUT_MESSAGES, serialize_llm_result(response)
+                )
 
         record_model_operation(
             duration_s=time.perf_counter() - run["started_at"],
@@ -448,11 +336,18 @@ class OTelStreamingLLMCallback(AsyncCallbackHandler):
         run = self._runs.pop(run_id, None)
         if run is None:
             return
-        run["span"].set_attribute(
-            "app.llm.stream.chunk_count", run["chunk_count"]
-        )
-        run["span"].set_status(Status(StatusCode.ERROR))
-        run["span"].set_attribute(ERROR_TYPE, type(error).__name__)
+        span = run["span"]
+
+        if self._streaming:
+            span.set_attribute(
+                "app.gen_ai.stream.chunk_count", run["chunk_count"]
+            )
+
+        # No record_exception: see ../../../conventions/errors.md. The exception
+        # detail is logged once at the boundary that handles it.
+        span.set_status(Status(StatusCode.ERROR))
+        span.set_attribute(ERROR_TYPE, type(error).__name__)
+
         record_model_operation(
             duration_s=time.perf_counter() - run["started_at"],
             operation="chat",
@@ -460,8 +355,84 @@ class OTelStreamingLLMCallback(AsyncCallbackHandler):
             request_model=run["model"],
             error_type=type(error).__name__,
         )
-        run["span"].end()
+        span.end()
 ```
+
+Four details that are not obvious:
+
+- **`start_span`, not `start_as_current_span`.** The callback returns before the model call completes, so there is no scope to attach. The span's parent is captured at creation from the then-current context, which is the agent span.
+- **`pop(run_id, None)`, always.** A run that never emits an end event must not raise a `KeyError` inside instrumentation. It leaks one span object instead — recoverable — rather than breaking the request.
+- **The metric is recorded on both paths.** Recording duration only on success gives an error rate computed against a denominator that excludes errors.
+- **`chunk_count` decides where captured output comes from, not the `streaming` flag.** If the flag and the model configuration ever disagree, the content still comes from whichever one actually produced text.
+
+### Non-chat models
+
+`on_chat_model_start` only fires for chat models. A service using a
+completion-style LLM (`OpenAI(...)`, `HuggingFacePipeline`, anything LangChain
+routes as an LLM rather than a ChatModel) emits `on_llm_start` instead and
+produces **zero spans** with the handler above. The shape is the same; add:
+
+```python
+    async def on_llm_start(
+        self, serialized, prompts, *, run_id, metadata=None, **kwargs
+    ) -> None:
+        # `prompts` is list[str] rather than a message list, and the operation
+        # is text_completion (see ../attributes.md). Everything else — model
+        # resolution, counters, span creation, run bookkeeping — is identical;
+        # factor the body of on_chat_model_start into a helper both call.
+        ...
+```
+
+Set `gen_ai.operation.name="text_completion"` and, when capturing content,
+serialize `prompts` rather than passing them to `serialize_chat_model_input`,
+whose contract is a message list.
+
+LangChain also exposes `on_retriever_start` / `on_retriever_end`. This skill
+does **not** use them: retrieval spans are written explicitly in
+`../retrieval.md` because they must be identical on the direct-SDK path, where
+no callback exists. Do not instrument retrieval twice.
+
+### Span leaks
+
+If neither `on_llm_end` nor `on_llm_error` fires — a cancelled request, a provider integration that swallows the event — the span never ends and never exports. Add a guard when the agent runs long or handles cancellation:
+
+```python
+def abandon_runs_older_than(self, max_age_s: float) -> None:
+    now = time.perf_counter()
+    for run_id, run in list(self._runs.items()):
+        if now - run["started_at"] > max_age_s:
+            run = self._runs.pop(run_id, None)
+            if run:
+                run["span"].set_status(Status(StatusCode.ERROR))
+                # Documented sentinel, not a class name: no exception occurred.
+                # The closed set is in ../../../conventions/errors.md.
+                run["span"].set_attribute(ERROR_TYPE, "_ABANDONED")
+                if self._streaming:
+                    run["span"].set_attribute(
+                        "app.gen_ai.stream.chunk_count", run["chunk_count"]
+                    )
+                record_model_operation(
+                    duration_s=now - run["started_at"],
+                    operation="chat",
+                    provider=run["provider"],
+                    request_model=run["model"],
+                    error_type="_ABANDONED",
+                )
+                run["span"].end()
+```
+
+Call it from the outer agent wrapper's `finally`. A growing `self._runs` in a long-lived process is a memory leak as well as missing telemetry.
+
+---
+
+## Streaming
+
+Streaming adds one thing that matters: **time to first chunk**, the latency the
+user actually perceives. It comes from `on_llm_new_token`, which fires on the
+real token stream — not from agent-level stream updates, which are step-granular
+and arrive much later. The `on_llm_new_token` hook above owns it; the additional
+imports it needs are `GENAI_TIME_TO_FIRST_CHUNK` and
+`record_time_to_first_chunk`, already listed in the fence.
 
 ### Streaming token usage is opt-in at the model
 
@@ -471,7 +442,7 @@ streaming_model = init_chat_model(
     streaming=True,
     # Without this, on_llm_end receives no usage_metadata for streamed calls.
     stream_usage=True,
-).with_config(callbacks=[OTelStreamingLLMCallback()])
+).with_config(callbacks=[OTelModelCallback(streaming=True)])
 ```
 
 Miss it and the spans look correct with zero usage everywhere. Why, and the equivalent for other providers: `../token_usage.md`.
@@ -486,15 +457,34 @@ safe default is active.
 
 ---
 
-## Which callback to use
+## How to attach it
 
-| Model config | Callback |
+| Situation | Attach |
 | --- | --- |
-| `streaming=False` | `OTelLLMCallback` |
-| `streaming=True` | `OTelStreamingLLMCallback` |
-| Both, in one service | Attach the matching one to each model |
+| `streaming=False` model | `OTelModelCallback()` |
+| `streaming=True` model | `OTelModelCallback(streaming=True)` |
+| Both, in one service | One instance per model, with the matching flag. A single instance can be shared by models with the same flag; it keys all state by `run_id`. |
+| Completion-style (non-chat) LLM | Add `on_llm_start`, above |
 
-The two can be merged into one handler that branches on the streaming flag; keep them separate while building, since the streaming path has more that can go wrong.
+### Sync versus async invocation
+
+The handler subclasses `AsyncCallbackHandler`. Whether that also covers a
+**synchronous** `agent.invoke()` / `agent.stream()` depends on the pinned
+`langchain-core`: it bridges sync callers to async handlers in some versions and
+silently skips them in others, and a skipped handler produces **zero model
+spans** — indistinguishable from a broken exporter.
+
+Resolve it once, for the version in the lockfile, and write the answer here:
+
+1. call the agent exactly the way production calls it — `invoke` if production
+   uses `invoke`, `ainvoke` if it uses `ainvoke`;
+2. confirm a `chat <model>` span is exported;
+3. if none appears, additionally attach a `BaseCallbackHandler` subclass with
+   the same body using synchronous methods, and record that both are required.
+
+Never verify with `ainvoke` and ship `invoke`. `tools_and_middleware.md` makes
+the same distinction explicit for middleware (`@wrap_tool_call` versus
+`awrap_tool_call`); the callback layer has the same hazard and no error message.
 
 ---
 
@@ -507,7 +497,8 @@ Run one agent invocation and check the exported spans:
 - `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens` are non-zero;
 - `gen_ai.usage.cache_read.input_tokens` is present, even if `0`;
 - with streaming, `gen_ai.response.time_to_first_chunk` is set and is smaller than the span duration;
-- `app.llm.stream.chunk_count` is correct with capture both on and off, including an error after the first chunk;
+- `app.gen_ai.stream.chunk_count` is correct with capture both on and off, including an error after the first chunk;
+- the agent is invoked **the way production invokes it** (sync or async) and model spans still appear;
 - `gen_ai.response.model` appears on the span and the model-duration/token metrics when the provider returns it;
 - forcing a provider error produces a span with `ERROR` status and `error.type`, and no exception span event;
 - with `CAPTURE_AI_CONTENT` unset, no `gen_ai.input.messages` attribute exists anywhere.

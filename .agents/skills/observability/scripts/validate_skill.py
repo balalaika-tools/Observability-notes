@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,55 @@ except ImportError as exc:  # pragma: no cover - actionable environment failure
 
 
 COLLECTOR_IMAGE = "otel/opentelemetry-collector-contrib:0.158.0"
+
+# Every `gen_ai.*` string literal this package is allowed to use, pinned to the
+# convention revision in references/compatibility.md. Rule 3 of SKILL.md says
+# never invent a key inside a standard namespace; without this allowlist that
+# rule is only an assertion. Adding a row is a deliberate act: check the key
+# against the pinned revision first, and if it is not there, it belongs under
+# `app.gen_ai.*` instead.
+STANDARD_GENAI_ATTRIBUTES = {
+    "gen_ai.agent.id",
+    "gen_ai.agent.name",
+    "gen_ai.conversation.compacted",
+    "gen_ai.conversation.id",
+    "gen_ai.data_source.id",
+    "gen_ai.input.messages",
+    "gen_ai.operation.name",
+    "gen_ai.output.messages",
+    "gen_ai.output.type",
+    "gen_ai.provider.name",
+    "gen_ai.request.max_tokens",
+    "gen_ai.request.model",
+    "gen_ai.request.reasoning.level",
+    "gen_ai.request.seed",
+    "gen_ai.request.stream",
+    "gen_ai.request.temperature",
+    "gen_ai.request.top_k",
+    "gen_ai.request.top_p",
+    "gen_ai.response.finish_reasons",
+    "gen_ai.response.id",
+    "gen_ai.response.model",
+    "gen_ai.response.time_to_first_chunk",
+    "gen_ai.system_instructions",
+    "gen_ai.token.type",
+    "gen_ai.tool.call.arguments",
+    "gen_ai.tool.call.id",
+    "gen_ai.tool.call.result",
+    "gen_ai.tool.definitions",
+    "gen_ai.tool.name",
+    "gen_ai.tool.type",
+    "gen_ai.usage.cache_creation.input_tokens",
+    "gen_ai.usage.cache_read.input_tokens",
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.reasoning.output_tokens",
+    "gen_ai.workflow.name",
+}
+# Standard event names, which share the namespace but are not attributes.
+STANDARD_GENAI_EVENTS = {
+    "gen_ai.client.operation.exception",
+}
 STANDARD_GENAI_METRICS = {
     "gen_ai.client.operation.duration",
     "gen_ai.client.operation.time_to_first_chunk",
@@ -46,7 +96,14 @@ def require(condition: bool, message: str) -> None:
         raise ValidationError(message)
 
 
-def find_quick_validator(explicit: Path | None) -> Path:
+def find_quick_validator(explicit: Path | None) -> Path | None:
+    """Locate the Codex skill-creator validator, or None if it is not installed.
+
+    It is an optional external toolchain. Returning None keeps the ~800 lines of
+    checks below runnable on a machine that has never seen Codex; requiring it
+    made the mandatory upgrade step in compatibility.md impossible to satisfy,
+    so it was skipped, so none of these checks ran.
+    """
     candidates: list[Path] = []
     if explicit is not None:
         candidates.append(explicit)
@@ -63,12 +120,19 @@ def find_quick_validator(explicit: Path | None) -> Path:
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    raise ValidationError(
-        "official quick_validate.py not found; pass --quick-validator PATH"
-    )
+    return None
 
 
-def run_official_validator(skill_root: Path, quick_validator: Path) -> None:
+def run_official_validator(
+    skill_root: Path, quick_validator: Path | None, *, required: bool
+) -> list[str]:
+    if quick_validator is None:
+        message = (
+            "official quick_validate.py not found; skipping it. "
+            "Install Codex's skill-creator or pass --quick-validator PATH."
+        )
+        require(not required, message.replace("skipping it", "required"))
+        return [message]
     result = subprocess.run(
         [sys.executable, str(quick_validator), str(skill_root)],
         check=False,
@@ -79,6 +143,7 @@ def run_official_validator(skill_root: Path, quick_validator: Path) -> None:
         result.returncode == 0,
         "official skill validator failed:\n" + result.stdout + result.stderr,
     )
+    return []
 
 
 def markdown_targets(text: str) -> set[str]:
@@ -255,6 +320,28 @@ def validate_serializer_fixtures(skill_root: Path) -> None:
     )
 
 
+def yaml_blocks(document: Path) -> list[str]:
+    return re.findall(
+        r"```yaml\n(.*?)```", document.read_text(encoding="utf-8"), re.DOTALL
+    )
+
+
+def collector_yaml_blocks(skill_root: Path) -> list[tuple[str, str]]:
+    """Every YAML block under collector/, labelled by file and position.
+
+    Extracting only the block after `## Configuration` in production.md left the
+    filter snippet, the Langfuse pipelines, the temporary policies, both
+    dev/staging configs, and component.md entirely unchecked — which is how an
+    invalid processor key survived in a copy-pasteable fence.
+    """
+    blocks: list[tuple[str, str]] = []
+    for document in sorted((skill_root / "references/collector").glob("*.md")):
+        for index, block in enumerate(yaml_blocks(document), start=1):
+            blocks.append((f"{document.name}#yaml-{index}", block))
+    require(blocks, "no Collector YAML blocks found")
+    return blocks
+
+
 def production_yaml(skill_root: Path) -> str:
     path = skill_root / "references/collector/production.md"
     text = path.read_text(encoding="utf-8")
@@ -264,6 +351,13 @@ def production_yaml(skill_root: Path) -> str:
 
 
 def validate_collector_yaml(skill_root: Path) -> str:
+    # Every block must at least be parseable YAML, wherever it lives.
+    for label, block in collector_yaml_blocks(skill_root):
+        try:
+            yaml.safe_load(block)
+        except yaml.YAMLError as exc:
+            raise ValidationError(f"invalid YAML in {label}:\n{exc}") from exc
+
     config_text = production_yaml(skill_root)
     parsed = yaml.safe_load(config_text)
     require(isinstance(parsed, dict), "production Collector config is not a mapping")
@@ -276,23 +370,211 @@ def validate_collector_yaml(skill_root: Path) -> str:
         "prometheusremotewrite" not in exporters,
         "deprecated prometheusremotewrite alias remains",
     )
+    processors = parsed.get("processors", {})
     email_actions = [
         action
-        for action in parsed.get("processors", {})
-        .get("attributes/drop_secrets", {})
-        .get("actions", [])
+        for action in processors.get("attributes/drop_secrets", {}).get("actions", [])
         if action.get("key") == "user.email"
     ]
     require(
         email_actions == [{"key": "user.email", "action": "delete"}],
         "user.email must be deleted by default",
     )
+    validate_exception_detail_split(parsed)
+    validate_environment_ownership(parsed)
     return config_text
 
 
-def validate_collector_image(config_text: str) -> None:
+def validate_exception_detail_split(parsed: dict) -> None:
+    """Exception detail is deleted on traces only.
+
+    errors.md moves exception detail out of spans and into correlated log
+    records; deleting it on the logs pipeline removes the only copy.
+    """
+    processors = parsed.get("processors", {})
+    for name, definition in processors.items():
+        keys = {action.get("key") for action in definition.get("actions", [])}
+        if not keys & {"exception.message", "exception.stacktrace"}:
+            continue
+        pipelines = parsed.get("service", {}).get("pipelines", {})
+        for pipeline_name, pipeline in pipelines.items():
+            require(
+                not pipeline_name.startswith("logs")
+                or name not in (pipeline.get("processors") or []),
+                f"{name} deletes exception detail on the {pipeline_name} pipeline; "
+                "the log record is where the stack trace lives",
+            )
+
+
+def validate_environment_ownership(parsed: dict) -> None:
+    """A Collector must not overwrite an environment the application set."""
+    for name, definition in parsed.get("processors", {}).items():
+        if not name.startswith("resource"):
+            continue
+        for attribute in definition.get("attributes", []):
+            if attribute.get("key") != "deployment.environment.name":
+                continue
+            require(
+                attribute.get("action") == "insert",
+                f"{name} uses action={attribute.get('action')!r} for "
+                "deployment.environment.name; insert never overwrites the "
+                "application's own value",
+            )
+
+
+MEASURED_TAIL_SAMPLING_KEYS = (
+    "decision_wait",
+    "num_traces",
+    "expected_new_traces_per_sec",
+    "sampled_cache_size",
+    "non_sampled_cache_size",
+    "threshold_ms",
+    "min_value",
+    "sampling_percentage",
+)
+
+
+def validate_measured_values_are_marked(skill_root: Path) -> None:
+    """Every unmeasurable literal in production.md carries a `# MEASURE:` note.
+
+    Four prose warnings elsewhere do not beat one syntactically valid YAML block
+    an agent can paste. The values stay real numbers so the config can be
+    image-validated; the marker is what stops them reading as defaults.
+    """
+    text = (skill_root / "references/collector/production.md").read_text(
+        encoding="utf-8"
+    )
+    unmarked: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        key = stripped.split(":", 1)[0].strip()
+        if key not in MEASURED_TAIL_SAMPLING_KEYS:
+            continue
+        if ":" not in stripped or not stripped.split(":", 1)[1].strip():
+            continue
+        if "# MEASURE:" not in line:
+            unmarked.append(stripped)
+    require(
+        not unmarked,
+        "sampling values missing a `# MEASURE:` marker (they read as defaults):\n"
+        + "\n".join(unmarked),
+    )
+
+
+COLLECTOR_CONFIG_KEYS = {
+    "receivers",
+    "processors",
+    "exporters",
+    "extensions",
+    "connectors",
+    "service",
+}
+
+
+def fragment_as_config(parsed: object) -> dict | None:
+    """Wrap a partial snippet in the smallest config that exercises its schema.
+
+    A fragment that is never handed to the binary is a fragment whose keys are
+    never checked — which is how an invalid `filter` processor key survived in a
+    copy-pasteable fence. Any pipeline block in the fragment is discarded and
+    replaced, because it names components defined in a different fence.
+    """
+    # A bare list is a tail-sampling policy list; give it a host processor.
+    if isinstance(parsed, list):
+        return {
+            "receivers": {"otlp": {"protocols": {"http": {}}}},
+            "processors": {
+                "tail_sampling": {
+                    "decision_wait": "10s",
+                    "num_traces": 100,
+                    "policies": parsed,
+                }
+            },
+            "exporters": {"debug": {}},
+            "service": {
+                "pipelines": {
+                    "traces": {
+                        "receivers": ["otlp"],
+                        "processors": ["tail_sampling"],
+                        "exporters": ["debug"],
+                    }
+                }
+            },
+        }
+
+    if not isinstance(parsed, dict):
+        return None
+    # Not a Collector config at all — a Compose file, a Dockerfile snippet.
+    if not set(parsed) <= COLLECTOR_CONFIG_KEYS:
+        return None
+
+    processors = dict(parsed.get("processors") or {})
+    exporters = dict(parsed.get("exporters") or {})
+    extensions = dict(parsed.get("extensions") or {})
+    if not processors and not exporters and not extensions:
+        return None
+
+    exporters.setdefault("debug", {})
+    config: dict = {
+        "receivers": {"otlp": {"protocols": {"http": {}}}},
+        "exporters": exporters,
+        "service": {
+            "pipelines": {
+                "traces": {
+                    "receivers": ["otlp"],
+                    "processors": list(processors),
+                    "exporters": list(exporters),
+                }
+            }
+        },
+    }
+    if processors:
+        config["processors"] = processors
+    if extensions:
+        config["extensions"] = extensions
+        config["service"]["extensions"] = list(extensions)
+    return config
+
+
+def validate_collector_image(skill_root: Path) -> None:
+    environment = {
+        "APM_ENDPOINT": "https://example.invalid/otel",
+        "APM_AUTHORIZATION": "test",
+        "PROMETHEUS_WRITE_ENDPOINT": "https://example.invalid/write",
+        "PROMETHEUS_AUTHORIZATION": "test",
+        "LOGS_ENDPOINT": "https://example.invalid/logs",
+        "LOGS_AUTHORIZATION": "test",
+        "TRACES_ENDPOINT": "https://example.invalid/traces",
+        "TRACES_AUTHORIZATION": "test",
+        "METRICS_ENDPOINT": "https://example.invalid/metrics",
+        "METRICS_AUTHORIZATION": "test",
+        "LANGFUSE_OTEL_ENDPOINT": "https://example.invalid/langfuse",
+        "LANGFUSE_AUTH_STRING": "dGVzdDp0ZXN0",
+    }
+    for label, block in collector_yaml_blocks(skill_root):
+        parsed = yaml.safe_load(block)
+        if isinstance(parsed, dict) and {"receivers", "service"} <= set(parsed):
+            validate_one_collector_config(label, block, environment)
+            continue
+        wrapped = fragment_as_config(parsed)
+        if wrapped is None:
+            # Nothing the binary can check: a Compose file, or a pipelines-only
+            # snippet naming components from another fence. Reported, never
+            # silent, so partial coverage stays visible.
+            print(f"NOTE: {label} is not an image-validatable config; syntax only")
+            continue
+        validate_one_collector_config(
+            f"{label} (wrapped fragment)",
+            yaml.safe_dump(wrapped, sort_keys=False),
+            environment,
+        )
+
+
+def validate_one_collector_config(
+    label: str, config_text: str, environment: dict[str, str]
+) -> None:
     with tempfile.TemporaryDirectory(prefix="observability-skill-") as temp_dir:
-        config_path = Path(temp_dir) / "config.prod.yaml"
+        config_path = Path(temp_dir) / "config.yaml"
         config_path.write_text(config_text, encoding="utf-8")
         command = [
             "docker",
@@ -301,14 +583,7 @@ def validate_collector_image(config_text: str) -> None:
             "--volume",
             f"{config_path}:/etc/otelcol/config.yaml:ro",
         ]
-        for key, value in {
-            "APM_ENDPOINT": "https://example.invalid/otel",
-            "APM_AUTHORIZATION": "test",
-            "PROMETHEUS_WRITE_ENDPOINT": "https://example.invalid/write",
-            "PROMETHEUS_AUTHORIZATION": "test",
-            "LOGS_ENDPOINT": "https://example.invalid/logs",
-            "LOGS_AUTHORIZATION": "test",
-        }.items():
+        for key, value in environment.items():
             command.extend(["--env", f"{key}={value}"])
         command.extend(
             [COLLECTOR_IMAGE, "validate", "--config=/etc/otelcol/config.yaml"]
@@ -318,12 +593,51 @@ def validate_collector_image(config_text: str) -> None:
         )
         require(
             result.returncode == 0,
-            "Collector image validation failed:\n" + result.stdout + result.stderr,
+            f"Collector image validation failed for {label}:\n"
+            + result.stdout
+            + result.stderr,
         )
 
 
-def validate_compatibility(skill_root: Path) -> None:
+def validate_genai_attribute_inventory(skill_root: Path) -> None:
+    """No invented key inside the standard `gen_ai.*` namespace.
+
+    Attributes are the larger and higher-risk surface; checking only metric
+    names left rule 3 as an assertion. Double-quoted literals are code; prose
+    uses backticks, so counter-examples in naming.md do not trip this.
+    """
+    known = STANDARD_GENAI_ATTRIBUTES | STANDARD_GENAI_EVENTS | STANDARD_GENAI_METRICS
+    offenders: dict[str, set[str]] = {}
+    for document in skill_root.rglob("*.md"):
+        text = document.read_text(encoding="utf-8")
+        for literal in re.findall(r'"(gen_ai\.[a-z0-9_.]+)"', text):
+            if literal not in known:
+                offenders.setdefault(
+                    str(document.relative_to(skill_root)), set()
+                ).add(literal)
+    require(
+        not offenders,
+        "gen_ai.* keys not in the pinned inventory (invent under app.gen_ai.* "
+        "instead, or add the row deliberately after checking the pinned "
+        "convention revision):\n"
+        + "\n".join(
+            f"  {path}: {sorted(keys)}" for path, keys in sorted(offenders.items())
+        ),
+    )
+
+
+def validate_compatibility(skill_root: Path) -> list[str]:
+    notes: list[str] = []
     text = (skill_root / "references/compatibility.md").read_text(encoding="utf-8")
+    review_by = re.search(r"Review by: \*\*(\d{4}-\d{2}-\d{2})\*\*", text)
+    require(review_by is not None, "compatibility contract has no `Review by:` date")
+    if date.today().isoformat() > review_by.group(1):
+        # A warning, not a failure: a stale contract is a prompt to re-check
+        # the pinned versions, not a broken package.
+        notes.append(
+            f"compatibility contract is past its review-by date "
+            f"({review_by.group(1)}); every version-sensitive example is unverified"
+        )
     for required in (
         "2026-08-10",
         "1.44",
@@ -337,6 +651,7 @@ def validate_compatibility(skill_root: Path) -> None:
         'x-langfuse-ingestion-version: "4"',
     ):
         require(required in text, f"compatibility contract missing {required}")
+    return notes
 
 
 def validate_resource_identity_contract(skill_root: Path) -> None:
@@ -348,12 +663,31 @@ def validate_resource_identity_contract(skill_root: Path) -> None:
         "service.instance.id",
         "deployment.environment.name",
         "service.version",
-        "product-data-management-automation",
-        "pdma-api",
-        "pdma-worker",
         "full Git commit SHA",
     ):
         require(required in identity, f"resource identity contract missing {required}")
+    # The shape of a repository mapping, not one repository's literal values.
+    # Concrete namespaces belong in references/local/, routed on a match: a
+    # namespace sitting in an always-loaded file gets adopted by unrelated
+    # services, and pinning the literals here made the skill ungeneralisable.
+    require(
+        "service.namespace = <" in identity and "service.name      = <" in identity,
+        "resource identity core must show a placeholder mapping, not a concrete one",
+    )
+    for local_only in ("product-data-management-automation", "pdma-api", "pdma-worker"):
+        require(
+            local_only not in identity,
+            f"repository-specific value {local_only} leaked into the shared "
+            "identity reference; move it to references/local/",
+        )
+    local_dir = skill_root / "references/local"
+    require(local_dir.is_dir(), "references/local/ is missing")
+    for local_file in local_dir.glob("*.md"):
+        text = local_file.read_text(encoding="utf-8")
+        require(
+            "Do not open this file unless" in text,
+            f"{local_file.name} lacks a conditional-load guard",
+        )
     require(
         "deployment.environment.name` is **not** part" in identity,
         "environment is not excluded from service-instance uniqueness",
@@ -410,7 +744,7 @@ def validate_resource_identity_contract(skill_root: Path) -> None:
         'alias="SERVICE_NAMESPACE"',
         'alias="SERVICE_INSTANCE_ID"',
         "default_factory=lambda: str(uuid4())",
-        "full Git SHA for PDMA",
+        "full Git commit SHA",
     ):
         require(required in package_layout, f"package settings missing {required}")
     require(
@@ -441,6 +775,7 @@ def validate_resource_identity_contract(skill_root: Path) -> None:
         "Start two replicas",
         "full Git commit SHA supplied by CI/build",
         "A gateway Collector does not stamp application telemetry",
+        "resourcedetection` uses `override: false`",
     ):
         require(required in verification, f"identity verification missing {required}")
 
@@ -788,25 +1123,72 @@ def validate_routing_contract(skill_root: Path) -> None:
         )
 
 
-def validate_context_footprint(skill_root: Path) -> None:
-    maximum_lines = {
-        "SKILL.md": 240,
-        "references/setup/resource_identity.md": 220,
-        "references/setup/sdk_bootstrap.md": 380,
-        "references/setup/resource_ecs.md": 220,
-        "references/tracing/async_handoffs.md": 80,
-        "references/tracing/queue_messaging.md": 260,
-        "references/tracing/durable_work.md": 220,
-        "references/tracing/scheduled_jobs.md": 80,
-        "references/tracing/worker_runtime.md": 100,
-        "references/tracing/lambda_functions.md": 300,
-    }
-    for relative, maximum in maximum_lines.items():
-        line_count = len((skill_root / relative).read_text(encoding="utf-8").splitlines())
+# Per-file caps. Anything not listed falls back to DEFAULT_LINE_CAP, so a new
+# reference cannot grow unbounded just by not being in the table.
+DEFAULT_LINE_CAP = 400
+LINE_CAPS = {
+    "SKILL.md": 290,
+    "references/discovery.md": 320,
+    "references/troubleshooting.md": 160,
+    "references/testing.md": 260,
+    "references/verification.md": 320,
+    "references/compatibility.md": 80,
+    "references/conventions/naming.md": 220,
+    "references/conventions/errors.md": 240,
+    "references/setup/resource_identity.md": 220,
+    "references/setup/sdk_bootstrap.md": 380,
+    "references/setup/resource_ecs.md": 230,
+    "references/setup/package_layout.md": 240,
+    "references/setup/auto_instrumentation.md": 200,
+    "references/tracing/async_handoffs.md": 90,
+    "references/tracing/queue_messaging.md": 300,
+    "references/tracing/durable_work.md": 230,
+    "references/tracing/scheduled_jobs.md": 80,
+    "references/tracing/worker_runtime.md": 110,
+    "references/tracing/lambda_functions.md": 300,
+    "references/tracing/production_policy.md": 240,
+    "references/tracing/genai/retrieval.md": 140,
+    "references/tracing/genai/langchain/model_callback.md": 520,
+    "references/collector/production.md": 580,
+    "references/metrics/genai.md": 400,
+    "references/logging/structlog.md": 400,
+}
+# The set loaded on every invocation, whatever the task. This is the number
+# that actually governs per-invocation cost, so it is capped as a whole.
+UNCONDITIONAL_SET = (
+    "SKILL.md",
+    "references/conventions/naming.md",
+    "references/conventions/errors.md",
+    "references/verification.md",
+)
+UNCONDITIONAL_LINE_CAP = 1_100
+
+
+def validate_context_footprint(skill_root: Path) -> list[str]:
+    notes: list[str] = []
+    for document in sorted(skill_root.rglob("*.md")):
+        relative = str(document.relative_to(skill_root))
+        maximum = LINE_CAPS.get(relative, DEFAULT_LINE_CAP)
+        line_count = len(document.read_text(encoding="utf-8").splitlines())
         require(
             line_count <= maximum,
             f"context budget exceeded for {relative}: {line_count} > {maximum}",
         )
+
+    total = sum(
+        len((skill_root / relative).read_text(encoding="utf-8").splitlines())
+        for relative in UNCONDITIONAL_SET
+    )
+    require(
+        total <= UNCONDITIONAL_LINE_CAP,
+        f"unconditional load is {total} lines > {UNCONDITIONAL_LINE_CAP}; "
+        "move material into a conditionally routed file",
+    )
+    notes.append(
+        f"unconditional load: {total}/{UNCONDITIONAL_LINE_CAP} lines "
+        f"({UNCONDITIONAL_LINE_CAP - total} spare)"
+    )
+    return notes
 
 
 def validate_review_regressions(skill_root: Path) -> None:
@@ -828,9 +1210,42 @@ def validate_review_regressions(skill_root: Path) -> None:
         / "references/tracing/genai/langchain/streaming_and_agent_span.md"
     ).read_text(encoding="utf-8")
     require('version="v2"' in streaming, "LangChain stream schema is not explicit")
+    # Every wrapper must report fan-out. The non-streaming one scopes counters
+    # with the context manager; the streaming ones cannot, because that scope
+    # would span a `yield` — they bind per resumption instead. Both shapes are
+    # accepted; omitting the counters entirely is not.
     require(
-        streaming.count("invocation_counters() as counters") >= 3,
+        streaming.count("invocation_counters() as counters")
+        + streaming.count("agent_step(span, counters)")
+        >= 3,
         "one or more agent wrappers omit invocation counters",
+    )
+    require(
+        streaming.count("record_agent_result(") >= 4,
+        "an agent wrapper does not record the fan-out metrics",
+    )
+    # The generator context-leak fix, in both files that stream. A span held
+    # current across a `yield` leaks into the consumer; both files must use
+    # start_span + explicit end() after their streaming heading.
+    provider = (
+        skill_root / "references/tracing/genai/provider_sdk.md"
+    ).read_text(encoding="utf-8")
+    require(
+        "Why the span is never current across a `yield`" in provider,
+        "provider_sdk.md no longer explains the generator context rule",
+    )
+    for label, text, heading in (
+        ("provider_sdk.md", provider, "## Streaming"),
+        ("streaming_and_agent_span.md", streaming, "### Token streaming"),
+    ):
+        # Prose may name the API; a code fence in a yielding wrapper may not.
+        require(
+            "with tracer.start_as_current_span(" not in text.split(heading, 1)[-1],
+            f"{label} holds start_as_current_span across a yield again",
+        )
+    require(
+        "agent_step(span, counters)" in streaming,
+        "streaming agent wrappers do not bracket each resumption",
     )
 
     for relative in (
@@ -870,9 +1285,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--quick-validator", type=Path)
     parser.add_argument(
+        "--official-validator",
+        action="store_true",
+        help=(
+            "fail if Codex's skill-creator quick_validate.py is not installed; "
+            "by default its absence is a warning so every other check still runs"
+        ),
+    )
+    parser.add_argument(
         "--collector-image",
         action="store_true",
-        help=f"also validate YAML with {COLLECTOR_IMAGE}",
+        help=f"also validate every Collector YAML block with {COLLECTOR_IMAGE}",
     )
     return parser.parse_args()
 
@@ -880,29 +1303,38 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     skill_root = args.skill_root.resolve()
+    notes: list[str] = []
     try:
-        run_official_validator(skill_root, find_quick_validator(args.quick_validator))
+        notes += run_official_validator(
+            skill_root,
+            find_quick_validator(args.quick_validator),
+            required=args.official_validator,
+        )
         validate_references(skill_root)
         validate_standard_genai_contract(skill_root)
+        validate_genai_attribute_inventory(skill_root)
         validate_python(skill_root)
         validate_trace_budget_calculator(skill_root)
         validate_serializer_fixtures(skill_root)
-        config_text = validate_collector_yaml(skill_root)
-        validate_compatibility(skill_root)
+        validate_collector_yaml(skill_root)
+        validate_measured_values_are_marked(skill_root)
+        notes += validate_compatibility(skill_root)
         validate_resource_identity_contract(skill_root)
         validate_ecs_resolver_fixtures(skill_root)
         validate_async_work_contract(skill_root)
         validate_lambda_contract(skill_root)
         validate_production_policy_contract(skill_root)
         validate_routing_contract(skill_root)
-        validate_context_footprint(skill_root)
+        notes += validate_context_footprint(skill_root)
         validate_review_regressions(skill_root)
         if args.collector_image:
-            validate_collector_image(config_text)
+            validate_collector_image(skill_root)
     except ValidationError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
     print("PASS: observability skill validation")
+    for note in notes:
+        print(f"NOTE: {note}")
     if not args.collector_image:
         print(f"NOTE: rerun with --collector-image to validate {COLLECTOR_IMAGE}")
     return 0

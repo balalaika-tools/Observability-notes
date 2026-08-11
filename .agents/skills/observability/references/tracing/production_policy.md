@@ -1,5 +1,10 @@
 # Production Tracing Policy
 
+**Do not open this file unless the task involves production retention** —
+sampling, filtering, telemetry cost, release burn-in, or an observability
+rollout. It is 180 lines of retention policy, and absorbing it during ordinary
+instrumentation work leads to proposing tail sampling for a dev service.
+
 Design the retention and operational policy before writing Collector YAML. The
 application records meaningful boundaries and exports vendor-neutral OTLP; the
 Collector applies central filtering, redaction, sampling, routing, and bounded
@@ -179,3 +184,32 @@ percentage. Keep a tested rollback path.
 Review the policy whenever traffic, routes, workflows, models, instrumentation,
 or backend pricing changes. Remove release burn-in and force-sampling rules when
 their expiry is reached.
+
+---
+
+## Operational levers that are not sampling
+
+Three things belong to the same policy conversation and are often missed:
+
+- **A kill switch.** `OTEL_SDK_DISABLED=true` turns off the SDK in one process
+  without a code change. Decide during rollout whether operators may set it,
+  who is allowed to, and how it is surfaced — an undocumented kill switch is
+  found during an incident and never turned back on.
+- **Log retention is a separate lever from trace sampling.** Traces are sampled
+  by value at the Collector; logs are retained by severity. The default is keep
+  `WARN`/`ERROR`, sample or drop high-volume `INFO`/`DEBUG` — and the mechanism
+  is the log pipeline or the backend's own retention rules, not tail sampling
+  (`../logging/structlog.md`).
+- **Cost attribution needs an owner.** `app.gen_ai.estimated_cost_usd` is only
+  as good as its price table. Decide where prices live, who updates them when a
+  provider changes pricing, and how a historical figure is interpreted after a
+  price change. An unversioned price table produces a cost dashboard that
+  silently rewrites the past.
+
+---
+
+## Then
+
+- Collector implementation of these decisions: `../collector/production.md`
+- capacity arithmetic: `../../scripts/estimate_trace_budget.py`
+- acceptance: `../verification.md` §11

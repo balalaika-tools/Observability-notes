@@ -230,11 +230,13 @@ The `View` definitions that apply the convention's explicit boundaries to these 
 
 `inference_calls` and `tool_calls` need a counter that lives for exactly one invocation. Use a context-scoped accumulator that the callback and tool middleware increment and the agent wrapper reads.
 
+<!-- complete-python-template -->
 ```python
 # observability/agent_counters.py
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -251,13 +253,25 @@ _counters: ContextVar[InvocationCounters | None] = ContextVar(
 
 
 @contextmanager
-def invocation_counters():
-    counters = InvocationCounters()
+def bind_counters(counters: InvocationCounters) -> Iterator[InvocationCounters]:
+    """Make an existing counters object current for this scope.
+
+    Streaming wrappers need this: their counters must outlive one resumption
+    of a generator, but must not stay current across a `yield`. See
+    ../tracing/genai/langchain/streaming_and_agent_span.md.
+    """
     token = _counters.set(counters)
     try:
         yield counters
     finally:
         _counters.reset(token)
+
+
+@contextmanager
+def invocation_counters() -> Iterator[InvocationCounters]:
+    """One fresh counter scope per agent invocation."""
+    with bind_counters(InvocationCounters()) as counters:
+        yield counters
 
 
 def current_counters() -> InvocationCounters | None:
@@ -308,12 +322,12 @@ Only where a product fact has no standard equivalent:
 
 | Metric | Instrument | For |
 | --- | --- | --- |
-| `app.agent.step_limit.count` | Counter | Runs stopped by max-step protection |
-| `app.agent.fallback.count` | Counter | Model or workflow fallback activations |
-| `app.agent.cancelled.count` | Counter | User or system cancellations |
+| `app.agent.step_limit.stops` | Counter | Runs stopped by max-step protection |
+| `app.agent.fallback.activations` | Counter | Model or workflow fallback activations |
+| `app.agent.cancellations` | Counter | User or system cancellations |
 | `app.retrieval.result_count` | Histogram | Empty-retrieval detection |
-| `app.guardrail.decision.count` | Counter, by bounded decision + policy | Safety and policy trends |
-| `app.llm.estimated_cost_usd` | Histogram | Spend by workflow, model, tenant tier |
+| `app.guardrail.decisions` | Counter, by bounded decision + policy | Safety and policy trends |
+| `app.gen_ai.estimated_cost_usd` | Histogram | Spend by workflow, model, tenant tier |
 | `app.gen_ai.client.token.cache_read.usage` | Histogram | Cached-input token subset, separate from standard totals |
 | `app.gen_ai.client.token.cache_creation.usage` | Histogram | Cache-write input-token subset |
 | `app.gen_ai.client.token.reasoning.usage` | Histogram | Reasoning output-token subset |

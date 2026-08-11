@@ -4,7 +4,12 @@ Read this before copying version-sensitive examples. The GenAI conventions, Lang
 
 ## Reviewed version set
 
-Review date: **2026-08-10**.
+Review date: **2026-08-10**. Review by: **2027-02-10**.
+
+Past the review-by date, treat every version-sensitive example here as
+unverified and say so in your report. `validate_skill.py` warns once the date
+passes; it does not fail, because a stale contract is a prompt to re-check, not
+a broken package.
 
 | Surface | Contract used by this skill |
 | --- | --- |
@@ -43,8 +48,10 @@ Before changing any version above:
    force-flush behaviour against the selected instrumentation release.
 4. Run capture-on and capture-off streaming tests against the real LangChain/LangGraph stream shape. Cover an empty stream, cancellation, and an error after the first chunk.
 5. Re-run model/provider metadata fixtures so `gen_ai.request.model` can never become a model type such as `chat` or `llm`.
-6. Validate the production Collector configuration with the exact candidate image and inspect its `components` output for renamed or removed components. Re-test whether `prometheus_remote_write` now accepts nested `http.endpoint` and `http.headers`.
-7. Re-check backend authentication, endpoints, required headers, and whether trace ingestion remains real-time.
-8. Run `python scripts/validate_skill.py` (add `--collector-image` in CI), then perform the exported-telemetry checks in `verification.md`.
+6. Validate **every** Collector YAML block under `references/collector/` with the exact candidate image and inspect its `components` output for renamed or removed components. Re-test whether `prometheus_remote_write` now accepts nested `http.endpoint` and `http.headers`.
+7. Confirm whether the `batch` **processor** is still the recommended batching mechanism at the candidate version, or whether exporter-level `sending_queue.batch` supersedes it. If batching moves into the exporter, the "`batch` last, after `tail_sampling`" ordering advice in `collector/production.md` changes with it.
+8. Re-check every `gen_ai.*` attribute this skill uses against the pinned convention revision, not only the metric names. `validate_skill.py` pins the attribute set as an allowlist, so a convention change shows up as a validation failure with the exact key — resolve each one deliberately rather than widening the allowlist.
+9. Re-check backend authentication, endpoints, required headers, and whether trace ingestion remains real-time.
+10. Run `python scripts/validate_skill.py` (add `--collector-image` in CI), then perform the exported-telemetry checks in `verification.md`. The script runs without any external toolchain; `--official-validator` additionally requires the Codex skill-creator validator.
 
 Record the new version set, convention tag or commit, and review date in this file in the same change.

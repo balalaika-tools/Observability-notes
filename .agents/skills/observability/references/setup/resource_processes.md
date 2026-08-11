@@ -20,3 +20,11 @@ service convention defines the UUID namespace
 
 Verify two child processes produce distinct `service.instance.id` values and
 that neither value was created in the pre-fork parent.
+
+---
+
+## Then
+
+- the container platform's own identity file, if one applies;
+- pre-fork startup ordering: `startup_prefork.md`;
+- then continue with `sdk_bootstrap.md`.

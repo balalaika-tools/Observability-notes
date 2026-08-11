@@ -5,13 +5,17 @@ durable carrier to extract unless the job is separately launched from such a
 transport. The primary telemetry risk is flushing before the process exits.
 
 ```python
+from opentelemetry import trace
+
+from observability.logging import configure_logging
 from observability.tracing import configure_observability, shutdown_observability
 
 tracer = trace.get_tracer(__name__)
 
 
 def main() -> None:
-    configure_observability()
+    providers = configure_observability()
+    configure_logging(providers.logger_provider)
     try:
         with tracer.start_as_current_span(
             "run nightly-repricing",

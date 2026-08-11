@@ -10,6 +10,7 @@ Do not claim a step passed that you did not actually run. If something could not
 - [Trace shape](#2-trace-shape)
 - [Error handling](#3-error-handling)
 - [Propagation](#4-propagation-multi-service-queue-or-durable-db-work)
+- [AWS Lambda](#4b-aws-lambda-if-used)
 - [GenAI spans](#5-genai-spans)
 - [Content capture](#6-content-capture)
 - [Metrics](#7-metrics)
@@ -70,7 +71,7 @@ Exercise one representative operation end to end, then check the exported spans.
 - [ ] `service.namespace`, `service.name`, `service.instance.id`, `service.version`, and `deployment.environment.name` appear on every span.
 - [ ] Start two replicas and confirm their `service.instance.id` values differ while `service.namespace` and `service.name` remain identical.
 - [ ] `service.instance.id` remains unchanged across several operations from one process; a value that changes per request destroys instance-level analysis.
-- [ ] Production `service.version` is the immutable artifact version, not `unknown`, `latest`, a branch name, or a rollout label. For PDMA it is the full Git commit SHA supplied by CI/build.
+- [ ] Production `service.version` is the immutable artifact version, not `unknown`, `latest`, a branch name, or a rollout label — normally the full Git commit SHA supplied by CI/build.
 - [ ] Platform telemetry carries its native identity too: Kubernetes has `k8s.pod.uid`, containers have `container.id`, ECS has `aws.ecs.task.arn` plus container identity when available, and Lambda has `faas.name`, `faas.version`, `cloud.provider`, and `cloud.region`.
 
 ## 3. Error handling
@@ -79,16 +80,20 @@ Force a failure — a bad credential, an unreachable dependency, a deliberately 
 
 - [ ] The span has `ERROR` status.
 - [ ] `error.type` is set, and is a bounded class name or code — not a message.
-- [ ] **No exception span event exists.** Grep the codebase to be sure:
+- [ ] **No exception span event in first-party code.** Grep the service's own
+  source, not the environment — auto-instrumentation will keep emitting
+  exception events, and that is expected, not a failure of this check:
 
 ```bash
-grep -rn "record_exception\|add_event" --include='*.py' .
+git grep -n "record_exception\|add_event" -- '*.py'
 ```
 
-Expect zero hits in new code.
+Expect zero hits in code this work added or touched.
 
 - [ ] The exception appears **once** in the logs, with a stack trace, from the boundary that handled it.
+- [ ] That stack trace survives the Collector: with the pipeline deployed, find the canary exception in the log backend and confirm `exception.stacktrace` is still on it. Deleting it on the logs path removes the only copy the error contract leaves.
 - [ ] A handled failure with a successful fallback does **not** mark the span `ERROR`.
+- [ ] Every `error.type` value is a class name, a provider code, or one of `_NONE` / `_OTHER` / `_ABANDONED`.
 
 ## 4. Propagation (multi-service, queue, or durable DB work)
 
@@ -118,7 +123,7 @@ linked trace      consumer trace_id != producer trace_id, parent_span_id empty,
 - [ ] Missing, malformed, and oversized stored carriers are ignored safely and
   produce an unlinked root; they do not fail or authorize the work.
 
-## AWS Lambda (if used)
+## 4b. AWS Lambda (if used)
 
 - [ ] Exactly one invocation span exists. A Lambda layer and a manual handler
   wrapper do not both own it.
@@ -149,9 +154,11 @@ linked trace      consumer trace_id != producer trace_id, parent_span_id empty,
 - [ ] `gen_ai.usage.cache_read.input_tokens` and `gen_ai.usage.cache_creation.input_tokens` are present, even when `0`.
 - [ ] `app.gen_ai.usage.input_token_details` / `output_token_details` are populated when the provider reports details, and `""` when it does not.
 - [ ] Streaming: `gen_ai.response.time_to_first_chunk` is set, and is **smaller** than the span duration. If token counts are zero on streamed calls only, the model was not configured to include usage in the stream.
-- [ ] Streaming: `app.llm.stream.chunk_count` is non-zero with content capture off and matches capture-on runs for the same fixture.
+- [ ] Streaming: `app.gen_ai.stream.chunk_count` is non-zero with content capture off and matches capture-on runs for the same fixture.
 - [ ] Provider-returned `gen_ai.response.model` appears on both the span and model metric attributes when it differs from the request model.
 - [ ] Agent runs: model and tool spans nest under `invoke_agent`, and `app.agent.time_to_first_chunk` is **larger** than the first model span's TTFC.
+- [ ] Streaming: a span created by the **consumer** between two streamed chunks is a child of the request span, **not** of the model or agent span. If it nests under either, a wrapper is holding a span current across a `yield` (`tracing/genai/provider_sdk.md`).
+- [ ] Streaming: the agent is invoked the way production invokes it — sync and async paths both produce model spans.
 - [ ] Tool spans exist per attempt, not per logical call — force a transient tool failure and count them.
 - [ ] Three turns of one conversation produce three traces sharing `gen_ai.conversation.id`, not one long trace.
 
@@ -174,6 +181,9 @@ Expect no matches.
 - [ ] Every instrument produces data. Export once and look:
 
 ```bash
+# :8889 is the dev-only `prometheus` exporter in collector/dev_staging.md.
+# :8888 is the Collector's OWN telemetry and holds no application metrics.
+# With no Collector, use an in-process ConsoleMetricExporter instead.
 curl -s localhost:8889/metrics | grep -E '^(app_|gen_ai_|http_server_)'
 ```
 
@@ -187,6 +197,7 @@ curl -s localhost:8889/metrics | grep -E '^(app_|gen_ai_|http_server_)'
 - [ ] **No forbidden label.** This is the check that prevents an expensive backend incident:
 
 ```bash
+# Same endpoint as above.
 curl -s localhost:8889/metrics | grep -E 'user_id|session_id|conversation_id|trace_id|request_id|response_id'
 ```
 
@@ -213,6 +224,7 @@ Expect no matches.
 - [ ] Defaults are safe: content capture off, no backend credentials in application containers.
 - [ ] `OTEL_SERVICE_NAME` and `SERVICE_NAMESPACE` are required repository-specific values. Missing either fails startup with a clear settings validation error; other new variables use their documented safe defaults.
 - [ ] Exactly one owner sets each service resource attribute. Code-based setup does not duplicate the same keys in `OTEL_RESOURCE_ATTRIBUTES`; zero-code setup does not build an in-code provider.
+- [ ] Collector enrichment cannot overwrite the application: `resource`/`attributes` processors use `action: insert`, `resourcedetection` uses `override: false`. Test it — send telemetry with `deployment.environment.name=uat` through the pipeline and confirm it arrives as `uat`, not as the Collector's value.
 - [ ] Kubernetes receives instance identity through the Downward API or the existing service-attribute derivation owner; Compose resolves container identity inside the container; ECS queries both the current-container and `/task` Metadata v4 endpoints once before provider creation.
 - [ ] A gateway Collector does not stamp application telemetry with the Collector's own pod, container, task, hostname, or IP.
 
@@ -222,7 +234,9 @@ Expect no matches.
 - [ ] Receive and export counters both increase; `otelcol_exporter_send_failed_*` stays at zero.
 - [ ] Canary secrets — a fake API key, email, and authorization header — reach no backend.
 - [ ] `user.email` is deleted on every Collector path. No test or documentation treats the Collector's unsalted hash action as anonymization.
+- [ ] Exception detail is deleted on traces only. The logs pipeline still carries `exception.message` and `exception.stacktrace`.
 - [ ] No metrics pipeline contains a sampling processor.
+- [ ] No `# MEASURE:` placeholder value from `collector/production.md` survives in a deployed config.
 - [ ] Complete traces reach the GenAI backend: root, HTTP, retrieval, tool, and model spans, not just model leaves.
 - [ ] The health endpoint responds — and remember it proves only that the process is up, not that the backend is accepting data.
 - [ ] A Langfuse exporter uses OTLP/HTTP and sends `x-langfuse-ingestion-version: "4"`.

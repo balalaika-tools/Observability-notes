@@ -70,7 +70,7 @@ async def trace_tool_call(request, handler):
             if tool_name != raw_name:
                 # Keep the real name findable without letting it into the
                 # span name.
-                span.set_attribute("app.tool.requested_name", raw_name[:128])
+                span.set_attribute("app.gen_ai.tool.requested_name", raw_name[:128])
 
             if settings.capture_ai_content:
                 span.set_attribute(
@@ -94,7 +94,7 @@ async def trace_tool_call(request, handler):
                 # Cheap and safe: size spots context blow-ups without
                 # capturing content.
                 span.set_attribute(
-                    "app.tool.result_size_bytes", len(str(response).encode())
+                    "app.gen_ai.tool.result_size_bytes", len(str(response).encode())
                 )
 
             return response
@@ -183,7 +183,7 @@ ModelRetryMiddleware
     ↓
 actual model invocation
     ↓
-OTelLLMCallback
+OTelModelCallback
 ```
 
 Each retry is a separate physical request, so each produces its own span automatically. `ModelRetryMiddleware` needs no tracing-specific configuration.
@@ -236,7 +236,7 @@ Scope retries to specific tools with `tools=[...]` when only some are worth retr
 from langchain.agents.middleware import SummarizationMiddleware
 
 summary_model = init_chat_model("openai:gpt-5-mini", streaming=False).with_config(
-    callbacks=[otel_llm_callback],
+    callbacks=[otel_model_callback],
 )
 
 summarization = SummarizationMiddleware(
@@ -247,8 +247,8 @@ summarization = SummarizationMiddleware(
 ```
 
 ```
-main agent LLM   ──> OTelLLMCallback
-summarization LLM ─> OTelLLMCallback
+main agent LLM   ──> OTelModelCallback
+summarization LLM ─> OTelModelCallback
 ```
 
 Without the callback on the summarization model, those calls are invisible: their latency and tokens land nowhere, and the agent's total cost silently under-reports. Since the model name is resolved per call (`model_callback.md`), the summarization span is distinguishable by `gen_ai.request.model` without any extra wiring.
@@ -303,7 +303,7 @@ invoke_agent support_agent
 - One `execute_tool <name>` span per **attempt**, not per logical call — force a transient failure to check.
 - Failed attempts have `ERROR` status and a bounded `error.type`.
 - Tool spans are children of the agent span, not siblings.
-- An unknown tool name produces `execute_tool unknown_tool`, with the raw name only in `app.tool.requested_name`.
+- An unknown tool name produces `execute_tool unknown_tool`, with the raw name only in `app.gen_ai.tool.requested_name`.
 - With `CAPTURE_AI_CONTENT` unset, no `gen_ai.tool.call.arguments` or `gen_ai.tool.call.result` appears.
 - The summarization model produces its own span with its own model name.
 

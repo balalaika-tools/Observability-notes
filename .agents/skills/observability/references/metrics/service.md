@@ -23,6 +23,13 @@ Framework instrumentation emits these already. Check what you get before writing
 
 Traffic, error rate, and latency percentiles all come from the duration histogram's count, status labels, and buckets. You do not need a separate request counter unless you need a label the standard metric does not carry (an SLO good/bad marker, for instance).
 
+That is also why the worker table below has **both** `app.worker.job.duration`
+and `app.worker.jobs`, which looks like the duplication just warned against and
+is not: the standard HTTP histogram already carries the outcome through
+`http.response.status_code`, while a job has no such standard label. The counter
+exists to carry `app.outcome`. If you drop it, you lose the outcome split; if
+you add its HTTP equivalent, you gain nothing.
+
 ### Worker / queue consumer
 
 | Metric | Instrument | Unit | Detects |
@@ -150,6 +157,11 @@ The `finally` is the point. Recording only on success produces an error rate who
 
 `error.type` needs a fixed placeholder on the success path (`_NONE`), or success and failure land in different label sets and cannot be divided against each other.
 
+This applies to **application-owned** instruments only. Standard OpenTelemetry
+instruments omit `error.type` on success instead, because the convention says
+so and a sentinel would not match what other producers emit. The rule for both
+lives in `../conventions/errors.md`, which owns `error.type`.
+
 ---
 
 ## Cardinality is a hard limit
@@ -168,13 +180,16 @@ Two attributes that pass that check by eye and are still wrong:
 Read the service's business logic and add the small number of metrics that would actually be watched. Examples of the shape:
 
 ```
-app.exceptions_processed.count        Counter,   by app.outcome
-app.exceptions_resolved.count         Counter,   by resolution category
-app.pricing.updates.count             Counter
-app.pricing.product_count             Histogram, per run
-app.documents_retrieved.count         Histogram
-app.queue_items_processed.count       Counter,   by app.outcome
+app.exceptions_processed     Counter,   by app.outcome
+app.exceptions_resolved      Counter,   by resolution category
+app.pricing.updates          Counter
+app.pricing.product_count    Histogram, per run
+app.retrieval.document_count Histogram, per query
+app.queue_items_processed    Counter,   by app.outcome
 ```
+
+No `.count` on the counters, and `.count`/`.result_count` only where the
+measured quantity really is "how many", per `../conventions/naming.md`.
 
 Each one needs a stated purpose before you add it:
 
@@ -185,7 +200,7 @@ Each one needs a stated purpose before you add it:
 
 If any of those has no answer, leave it out. Every metric has storage, query, alerting, and cognitive cost.
 
-Business metrics are not a loophole for cardinality. `app.pricing.updates.count` labelled by `supplier_id` is still one time series per supplier.
+Business metrics are not a loophole for cardinality. `app.pricing.updates` labelled by `supplier_id` is still one time series per supplier.
 
 ---
 
@@ -194,9 +209,15 @@ Business metrics are not a loophole for cardinality. `app.pricing.updates.count`
 Export once and check the actual output:
 
 ```bash
-# with a Prometheus-reading Collector in front
+# Requires the dev-only `prometheus` exporter on :8889 from
+# ../collector/dev_staging.md. 8888 is the Collector's own telemetry and will
+# not contain application metrics — grepping it finds nothing and looks like a
+# missing instrument.
 curl -s localhost:8889/metrics | grep '^app_'
 ```
+
+Without a Collector, use an in-process `ConsoleMetricExporter` with a short
+export interval instead; the checks below apply to either output.
 
 Confirm:
 

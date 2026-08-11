@@ -20,8 +20,10 @@ def _request_stop(*_):
 
 
 def main() -> None:
-    configure_observability()
-    configure_logging()
+    # Always this pair, in this order, with the provider passed through — the
+    # same call in every entry point (`../setup/startup_worker_cli.md`).
+    providers = configure_observability()
+    configure_logging(providers.logger_provider)
     signal.signal(signal.SIGTERM, _request_stop)
     signal.signal(signal.SIGINT, _request_stop)
     try:
@@ -57,3 +59,10 @@ def _run_with_context(parent_ctx, payload: dict) -> None:
 Verify that child spans keep the boundary span's trace ID, that shutdown waits
 for the in-flight unit of work, and that providers are configured exactly once
 per process.
+
+## Then
+
+- the unit-of-work transport: `queue_messaging.md` or `durable_work.md`
+- metrics: `../metrics/service.md` — queue depth, oldest-message age, job duration
+- logs: `../logging/structlog.md`
+- final checks: `../verification.md`

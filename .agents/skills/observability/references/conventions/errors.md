@@ -6,9 +6,33 @@ Every code sample in this skill records failures the same way. Use this contract
 
 ## Why not `record_exception()`
 
-OpenTelemetry is deprecating `Span.add_event()` and `Span.record_exception()`. Exception detail is moving to named log records correlated with the active span, because a log record has its own timestamp, severity, and schema, and can be retained, sampled, and redacted independently of the trace.
+OpenTelemetry has been moving exception detail off span events and onto log
+records correlated with the active span: a log record has its own timestamp,
+severity, and schema, and can be retained, sampled, and redacted independently
+of the trace. **This file states the contract; it does not state the spec.**
+Before relying on the deprecation itself, check the status of `AddEvent` /
+`RecordException` and of the `exception` semantic conventions in the revision
+pinned by `../compatibility.md`, and record what you found there. The SDK you
+are using may still document both as stable API, and the rule below then reads
+as house preference — which is fine, as long as it is not presented as spec.
 
-Practical consequence: **do not add new span events.** Not for exceptions, not for checkpoints. The span carries status and bounded attributes; the logs pipeline carries the detail.
+Practical consequence, either way: **do not add new span events.** Not for
+exceptions, not for checkpoints. The span carries status and bounded attributes;
+the logs pipeline carries the detail.
+
+### The trade-off this makes for you
+
+Some trace backends render an error's message and stack trace from the
+`exception` span event, and their error views go quiet when that event is
+absent. With this contract, the detail arrives as a correlated log record
+instead. Before adopting it, confirm the backend can pivot from a span to its
+logs by `trace_id`/`span_id` — and that the Collector is not deleting the log
+attribute the detail travels in (`../collector/production.md` splits the
+exception-detail processor out of the logs pipeline precisely for this).
+
+If a backend cannot pivot, say so and let the user choose; do not quietly
+degrade their error view. This is the one place in the skill where a house rule
+has a visible product consequence.
 
 ---
 
@@ -132,6 +156,34 @@ Low-cardinality, and stable enough to alert on.
 
 Prefer the exception class name, or a provider error code when the SDK exposes a stable one. Wrapped exceptions are worth unwrapping — `RetryError` tells you nothing; the cause does.
 
+### The sentinel set is closed
+
+Not every failure has an exception class. Those cases use a sentinel, and the
+set of sentinels is exactly these three — anything else is a class name:
+
+| Sentinel | Means |
+| --- | --- |
+| `_NONE` | success, on an **application-owned** instrument only (see below) |
+| `_OTHER` | a real failure that could not be classified into the bounded set |
+| `_ABANDONED` | the operation never reported an outcome — a stream the consumer dropped, a callback run with no end event |
+
+The `_UPPER` shape is the point: it cannot be mistaken for a class name, so a
+dashboard reading `error.type` can tell "we do not know" from "it raised
+`TimeoutError`". Cancellation is **not** a sentinel — `CancelledError` and
+`GeneratorExit` are real classes, so use their names.
+
+### `_NONE` on success: application instruments only
+
+| Instrument | On success |
+| --- | --- |
+| Standard OTel (`gen_ai.*`, `http.*`, `db.*`, `messaging.*`) | **omit** `error.type` — the convention says so, and a sentinel would not match what other producers emit |
+| Application-owned (`app.*`) | set `error.type="_NONE"`, so success and failure share one label set and can be divided against each other |
+
+Both metrics files defer to this rule: `../metrics/service.md` for the `app.*`
+case, `../metrics/genai.md` for the standard one. When you add an `app.*`
+instrument next to a standard one, they will disagree on this attribute by
+design.
+
 ---
 
 ## Where the exception log goes
@@ -165,7 +217,9 @@ Set both, deliberately, at the boundary that knows the operation failed.
 
 - [ ] No `record_exception()` or `add_event()` anywhere in the new code.
 - [ ] Every manually created span passes `record_exception=False`.
-- [ ] Every failure path sets a bounded `error.type`.
+- [ ] Every failure path sets a bounded `error.type` — a class name, a provider code, or one of the three documented sentinels.
+- [ ] `error.type="_NONE"` appears on `app.*` instruments and on no standard one.
+- [ ] The trace backend can reach the exception log record from the span, and the Collector's logs pipeline does not delete `exception.stacktrace`.
 - [ ] Caught-and-handled failures set span status explicitly, and only when the operation actually failed.
 - [ ] Exception detail is logged once, at the owning boundary, with `exc_info=True`.
 - [ ] Provider-facing GenAI client exception events use `gen_ai.client.operation.exception`; outer application failures use an `app.*` event and are not duplicated.

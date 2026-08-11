@@ -129,3 +129,11 @@ This is the split that catches people out on a GenAI service: the trace backend,
 - A retried-then-successful tool call produces a `warning` record and leaves the agent span `UNSET`.
 - Records emitted inside a model span carry that span's `trace_id` and `span_id`.
 - `gen_ai.conversation.id` appears in logs and in no metric.
+
+---
+
+## Then
+
+- metrics, if not done: `../metrics/genai.md`
+- asserting redaction in tests: `../testing.md`
+- final checks: `../verification.md`

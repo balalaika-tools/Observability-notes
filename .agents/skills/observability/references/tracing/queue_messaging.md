@@ -12,6 +12,7 @@ instrumentation ownership. It does not cover DB-backed work or scheduled jobs.
 - [Consumer: new trace with a link](#queue-consumer-side--new-trace-with-a-link)
 - [Batch consumers](#batch-consumers)
 - [Automatic instrumentation](#automatic-queue-instrumentation-may-already-own-this)
+- [Other brokers](#other-brokers)
 - [Attributes and next signals](#attributes-and-next-signals)
 
 ## Producer side
@@ -65,17 +66,45 @@ sqs.send_message(
 
 Importing the adapters does not enable automatic spans; they only translate the carrier representation.
 
-**On the receive side, SQS returns message attributes only if you ask for them:**
+**But the package must be installed**, and `../setup/auto_instrumentation.md` lists
+`boto3sqs` under "leave off". Both are correct; the resolution is explicit:
+
+| Setup | What to do |
+| --- | --- |
+| Code-based | Install `opentelemetry-instrumentation-boto3sqs` for the adapters. Never call `Boto3SQSInstrumentor().instrument()`; without that call the package patches nothing. |
+| Zero-code | Install it **and** disable the entry point: `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=boto3`. `opentelemetry-instrument` activates every installed package, so an un-disabled install silently produces the double consumer span described below. |
+| Neither is acceptable | Inline the two adapters. SQS message attributes are `{name: {"DataType": "String", "StringValue": value}}` — an eight-line getter/setter pair with no instrumentation dependency at all. |
+
+**On the receive side, SQS returns attributes only if you ask for them — and
+there are two different kinds:**
 
 ```python
 response = sqs.receive_message(
     QueueUrl=queue_url,
     MaxNumberOfMessages=10,
+    # W3C traceparent/tracestate written by a producer: USER attributes.
     MessageAttributeNames=list(propagate.get_global_textmap().fields),
+    # X-Ray context written by AWS itself: a SYSTEM attribute. Requesting it
+    # under MessageAttributeNames returns nothing.
+    MessageSystemAttributeNames=["AWSTraceHeader"],
 )
 ```
 
-Omit `MessageAttributeNames` and the propagated fields silently never arrive. The consumer produces orphan traces with no error — the single most common cause of "propagation looks configured but doesn't work."
+| Carrier | Requested with | Written by |
+| --- | --- | --- |
+| `traceparent`, `tracestate`, `baggage` | `MessageAttributeNames` | your instrumented producer |
+| `AWSTraceHeader` | `MessageSystemAttributeNames` (legacy: `AttributeNames`) | AWS, for X-Ray-propagated flows including Lambda event sources |
+
+Omit the matching one and the propagated fields silently never arrive. The
+consumer produces orphan traces with no error — the single most common cause of
+"propagation looks configured but doesn't work." A direct (non-Lambda) consumer
+of an X-Ray-carried trace hits this even with `MessageAttributeNames` set
+correctly, because it is asking for the wrong kind of attribute. The Lambda side
+of `AWSTraceHeader` is in `lambda_functions.md`.
+
+Two SQS limits bite here: a message carries at most **10** user message
+attributes, and attributes count toward the **256 KB** message size. A W3C
+carrier is 2–3 of those 10.
 
 ## Queue consumer side — continued trace
 
@@ -200,6 +229,24 @@ OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=boto3 opentelemetry-instrument python work
 ```
 
 That disables the whole entry point, producer side included, so the worker must then inject manually if it also publishes. Keep unrelated instrumentation (HTTP, database) enabled. Re-verify the exported shape after every instrumentation upgrade; queue semantics are version-specific.
+
+## Other brokers
+
+The producer/consumer shapes above are transport-independent; only the carrier
+adapter and the ownership question change. `../discovery.md` names these as
+detection signals, so here is what each one needs:
+
+| Transport | Carrier | Ownership note |
+| --- | --- | --- |
+| Kafka (`confluent_kafka`, `aiokafka`) | Record headers: `list[tuple[str, bytes]]`. Needs a getter/setter that decodes/encodes UTF-8, because W3C values are strings and headers are bytes. | Kafka instrumentation, where installed, owns produce and consume spans. Pick one. |
+| Celery | Celery's own message headers | **`opentelemetry-instrumentation-celery` already owns both the publish and the task-execution span, and links them.** Do not add your own; add business child spans inside the task. This is a live duplicate-owner risk, because `../setup/auto_instrumentation.md` recommends installing it. |
+| RabbitMQ / AMQP via `kombu` or `pika` | AMQP `headers` property — already a string map, so `inject(headers)` / `extract(headers)` work directly | No first-party instrumentation for raw `pika`; you own the boundary. |
+| Redis Streams | No header space. Put the carrier in a named field of the entry, e.g. `otel_traceparent`, and document the field name as a contract. | `redis` instrumentation traces the `XADD`/`XREADGROUP` commands, not the work. Those are transport spans, never the parent of processing. |
+| Google Cloud Pub/Sub | Message `attributes`, a string map | Check whether the client library already injects; some versions do. |
+
+Whatever the transport: the carrier is untrusted input, the parent-or-link
+decision is unchanged (`async_handoffs.md`), and a command-level span from a
+client instrumentation is never the causal parent of the work.
 
 ## Attributes and next signals
 

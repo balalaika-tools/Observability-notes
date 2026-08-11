@@ -116,7 +116,7 @@ mistral_ai        deepseek             groq
 x_ai              perplexity           ibm.watsonx.ai
 ```
 
-Through a proxy or gateway, set the platform you can actually see at span start. If the upstream provider becomes known later, record it as `app.llm.upstream_provider`.
+Through a proxy or gateway, set the platform you can actually see at span start. If the upstream provider becomes known later, record it as `app.gen_ai.upstream_provider`.
 
 ---
 

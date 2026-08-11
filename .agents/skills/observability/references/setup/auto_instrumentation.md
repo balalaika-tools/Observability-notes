@@ -13,11 +13,10 @@ Install an instrumentation package only when the service uses that library in a 
 | The service… | Install |
 | --- | --- |
 | serves HTTP with FastAPI | `opentelemetry-instrumentation-fastapi` |
-| serves HTTP with Flask / Django | `opentelemetry-instrumentation-flask` / `-django` |
 | calls HTTP with httpx / requests | `opentelemetry-instrumentation-httpx` / `-requests` |
 | uses SQLAlchemy / psycopg / asyncpg | `opentelemetry-instrumentation-sqlalchemy` / `-psycopg` / `-asyncpg` |
 | uses Redis | `opentelemetry-instrumentation-redis` |
-| runs Celery tasks | `opentelemetry-instrumentation-celery` |
+| runs Celery tasks | `opentelemetry-instrumentation-celery` — **it owns the publish and task spans**; do not also write your own (`../tracing/queue_messaging.md`, "Other brokers") |
 | runs as an AWS Lambda function | `opentelemetry-instrumentation-aws-lambda`, normally supplied by one selected Lambda instrumentation layer |
 | needs trace IDs in stdlib `logging` records | `opentelemetry-instrumentation-logging` |
 
@@ -47,13 +46,33 @@ Same reasoning for:
 
 | Package | Leave off unless |
 | --- | --- |
-| `botocore` / `boto3sqs` | you need a specific AWS operation observed, or you want the library's queue semantics instead of your own |
+| `botocore` | you need a specific AWS operation observed |
+| `boto3sqs` | you want the library's queue semantics instead of your own — **or** you need its carrier adapters, which is a different case, resolved below |
 | `urllib3` | you are not already tracing at the `requests`/`httpx` layer — otherwise it double-reports every outbound call |
 | `system-metrics` | the host/container platform is not already reporting CPU, memory, and process metrics |
 | `sqlite3` | the local database is genuinely a performance question |
 | framework-internal instrumentors (template rendering, ASGI internals) | you are debugging that layer specifically |
 
 The test is not "is this data true" but "would anyone open this span during an incident."
+
+### The `boto3sqs` exception: installed for adapters, not for spans
+
+Manual SQS propagation needs `Boto3SQSGetter` / `Boto3SQSSetter`, which only
+exist inside `opentelemetry-instrumentation-boto3sqs`. Installing a package for
+its helper classes is legitimate; leaving its entry point active is not.
+
+- **Code-based setup:** install it and never call
+  `Boto3SQSInstrumentor().instrument()`. It patches nothing on its own.
+- **Zero-code setup:** install it and disable the entry point —
+  `OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=boto3`. The launcher activates every
+  installed package, and an active `boto3sqs` plus a hand-written consumer span
+  is two owners for one message.
+- **Neither:** inline the adapters. The nested attribute shape is
+  `{name: {"DataType": "String", "StringValue": value}}` — see
+  `../tracing/queue_messaging.md`.
+
+This is the one case where "installed but deliberately inert" is the intended
+state, so write down which of the three you chose.
 
 ### Trace these boundaries instead
 

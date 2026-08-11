@@ -43,6 +43,9 @@ class TraceBudgetEstimate:
     minimum_active_trace_capacity: int
     suggested_sampled_cache_lower_bound: int
     suggested_non_sampled_cache_lower_bound: int
+    sampling_pipelines: int
+    total_active_trace_capacity: int
+    total_decision_cache_entries: int
 
 
 def estimate_trace_budget(
@@ -54,6 +57,7 @@ def estimate_trace_budget(
     decision_wait_seconds: Decimal,
     burst_factor: Decimal = Decimal(2),
     cache_multiplier: Decimal = Decimal(10),
+    sampling_pipelines: Decimal = Decimal(1),
 ) -> TraceBudgetEstimate:
     values = {
         "traces_per_second": traces_per_second,
@@ -63,6 +67,7 @@ def estimate_trace_budget(
         "decision_wait_seconds": decision_wait_seconds,
         "burst_factor": burst_factor,
         "cache_multiplier": cache_multiplier,
+        "sampling_pipelines": sampling_pipelines,
     }
     if any(not value.is_finite() or value <= 0 for value in values.values()):
         raise ValueError("all inputs must be finite and greater than zero")
@@ -86,6 +91,13 @@ def estimate_trace_budget(
         minimum_active_trace_capacity=ceil_int(active_capacity),
         suggested_sampled_cache_lower_bound=ceil_int(cache_lower_bound),
         suggested_non_sampled_cache_lower_bound=ceil_int(cache_lower_bound),
+        # The Collector builds one processor instance per pipeline, so naming
+        # tail_sampling in N pipelines allocates the buffers N times.
+        sampling_pipelines=ceil_int(sampling_pipelines),
+        total_active_trace_capacity=ceil_int(active_capacity * sampling_pipelines),
+        total_decision_cache_entries=ceil_int(
+            cache_lower_bound * Decimal(2) * sampling_pipelines
+        ),
     )
 
 
@@ -105,6 +117,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decision-wait-seconds", type=positive_decimal, required=True)
     parser.add_argument("--burst-factor", type=positive_decimal, default=Decimal(2))
     parser.add_argument("--cache-multiplier", type=positive_decimal, default=Decimal(10))
+    parser.add_argument(
+        "--sampling-pipelines",
+        type=positive_decimal,
+        default=Decimal(1),
+        help=(
+            "how many pipelines name tail_sampling; each one is a separate "
+            "processor instance with its own buffers and decision caches"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -118,6 +139,7 @@ def main() -> int:
         decision_wait_seconds=args.decision_wait_seconds,
         burst_factor=args.burst_factor,
         cache_multiplier=args.cache_multiplier,
+        sampling_pipelines=args.sampling_pipelines,
     )
     print(json.dumps(asdict(estimate), indent=2, sort_keys=True))
     return 0

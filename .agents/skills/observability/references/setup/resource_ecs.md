@@ -167,3 +167,11 @@ chooses the service-level `service.instance.id`. A Collector-side ECS detector
 is valid only when the Collector is in the same task and processes telemetry
 for that task. A central ECS gateway would detect itself and must not overwrite
 application resource identity.
+
+---
+
+## Then
+
+- back to `resource_identity.md` if any ownership question is still open;
+- a pre-fork server in the task also needs `resource_processes.md`;
+- then continue with `sdk_bootstrap.md`.

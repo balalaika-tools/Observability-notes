@@ -1,6 +1,6 @@
 ---
 name: observability
-description: "Add, audit, repair, upgrade, or troubleshoot OpenTelemetry tracing, metrics, and structured logging in an existing application or service — HTTP/API services, background workers, queue consumers, DB-backed state machines, scheduled jobs, AWS Lambda functions, LangChain/LangGraph agents, and direct provider-SDK LLM code — including GenAI semantic conventions, token and TTFC capture, trace propagation across queues and durable database handoffs, allowlisted baggage, an OpenTelemetry Collector component, and Langfuse/APM/Prometheus routing. Use whenever the user wants to instrument a service, fix or review existing telemetry, investigate missing or duplicate signals, or update an observability implementation."
+description: "Add, audit, repair, upgrade, or troubleshoot OpenTelemetry tracing, metrics, and structured logging in an existing Python application or service — FastAPI/HTTP APIs, background workers, queue consumers, DB-backed state machines, scheduled jobs, AWS Lambda functions, LangChain/LangGraph agents, and direct provider-SDK LLM code — including GenAI semantic conventions, token and TTFC capture, trace propagation across queues and durable database handoffs, allowlisted baggage, an OpenTelemetry Collector component, and Langfuse/APM/Prometheus routing. Use whenever the user wants to instrument a service, fix or review existing telemetry, investigate missing or duplicate signals, or update an observability implementation."
 ---
 
 # Observability Implementation
@@ -11,17 +11,35 @@ This file is a router. It holds the rules that apply to every implementation and
 
 ---
 
-## Scope: one service at a time
+## Scope
 
-Instrument exactly the service the user named. In a monorepo, do not touch sibling services, even when they share a telemetry package. If shared code must change, say so and keep the change additive so other services keep working unchanged.
+**One service at a time.** Instrument exactly the service the user named. In a monorepo, do not touch sibling services, even when they share a telemetry package. If shared code must change, say so and keep the change additive so other services keep working unchanged.
 
 If the user has not named a service and the repo contains more than one, ask which one before editing anything.
+
+**Python, and FastAPI for HTTP.** Every code sample here is Python, and the HTTP framework hooks are FastAPI's. The routing, conventions, retention policy, and Collector material are language-neutral — for another runtime use those and skip `setup/`, `tracing/genai/`, and `logging/`, whose code does not transfer.
+
+---
+
+## Step 0 — Which kind of work is this?
+
+The description covers five modes and they do not need the same files. Pick one before loading anything else:
+
+| Mode | Load |
+| --- | --- |
+| **Add** instrumentation to a service | Step 1 discovery, then the Step 3 routing tables |
+| **Audit or review** existing telemetry | `references/conventions/naming.md` + `references/conventions/errors.md`, `references/verification.md`, and the one boundary file matching the service type. Skip discovery's greenfield intake. |
+| **Troubleshoot** a specific symptom — missing, duplicated, orphaned, or zero-valued signals | `references/troubleshooting.md` only, then the single file it points at |
+| **Upgrade** a package, convention revision, or Collector image | `references/compatibility.md` only, then the files its checklist names |
+| **Collector-only** change | `references/collector/*`, plus `references/tracing/production_policy.md` if production retention is involved |
+
+Only the first mode runs the whole workflow below. A one-line fix does not need a 23k-token intake, and an audit does not need `setup/`.
 
 ---
 
 ## Step 1 — Discovery
 
-Read **`references/discovery.md`**. It carries the intake questions, the defaults you may assume without asking, and the two things you must never assume: the **observability backends** and, for a consumer, **how trace context arrives**. Production sampling work also needs measured traffic and trace-shape inputs; do not turn example percentages or thresholds into production defaults.
+Read **`references/discovery.md`**. It carries the intake questions, the defaults you may assume without asking, and the decisions you must never guess: the **observability backends**; for a consumer, **how trace context arrives**; and, when deployment or export configuration is in scope, the **export topology**. Production sampling work also needs measured traffic and trace-shape inputs; do not turn example percentages or thresholds into production defaults.
 
 Two questions block work if unanswered:
 
@@ -30,7 +48,13 @@ Two questions block work if unanswered:
 | Which backends receive traces, metrics, and logs? | Exporter and Collector configuration cannot be written without it. Never guess a backend. |
 | For a queue consumer, worker, DB-backed state machine, or event-driven Lambda: how is trace context propagated from the producer or previous transition? | The carrier field determines whether the work continues a trace or starts a linked one. |
 
-Everything else has a documented default.
+When deployment manifests or exporter routing are part of the task, one more
+question blocks that part of the work: direct OTLP export, a colocated
+Collector, a shared gateway Collector, or a combination? Application
+instrumentation itself can remain topology-neutral by using a configurable OTLP
+endpoint.
+
+Everything else has a documented default or a condition under which to ask.
 
 ---
 
@@ -53,7 +77,8 @@ These hold regardless of service type. They are short on purpose; the reasoning 
 ### Material to load conditionally
 
 - **Baggage.** Assume none is required. Read `references/tracing/baggage.md` only when the user names values that must travel between services — trace context alone already connects the spans.
-- **Tests.** If the repository already has a test suite, add focused tests for deterministic telemetry helpers and critical success, error, cancellation, partial-stream, propagation, and duplicate-ownership paths as normal implementation work. Follow the repository's conventions. Do not introduce a new test framework solely for observability unless the risk justifies it. Exported-telemetry verification (`references/verification.md`) remains a separate acceptance layer.
+- **Tests.** If the repository already has a test suite, add focused tests for deterministic telemetry helpers and critical success, error, cancellation, partial-stream, propagation, and duplicate-ownership paths as normal implementation work. The fixtures and assertion helpers are in `references/testing.md`. Follow the repository's conventions. Do not introduce a new test framework solely for observability unless the risk justifies it. Exported-telemetry verification (`references/verification.md`) remains a separate acceptance layer.
+- **Symptoms.** If the user reports a symptom rather than requesting work — no spans, duplicate spans, orphan traces, zero token counts — go to `references/troubleshooting.md` first. It routes to one file instead of the whole workflow.
 
 ---
 
@@ -61,39 +86,69 @@ These hold regardless of service type. They are short on purpose; the reasoning 
 
 Work in this order: **tracing → metrics → logging → collector**. Load a file when you reach the part of the work it covers, not upfront.
 
-The tree mirrors that order. Each signal owns its own GenAI material rather than there being one detached GenAI pile:
+The tree mirrors that order. It is a map only — the tables below are the authority on what to load and when. Each signal owns its own GenAI material rather than there being one detached GenAI pile:
 
 ```
 references/
-  discovery.md        the intake questions               — always, first
-  compatibility.md    tested versions + upgrade checks   — always
-  conventions/        naming.md + errors.md              — always
+  discovery.md        the intake questions
+  troubleshooting.md  symptom -> cause -> file
+  compatibility.md    tested versions + upgrade checks
+  conventions/        naming.md + errors.md
   setup/              resource_identity + runtime-specific identity,
                       package_layout, sdk_bootstrap + startup variants,
                       auto_instrumentation
   tracing/            production_policy, http_service, async_handoffs, queue_messaging,
                       durable_work, scheduled_jobs, worker_runtime,
                       lambda_functions, baggage
-    genai/            attributes, token_usage, content_capture, provider_sdk
+    genai/            attributes, token_usage, content_capture, provider_sdk, retrieval
       langchain/      architecture + the three agent layers
   metrics/            service.md + genai.md
   logging/            structlog.md + genai.md
   collector/          component, dev_staging, production
-  verification.md     the exported-telemetry checks      — always, last
+  testing.md          in-memory exporter harness for telemetry assertions
+  verification.md     the exported-telemetry checks
+  local/              repository-specific mappings; load only on a match
 scripts/
   estimate_trace_budget.py   production volume/capacity lower bounds
+  validate_skill.py          deterministic checks on this package
 ```
 
-### Always
+### Always — the two files every code sample depends on
 
 | File | What it gives you |
 | --- | --- |
-| `references/compatibility.md` | Tested package ranges, the pinned GenAI convention revision, Collector/Langfuse contract, and upgrade checklist |
-| `references/conventions/naming.md` | Span, attribute, metric, and log-event naming; the `app.*` namespace; the cardinality allow/forbid lists |
-| `references/conventions/errors.md` | The no-span-events error contract used by every code sample in this skill |
-| `references/setup/resource_identity.md` | Common service namespace/name/version/instance identity contract; runtime identity is routed separately |
+| `references/conventions/naming.md` | Span, attribute, metric, and log-event naming; the `app.*` registry; the cardinality allow/forbid lists |
+| `references/conventions/errors.md` | The no-span-events error contract, `error.type` values, and the closed sentinel set |
+
+Two facts from `references/compatibility.md` apply unconditionally, so they are
+here rather than in a file you must open:
+
+- the pinned GenAI convention revision is the one recorded in
+  `references/compatibility.md`; never assume a `gen_ai.*` key that is not already used by
+  this skill;
+- a Langfuse exporter is OTLP/**HTTP** and sends
+  `x-langfuse-ingestion-version: "4"`.
+
+Read the rest of `references/compatibility.md` before copying any **version-sensitive**
+example — GenAI attributes, LangChain/LangGraph stream shapes, Collector
+component schemas, Lambda layers — and before any upgrade.
+
+### Always when creating or changing SDK setup
+
+Skip these three for a repair, audit, or debug task on an already-instrumented
+service; they describe decisions that were already made.
+
+| File | What it gives you |
+| --- | --- |
+| `references/setup/resource_identity.md` | Service namespace/name/version/instance identity contract; runtime identity is routed separately |
 | `references/setup/package_layout.md` | Where the observability modules go and how config/env vars are wired |
 | `references/setup/auto_instrumentation.md` | Which instrumentation packages to install, which to deliberately leave off |
+
+### Repository-specific
+
+| Condition | Add |
+| --- | --- |
+| The target repository is PDMA | `references/local/pdma_identity.md` |
 
 ### Resource identity, by deployment runtime
 
@@ -123,7 +178,7 @@ compose: a pre-fork service on ECS needs both ECS and multi-process identity.
 
 | Service type | Add these |
 | --- | --- |
-| HTTP/API service (FastAPI, Flask, Django) | `references/tracing/http_service.md` |
+| HTTP/API service (FastAPI) | `references/tracing/http_service.md` |
 | Long-running background worker process | `references/tracing/worker_runtime.md` |
 | Scheduled job or CLI batch | `references/tracing/scheduled_jobs.md` |
 | AWS Lambda function | `references/tracing/lambda_functions.md` |
@@ -162,7 +217,14 @@ Start at `references/tracing/genai/attributes.md`; it is the entry point for eve
 | — model spans, TTFC | `references/tracing/genai/langchain/model_callback.md` |
 | — tool spans, retry middleware, summarization | `references/tracing/genai/langchain/tools_and_middleware.md` |
 | — outer agent span, streaming, conversation correlation | `references/tracing/genai/langchain/streaming_and_agent_span.md` |
-| RAG — embedding and retrieval spans, on **either** path | `references/tracing/genai/provider_sdk.md`, "Other operations" |
+| RAG — embedding and retrieval spans, on **either** path | `references/tracing/genai/retrieval.md` |
+
+GenAI tracing code imports `observability/genai_metrics.py` and
+`observability/agent_counters.py`, which are specified in
+`references/metrics/genai.md`. Create those two modules **before** the tracing
+layer that imports them, then come back — otherwise the tracing step cannot run,
+and inventing local recorder functions to get past the `ImportError` is the
+label drift the shared module exists to prevent.
 
 ### Metrics and logging, after tracing works
 
@@ -183,7 +245,10 @@ Start at `references/tracing/genai/attributes.md`; it is the entry point for eve
 
 ### Before reporting the work complete
 
-`references/verification.md` — always.
+| File | When |
+| --- | --- |
+| `references/testing.md` | The repository has a test suite and this work added deterministic parsing, serialization, redaction, streaming, retry, or propagation logic — it holds the in-memory exporter harness those tests need |
+| `references/verification.md` | Always, last. The exported-telemetry checks. |
 
 ---
 
@@ -207,6 +272,7 @@ Prefer domain words over implementation words: `app.pricing.product_count`, not 
 - Don't capture prompts or tool payloads unconditionally.
 - Don't create a second `TracerProvider` when one already exists, and don't mix `opentelemetry-instrument` with in-code provider setup.
 - Don't create a span per streamed token.
+- Don't hold `start_as_current_span` across a `yield`. A generator shares the consumer's context, so the span stays current after control returns.
 - Don't add baggage unless the user asked for it.
 - Don't copy example sampling percentages, latency thresholds, trace capacities, cache sizes, or token thresholds into production. Derive them from measured traffic and the retention policy.
 - Don't accept a force-sampling signal from an untrusted request, message, or baggage carrier.

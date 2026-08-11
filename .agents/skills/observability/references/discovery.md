@@ -1,6 +1,6 @@
 # Discovery
 
-Answer these before editing code. Most have a default you may take silently — those are marked **Default**. The two marked **Ask** have no safe default; guessing them produces telemetry that is wrong rather than incomplete.
+Answer these before editing code. Most have a default you may take silently — those are marked **Default**. Items marked **Ask** require confirmation when their stated condition applies; guessing them produces telemetry or deployment architecture that is wrong rather than incomplete.
 
 Record the answers in your first message so the user can correct a wrong assumption cheaply.
 
@@ -12,7 +12,7 @@ Record the answers in your first message so the user can correct a wrong assumpt
 - [Asynchronous work](#4-does-it-publish-or-consume-asynchronous-work)
 - [Baggage](#5-is-this-a-rootstart-application-that-must-introduce-baggage)
 - [Backends](#6-which-observability-backends--ask)
-- [Collector](#7-is-an-opentelemetry-collector-required)
+- [Export topology](#7-how-should-telemetry-be-exported--ask-when-deployment-is-in-scope)
 - [Production policy inputs](#8-is-the-target-production-or-is-samplingfiltering-being-changed)
 - [Business telemetry](#9-what-business-telemetry-is-worth-adding)
 - [Report template](#report-template)
@@ -172,19 +172,31 @@ metrics -> ?
 logs    -> ?
 ```
 
-Common answers: Grafana Tempo, Grafana Mimir/Prometheus, Grafana Loki, Langfuse, Datadog, New Relic, Honeycomb, Jaeger, AWS X-Ray, CloudWatch, Azure Monitor, an OTLP-compatible vendor, or "an OpenTelemetry Collector, and the Collector decides."
+Common answers: Grafana Tempo, Grafana Mimir/Prometheus, Grafana Loki, Langfuse, Datadog, New Relic, Honeycomb, Jaeger, AWS X-Ray, CloudWatch, Azure Monitor, or another OTLP-compatible vendor.
 
-The last answer is the good one for production. It means the application exports plain OTLP to the Collector and every vendor detail — endpoint, credentials, redaction, fan-out — lives in Collector configuration. Recommend it when the user has no strong preference, then still ask what the Collector should forward to.
+A Collector is transport and processing infrastructure, not the final backend.
+If the user answers "a Collector," still ask where it forwards each signal.
+Collector-mediated routing is often useful in production, but direct OTLP export
+may also be appropriate. Confirm the intended topology in §7.
 
 Note the split that matters for GenAI services: **Langfuse is a trace and LLM-workflow backend, not a metrics backend.** Operational metrics and alerts go to a metrics backend; Langfuse receives traces, generations, scores, and cost.
 
 ---
 
-## 7. Is an OpenTelemetry Collector required?
+## 7. How should telemetry be exported? — **Ask when deployment is in scope**
 
-**Default:** yes for anything deployed; direct export is acceptable only for local development or a single small service the user says is fine to keep simple.
+Do not assume that a deployed service requires an OpenTelemetry Collector. Direct OTLP export and Collector-mediated export are both valid production architectures.
 
-If yes, read `collector/component.md`. The Collector is its own deployable component (`services/otel-collector/` or the repo's equivalent), with separate configs for development, staging, and production.
+Preserve an established export topology when one already exists. Otherwise, when deployment manifests, credentials, exporter routing, or Collector configuration are in scope, ask the user to choose:
+
+- direct OTLP export from the application to each backend;
+- a Collector colocated with the application: a sidecar per application replica, or an agent per host or Kubernetes node;
+- a shared gateway Collector; or
+- colocated Collectors forwarding to a gateway Collector.
+
+Recommend a Collector when concrete requirements include centralized credentials, redaction, transformation, fan-out, protocol conversion, tail sampling, stronger buffering, or organization-wide telemetry policy. Explain its operational cost as well as its benefit.
+
+If deployment topology is outside the requested scope, keep the OTLP endpoint configurable and do not add a Collector component without asking. If a Collector is selected, read `collector/component.md`. It is its own deployable component (`services/otel-collector/` or the repo's equivalent), with separate configs for development, staging, and production.
 
 ---
 
@@ -237,7 +249,7 @@ Split them by signal:
 | Signal | Good candidate |
 | --- | --- |
 | Span attribute | A bounded fact describing one operation: `app.pricing.product_count`, `app.exception.rule` |
-| Metric | A rate or distribution you would alert or trend on: `app.exceptions_processed.count` |
+| Metric | A rate or distribution you would alert or trend on: `app.exceptions_processed` |
 | Log field | A high-cardinality identifier needed to find one record later: `exception_id`, `order_id` |
 
 If the user explicitly requested particular business attributes, include them as well.
@@ -256,12 +268,23 @@ GenAI:          none
 Messaging:      consumes pricing-jobs; trace context in SQS MessageAttributes
 Trace policy:   new trace + link to producer (jobs are retried independently)
 Baggage:        none
-Backends:       traces -> Tempo, metrics -> Mimir, logs -> Loki, all via Collector
-Collector:      yes, new services/otel-collector component
-Business:       app.pricing.product_count, app.pricing.updates.count, supplier_id log field
-Production:     120 traces/s; p99 complete arrival 18 s; errors/slow/checkout 100%; normal successes measured at 3%
+Backends:       traces -> Tempo, metrics -> Mimir, logs -> Loki
+Export topology: shared gateway Collector, new services/otel-collector component
+Business:       app.pricing.product_count, app.pricing.updates, supplier_id log field
+Production:     <not measured — PROVISIONAL; see §8 for the required inputs>
 Noise:          successful /live and /ready are leaf spans; failed probes retained
-Rollout:        release burn-in for one Git SHA; owner=platform; expires=2026-08-18
+Rollout:        release burn-in for one Git SHA; owner=platform; expires=<date>
+```
+
+The `Production:` line is deliberately a placeholder. Fill it in only from
+measurements you actually have, and keep the literal word **PROVISIONAL** on it
+until every input in §8 exists. A filled-in shape is read as a measurement; if
+you write `120 traces/s` because the template had a number in it, someone will
+size a sampler from it. When measurements do exist, the line looks like:
+
+```
+Production:     MEASURED 2026-08-11: 120 traces/s; p99 complete arrival 18 s;
+                errors/slow/checkout 100%; normal successes 3%
 ```
 
 Anything you had to assume, mark as an assumption so it is cheap for the user to correct.

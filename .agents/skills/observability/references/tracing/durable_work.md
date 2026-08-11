@@ -1,5 +1,11 @@
 # DB-Backed Work Queues and Durable State Machines
 
+**Do not open this file unless the service coordinates work through a
+database** — an outbox table, a claim/lease loop, `FOR UPDATE SKIP LOCKED`, or a
+persisted state machine another process resumes. A broker-only service needs
+`queue_messaging.md` instead, and loading both invites a hybrid that matches
+neither transport.
+
 Read `async_handoffs.md` with this file. A database row can be the
 asynchronous carrier even when no broker exists. Examples include an outbox
 table, a worker using `FOR UPDATE SKIP LOCKED`, a leased job row, and a

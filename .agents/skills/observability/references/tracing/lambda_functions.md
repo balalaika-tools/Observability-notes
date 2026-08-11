@@ -1,5 +1,9 @@
 # AWS Lambda Functions
 
+**Do not open this file unless the target actually runs on AWS Lambda.** The
+managed-runtime lifecycle here contradicts the ordinary startup/shutdown
+pattern on purpose, and applying it to a normal process breaks flushing.
+
 Read this file for Python functions running in the managed AWS Lambda runtime.
 Do not apply the normal server/worker shutdown pattern mechanically: a Lambda
 execution environment is frozen and reused between invocations.

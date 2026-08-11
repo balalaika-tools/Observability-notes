@@ -10,7 +10,7 @@ Three neighbours own what this file uses: `attributes.md` (the constants module)
 - [Usage adapters](#usage)
 - [Streaming](#streaming)
 - [Retries](#application-level-retries)
-- [Embeddings and retrieval](#other-operations)
+- [Embeddings and retrieval](#embeddings-and-retrieval) — moved to `retrieval.md`
 - [Checklist](#checklist)
 
 The provider wrappers are **partial integration templates** because the SDK
@@ -164,33 +164,43 @@ For Bedrock specifically: read usage from the `bedrock-runtime` response body, a
 
 Two different latencies matter: time to the first chunk (what the user perceives) and total duration (the span). Record both.
 
+**Never hold `start_as_current_span` across a `yield`.** A Python generator does
+not get its own `contextvars` context: `start_as_current_span` calls
+`context.attach()`, and when the generator yields, that attach is still in
+effect *in the consumer*. Use `start_span` and end the span in `finally`.
+
 ```python
 def stream_chat(client, messages: list[dict], *, model: str):
-    with tracer.start_as_current_span(
+    # start_span, not start_as_current_span — see the note below the fence.
+    # The parent is whatever span is current at the FIRST iteration, because a
+    # generator body does not run until then.
+    span = tracer.start_span(
         f"chat {model}",
         kind=SpanKind.CLIENT,
-        record_exception=False,
         attributes={
             GENAI_OPERATION_NAME: "chat",
             GENAI_PROVIDER_NAME: "openai",
             GENAI_REQUEST_MODEL: model,
             GENAI_REQUEST_STREAM: True,
         },
-    ) as span:
-        started = time.perf_counter()
-        first_chunk_at: float | None = None
-        chunk_count = 0
-        captured_chunks: list[str] | None = (
-            [] if settings.capture_ai_content else None
-        )
-        captured_chars = 0
-        capture_truncated = False
-        error_type: str | None = None
-        usage: dict | None = None
-        response_model: str | None = None
-        response_id: str | None = None
+    )
+    started = time.perf_counter()
+    first_chunk_at: float | None = None
+    chunk_count = 0
+    captured_chunks: list[str] | None = (
+        [] if settings.capture_ai_content else None
+    )
+    captured_chars = 0
+    capture_truncated = False
+    error_type: str | None = None
+    usage: dict | None = None
+    response_model: str | None = None
+    response_id: str | None = None
 
-        try:
+    try:
+        # Only the non-yielding work is made current, so any span the SDK or a
+        # retry hook creates still nests under the model span.
+        with trace.use_span(span, end_on_exit=False, record_exception=False):
             stream = client.chat.completions.create(
                 model=model,
                 messages=messages,
@@ -200,83 +210,116 @@ def stream_chat(client, messages: list[dict], *, model: str):
                 stream_options={"include_usage": True},
             )
 
-            for chunk in stream:
-                chunk_count += 1
-                if first_chunk_at is None:
-                    first_chunk_at = time.perf_counter()
-                    span.set_attribute(
-                        GENAI_TIME_TO_FIRST_CHUNK, first_chunk_at - started
-                    )
-                    record_time_to_first_chunk(
-                        first_chunk_at - started,
-                        operation="chat",
-                        provider="openai",
-                        request_model=model,
-                    )
-
-                response_model = getattr(chunk, "model", None) or response_model
-                response_id = getattr(chunk, "id", None) or response_id
-                if response_model:
-                    span.set_attribute(GENAI_RESPONSE_MODEL, response_model)
-                if response_id:
-                    span.set_attribute(GENAI_RESPONSE_ID, response_id)
-
-                # Arrives on a final chunk whose `choices` list is empty.
-                if chunk.usage is not None:
-                    usage = extract_stream_usage(chunk)
-                    set_usage_attributes(span, usage)
-
-                text = extract_text_delta(chunk)
-                if text:
-                    if captured_chunks is not None:
-                        remaining = 32_768 - captured_chars
-                        if remaining > 0:
-                            captured = text[:remaining]
-                            captured_chunks.append(captured)
-                            captured_chars += len(captured)
-                        if len(text) > max(remaining, 0):
-                            capture_truncated = True
-                    yield text
-        except GeneratorExit:
-            error_type = "cancelled"
-            span.set_status(Status(StatusCode.ERROR))
-            span.set_attribute(ERROR_TYPE, error_type)
-            raise
-        except Exception as exc:
-            error_type = type(exc).__name__
-            span.set_attribute(ERROR_TYPE, error_type)
-            raise
-        finally:
-            # `usage` is None if the stream errored before the final chunk, or
-            # if include_usage was not requested — the duration observation is
-            # still recorded either way.
-            span.set_attribute("app.llm.stream.chunk_count", chunk_count)
-            if captured_chunks is not None:
+        for chunk in stream:
+            chunk_count += 1
+            if first_chunk_at is None:
+                first_chunk_at = time.perf_counter()
                 span.set_attribute(
-                    GENAI_OUTPUT_MESSAGES,
-                    serialize_text_output("".join(captured_chunks)),
+                    GENAI_TIME_TO_FIRST_CHUNK, first_chunk_at - started
                 )
-                if error_type:
-                    span.set_attribute("app.gen_ai.output.capture_mode", "partial")
-                elif capture_truncated:
-                    span.set_attribute(
-                        "app.gen_ai.output.capture_mode", "truncated"
-                    )
-            record_model_operation(
-                duration_s=time.perf_counter() - started,
-                operation="chat",
-                provider="openai",
-                request_model=model,
-                response_model=response_model,
-                usage=usage,
-                error_type=error_type,
+                record_time_to_first_chunk(
+                    first_chunk_at - started,
+                    operation="chat",
+                    provider="openai",
+                    request_model=model,
+                )
+
+            response_model = getattr(chunk, "model", None) or response_model
+            response_id = getattr(chunk, "id", None) or response_id
+            if response_model:
+                span.set_attribute(GENAI_RESPONSE_MODEL, response_model)
+            if response_id:
+                span.set_attribute(GENAI_RESPONSE_ID, response_id)
+
+            # Arrives on a final chunk whose `choices` list is empty.
+            if chunk.usage is not None:
+                usage = extract_stream_usage(chunk)
+                set_usage_attributes(span, usage)
+
+            text = extract_text_delta(chunk)
+            if text:
+                if captured_chunks is not None:
+                    remaining = 32_768 - captured_chars
+                    if remaining > 0:
+                        captured = text[:remaining]
+                        captured_chunks.append(captured)
+                        captured_chars += len(captured)
+                    if len(text) > max(remaining, 0):
+                        capture_truncated = True
+                yield text
+    except GeneratorExit:
+        # A real class name, bounded — see ../../conventions/errors.md.
+        error_type = "GeneratorExit"
+        span.set_status(Status(StatusCode.ERROR))
+        span.set_attribute(ERROR_TYPE, error_type)
+        raise
+    except Exception as exc:
+        error_type = type(exc).__name__
+        span.set_status(Status(StatusCode.ERROR))
+        span.set_attribute(ERROR_TYPE, error_type)
+        raise
+    finally:
+        # `usage` is None if the stream errored before the final chunk, or
+        # if include_usage was not requested — the duration observation is
+        # still recorded either way.
+        span.set_attribute("app.gen_ai.stream.chunk_count", chunk_count)
+        if captured_chunks is not None:
+            span.set_attribute(
+                GENAI_OUTPUT_MESSAGES,
+                serialize_text_output("".join(captured_chunks)),
             )
+            if error_type:
+                span.set_attribute("app.gen_ai.output.capture_mode", "partial")
+            elif capture_truncated:
+                span.set_attribute(
+                    "app.gen_ai.output.capture_mode", "truncated"
+                )
+        record_model_operation(
+            duration_s=time.perf_counter() - started,
+            operation="chat",
+            provider="openai",
+            request_model=model,
+            response_model=response_model,
+            usage=usage,
+            error_type=error_type,
+        )
+        # start_span has no context manager, so the end is explicit.
+        span.end()
 ```
 
-The stream fragment requires three provider-specific helpers that must be
-defined or imported in the final module: `extract_stream_usage`,
-`extract_text_delta`, and the non-streaming `extract_usage` adapter. The
-constants and metric recorders it uses are imported in the first fragment.
+### Why the span is never current across a `yield`
+
+PEP 550 was rejected, so generators and async generators share the caller's
+`contextvars` context. `start_as_current_span` attaches on entry and detaches on
+exit; between them the generator yields control **with the attach still live**,
+which produces three silent defects:
+
+- a span the consumer creates between two chunks becomes a child of the *model*
+  span instead of the request span — the same "siblings where you expected
+  nesting" symptom this skill elsewhere attributes to *lost* context, so the
+  diagnostic points the wrong way;
+- two interleaved streams unwind their `detach()` tokens out of order and the
+  SDK logs `Failed to detach context`;
+- concurrent streaming requests in one task can inherit each other's parent.
+
+`start_span` + explicit `end()` avoids all three. When a child genuinely must
+nest under the model span, wrap only that work in
+`trace.use_span(span, end_on_exit=False, record_exception=False)` and make sure
+no `yield` sits inside it. The same rule applies to the agent-level wrappers in
+`langchain/streaming_and_agent_span.md`.
+
+### Helpers this fragment expects
+
+Three provider-specific helpers must be defined or imported in the final
+module. Their contracts, so the gap is a fill-in rather than a design task:
+
+| Helper | Signature | Returns |
+| --- | --- | --- |
+| `extract_usage(response)` | `(Any) -> dict` | the normalized usage dict for a non-streaming response — adapter in `token_usage.md` |
+| `extract_stream_usage(chunk)` | `(Any) -> dict` | the same normalized dict, read from the provider's usage-carrying chunk |
+| `extract_text_delta(chunk)` | `(Any) -> str \| None` | the incremental text of this chunk; `None` for a usage-only, role-only, or tool-call-only chunk |
+
+The constants and metric recorders it uses are imported in the first fragment.
 
 `stream_options={"include_usage": True}` is not optional — without it the provider sends no token counts at all and the omission is silent. Why, and the equivalent for other providers: `token_usage.md`.
 
@@ -300,68 +343,17 @@ for attempt in range(1, max_attempts + 1):
         time.sleep(backoff(attempt))
 ```
 
-Put the attempt number on the span if the wrapper accepts it (`app.llm.attempt`), and wrap the whole retry loop in a parent span when the caller needs the total latency in one place.
+Put the attempt number on the span if the wrapper accepts it (`app.gen_ai.request.attempt`), and wrap the whole retry loop in a parent span when the caller needs the total latency in one place.
 
 Retry only transient failures — timeouts, connection errors, rate limits, 5xx. A malformed request retried three times is three identical failures and three times the cost.
 
 ---
 
-## Other operations
+## Embeddings and retrieval
 
-**This section applies to the LangChain path too.** Embedding and retrieval calls in a RAG agent are made by your own retriever code, not by the model callback, so they need these spans wherever the chat call comes from.
-
-The following fences are **boundary sketches**, not complete templates: the
-ellipsis is the service's real provider/vector-store call, which must keep the
-error contract, content gating, and response parsing used by that dependency.
-
-Embeddings, retrieval, and reranking are separate spans. Collapsing them into the generation span means you cannot tell a slow vector store from a slow model.
-
-```python
-with tracer.start_as_current_span(
-    f"embeddings {model}",
-    kind=SpanKind.CLIENT,
-    record_exception=False,
-    attributes={
-        GENAI_OPERATION_NAME: "embeddings",
-        GENAI_PROVIDER_NAME: "openai",
-        GENAI_REQUEST_MODEL: model,
-        "app.embedding.input_count": len(texts),
-    },
-) as span:
-    ...
-    # Through the writer, like every other usage write in this skill — an
-    # embedding call reports input tokens only, and normalize_usage() treats
-    # every field as optional, so no special case is needed here.
-    set_usage_attributes(span, {"input_tokens": response.usage.prompt_tokens})
-```
-
-```python
-with tracer.start_as_current_span(
-    f"retrieval {data_source_id}",
-    record_exception=False,
-    attributes={
-        GENAI_OPERATION_NAME: "retrieval",
-        "gen_ai.data_source.id": data_source_id,
-        "gen_ai.request.top_k": top_k,
-    },
-) as span:
-    ...
-    span.set_attribute("app.retrieval.result_count", len(docs))
-    if docs:
-        span.set_attribute("app.retrieval.top_score", docs[0].score)
-```
-
-Retrieval query text and document contents are opt-in content, on the same switch as prompts (`content_capture.md`). Safe by default: data source ID, top-k, result count, top score, retriever version. Opt-in only: query text, document text, document metadata, user-specific filters.
-
-If the whole thing is a multi-step workflow, wrap it:
-
-```
-POST /ask                          SERVER
-  invoke_workflow product_rag      INTERNAL
-    embeddings text-embedding-3-small
-    retrieval product_docs
-    chat gpt-5
-```
+RAG spans live in **`retrieval.md`**, because they are identical on both paths —
+a LangChain service needs them too, and should not have to load this
+direct-SDK file to get them.
 
 ---
 
@@ -377,11 +369,13 @@ POST /ask                          SERVER
 - [ ] Content capture gated on `CAPTURE_AI_CONTENT`, off by default — `content_capture.md`.
 - [ ] `error.type` on failure, no `record_exception`, per `../../conventions/errors.md`.
 - [ ] Duration and token metrics recorded on both success and failure paths — `../../metrics/genai.md`.
-- [ ] Embeddings and retrieval are their own spans.
+- [ ] Streaming wrappers use `start_span` + `finally: span.end()`; no span is current across a `yield`.
+- [ ] Embeddings and retrieval are their own spans — `retrieval.md`.
 
 ---
 
 ## Then
 
+- RAG spans: `retrieval.md`
 - metrics: `../../metrics/genai.md`
 - logging: `../../logging/genai.md`

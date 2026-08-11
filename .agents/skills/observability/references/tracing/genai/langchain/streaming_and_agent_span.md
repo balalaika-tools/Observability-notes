@@ -77,7 +77,8 @@ async def invoke_agent(
         try:
             result = await agent.ainvoke({"messages": messages})
         except asyncio.CancelledError:
-            error_type = "cancelled"
+            # Real class name, bounded — ../../../conventions/errors.md.
+            error_type = "CancelledError"
             span.set_status(Status(StatusCode.ERROR))
             span.set_attribute(ERROR_TYPE, error_type)
             raise
@@ -125,9 +126,48 @@ returns a `StreamPart` dictionary with `type`, `ns`, and `data` regardless of
 whether one or several stream modes are selected. The v1 default yields tuples
 for multiple modes; do not mix the two schemas. See `../../../compatibility.md`.
 
+### The rule both streaming wrappers follow
+
+A generator does not get its own `contextvars` context. If the agent span is
+made current with `start_as_current_span` and the body yields, the span stays
+current **in the consumer** — the caller's next span becomes a child of the
+agent span, interleaved streams unwind their `detach()` tokens out of order,
+and the SDK logs `Failed to detach context`. Full explanation:
+`../provider_sdk.md`, "Why the span is never current across a `yield`".
+
+A streaming agent wrapper cannot simply stop making the span current, though:
+the model callback and tool middleware create their spans *during* the agent's
+work, and that work happens while the generator is **resumed**. So the span and
+the invocation counters must be current for each resumption and not between
+them. One helper says exactly that, and both wrappers use it:
+
+```python
+from contextlib import contextmanager
+
+from opentelemetry import trace
+
+from observability.agent_counters import InvocationCounters, bind_counters
+
+
+@contextmanager
+def agent_step(span, counters: InvocationCounters):
+    """Make the agent span and its counters current for ONE resumption.
+
+    Never put a `yield` of the streaming wrapper inside this. That is the
+    entire point of it.
+    """
+    with trace.use_span(span, end_on_exit=False, record_exception=False):
+        with bind_counters(counters):
+            yield
+```
+
+Because each step must be bracketed, the wrappers iterate the stream
+explicitly rather than with `async for`.
+
 ### Token streaming
 
 ```python
+from observability.agent_counters import InvocationCounters
 from observability.genai_attributes import GENAI_CONVERSATION_ID
 from observability.genai_metrics import record_agent_time_to_first_chunk
 
@@ -138,125 +178,148 @@ async def stream_agent_tokens(
     started_at = time.perf_counter()
     first_chunk_seen = False
     error_type: str | None = None
+    counters = InvocationCounters()
 
-    with tracer.start_as_current_span(
+    # start_span, not start_as_current_span: this function yields.
+    span = tracer.start_span(
         f"invoke_agent {agent_name}",
-        record_exception=False,
         attributes={
             GENAI_OPERATION_NAME: "invoke_agent",
             GENAI_AGENT_NAME: agent_name,
             "gen_ai.request.stream": True,
         },
-    ) as span, invocation_counters() as counters:
-        if conversation_id:
-            span.set_attribute(GENAI_CONVERSATION_ID, conversation_id)
+    )
+    if conversation_id:
+        span.set_attribute(GENAI_CONVERSATION_ID, conversation_id)
 
-        try:
-            async for part in agent.astream(
+    try:
+        with agent_step(span, counters):
+            stream = agent.astream(
                 {"messages": messages},
                 stream_mode="messages",
                 version="v2",
-            ):
-                if part["type"] != "messages":
-                    continue
-                token, metadata = part["data"]
-                if not first_chunk_seen:
-                    elapsed = time.perf_counter() - started_at
-                    # Organisation-owned: there is no standard agent-level
-                    # TTFC attribute. gen_ai.response.time_to_first_chunk
-                    # belongs to a single model request, not to an agent run.
-                    span.set_attribute("app.agent.time_to_first_chunk", elapsed)
-                    record_agent_time_to_first_chunk(elapsed, agent_name=agent_name)
-                    first_chunk_seen = True
+            ).__aiter__()
 
-                yield token
-        except asyncio.CancelledError:
-            error_type = "cancelled"
-            span.set_status(Status(StatusCode.ERROR))
-            span.set_attribute(ERROR_TYPE, error_type)
-            raise
-        except Exception as exc:
-            error_type = type(exc).__name__
-            span.set_status(Status(StatusCode.ERROR))
-            span.set_attribute(ERROR_TYPE, error_type)
-            raise
-        finally:
-            record_agent_result(
-                started_at=started_at,
-                agent_name=agent_name,
-                error_type=error_type,
-                counters=counters,
-            )
+        while True:
+            # The agent actually runs inside this block, so the span and the
+            # counters are current exactly where the callback needs them.
+            with agent_step(span, counters):
+                try:
+                    part = await stream.__anext__()
+                except StopAsyncIteration:
+                    break
+
+            if part["type"] != "messages":
+                continue
+            token, metadata = part["data"]
+            if not first_chunk_seen:
+                elapsed = time.perf_counter() - started_at
+                # Organisation-owned: there is no standard agent-level
+                # TTFC attribute. gen_ai.response.time_to_first_chunk
+                # belongs to a single model request, not to an agent run.
+                span.set_attribute("app.agent.time_to_first_chunk", elapsed)
+                record_agent_time_to_first_chunk(elapsed, agent_name=agent_name)
+                first_chunk_seen = True
+
+            # Outside agent_step: nothing of ours is current in the consumer.
+            yield token
+    except asyncio.CancelledError:
+        error_type = "CancelledError"
+        span.set_status(Status(StatusCode.ERROR))
+        span.set_attribute(ERROR_TYPE, error_type)
+        raise
+    except Exception as exc:
+        error_type = type(exc).__name__
+        span.set_status(Status(StatusCode.ERROR))
+        span.set_attribute(ERROR_TYPE, error_type)
+        raise
+    finally:
+        record_agent_result(
+            started_at=started_at,
+            agent_name=agent_name,
+            error_type=error_type,
+            counters=counters,
+        )
+        # start_span has no context manager, so the end is explicit.
+        span.end()
 ```
 
 ### Step updates
+
+Same skeleton; only the stream mode and the per-part handling change.
 
 ```python
 async def stream_agent_updates(agent, messages: list, *, agent_name: str):
     started_at = time.perf_counter()
     step_count = 0
     error_type: str | None = None
+    counters = InvocationCounters()
 
-    with tracer.start_as_current_span(
+    span = tracer.start_span(
         f"invoke_agent {agent_name}",
-        record_exception=False,
         attributes={
             GENAI_OPERATION_NAME: "invoke_agent",
             GENAI_AGENT_NAME: agent_name,
         },
-    ) as span, invocation_counters() as counters:
-        try:
-            async for part in agent.astream(
+    )
+    try:
+        with agent_step(span, counters):
+            stream = agent.astream(
                 {"messages": messages},
                 stream_mode="updates",
                 version="v2",
-            ):
-                if part["type"] != "updates":
-                    continue
-                update = part["data"]
-                step_count += 1
-                yield update
-        except asyncio.CancelledError:
-            error_type = "cancelled"
-            span.set_status(Status(StatusCode.ERROR))
-            span.set_attribute(ERROR_TYPE, error_type)
-            raise
-        except Exception as exc:
-            error_type = type(exc).__name__
-            span.set_status(Status(StatusCode.ERROR))
-            span.set_attribute(ERROR_TYPE, error_type)
-            raise
-        finally:
-            span.set_attribute("app.agent.step_count", step_count)
-            record_agent_result(
-                started_at=started_at,
-                agent_name=agent_name,
-                error_type=error_type,
-                counters=counters,
-            )
+            ).__aiter__()
+
+        while True:
+            with agent_step(span, counters):
+                try:
+                    part = await stream.__anext__()
+                except StopAsyncIteration:
+                    break
+
+            if part["type"] != "updates":
+                continue
+            step_count += 1
+            yield part["data"]
+    except asyncio.CancelledError:
+        error_type = "CancelledError"
+        span.set_status(Status(StatusCode.ERROR))
+        span.set_attribute(ERROR_TYPE, error_type)
+        raise
+    except Exception as exc:
+        error_type = type(exc).__name__
+        span.set_status(Status(StatusCode.ERROR))
+        span.set_attribute(ERROR_TYPE, error_type)
+        raise
+    finally:
+        span.set_attribute("app.agent.step_count", step_count)
+        record_agent_result(
+            started_at=started_at,
+            agent_name=agent_name,
+            error_type=error_type,
+            counters=counters,
+        )
+        span.end()
 ```
 
 ### Both at once
 
+Only the per-part branch differs. The `while` loop, the `agent_step`
+bracketing, and the `finally` are identical to the two wrappers above.
+
 ```python
-async for part in agent.astream(
-    {"messages": messages},
-    stream_mode=["updates", "messages"],
-    version="v2",
-):
-    stream_mode = part["type"]
-    chunk = part["data"]
-    if stream_mode == "updates":
-        step_count += 1
-        yield {"type": "update", "data": chunk}
-    elif stream_mode == "messages":
-        token, metadata = chunk
-        if not first_chunk_seen:
-            span.set_attribute(
-                "app.agent.time_to_first_chunk", time.perf_counter() - started_at
-            )
-            first_chunk_seen = True
-        yield {"type": "token", "data": token.content}
+            if part["type"] == "updates":
+                step_count += 1
+                yield {"type": "update", "data": part["data"]}
+            elif part["type"] == "messages":
+                token, metadata = part["data"]
+                if not first_chunk_seen:
+                    span.set_attribute(
+                        "app.agent.time_to_first_chunk",
+                        time.perf_counter() - started_at,
+                    )
+                    first_chunk_seen = True
+                yield {"type": "token", "data": token.content}
 ```
 
 Because the call opts into v2, both single-mode and multi-mode streams use the
@@ -318,7 +381,8 @@ Use `invoke_workflow` for the coordinating process and `invoke_agent` for each a
 ## Verify before moving on
 
 - Exactly one `invoke_agent <name>` span per invocation.
-- Every model and tool span is a **child** of it, not a sibling. If they are siblings, context was lost — check that the agent runs in the same task/context where the span was made current.
+- Every model and tool span is a **child** of it, not a sibling. If they are siblings, context was lost — check that the agent runs in the same task/context where the span was made current, and that a streaming wrapper brackets each resumption with `agent_step`.
+- **Streaming only, and easy to miss:** a span the *consumer* creates between two streamed chunks is a child of the request span, **not** of `invoke_agent`. If it nests under `invoke_agent`, the wrapper is holding the span current across a `yield`.
 - Streaming runs have `app.agent.time_to_first_chunk`, and it is **larger** than the first model span's `gen_ai.response.time_to_first_chunk`. If they are equal, one of them is measuring the wrong thing.
 - Both streaming wrappers record `gen_ai.invoke_agent.inference_calls` and `gen_ai.invoke_agent.tool_calls` once, with values matching child spans even on error or cancellation.
 - Every stream call opts into v2 and consumes `StreamPart["type"]` / `["data"]`; no v1 tuple unpacking remains.

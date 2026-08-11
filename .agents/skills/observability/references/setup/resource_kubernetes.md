@@ -46,3 +46,11 @@ derivation; do not add a competing application rule. See the
 
 Failure signal: if every replica has the same ID, a deployment ordinal,
 service name, or UUID created before a worker fork owns the attribute.
+
+---
+
+## Then
+
+- back to `resource_identity.md` if any ownership question is still open;
+- multiple telemetry-producing processes in one container: `resource_processes.md`;
+- then continue with `sdk_bootstrap.md`.

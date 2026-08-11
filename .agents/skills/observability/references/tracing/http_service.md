@@ -2,6 +2,12 @@
 
 The framework owns the request boundary. Your job is the layer underneath it: the business operations that explain why a request was slow or wrong.
 
+The code here is **FastAPI**, which is what this skill supports. Everything
+except the two framework hooks — the exception handler and the route-template
+lookup — is framework-independent: span selection, route templates, outbound
+calls, attributes, and streaming all apply unchanged to any ASGI or WSGI
+framework whose instrumentation owns the `SERVER` span.
+
 ---
 
 ## The trace shape you are aiming for
@@ -21,7 +27,7 @@ Auto-instrumentation gives you the first, third, and fifth lines. You write the 
 
 ## Do not create a second server span
 
-If FastAPI/Flask/Django instrumentation is active, it already extracts inbound trace context and starts the `SERVER` span. Do not call `propagate.extract()` in a handler and do not open another root span — you would detach the trace from its caller.
+If FastAPI instrumentation is active, it already extracts inbound trace context and starts the `SERVER` span. Do not call `propagate.extract()` in a handler and do not open another root span — you would detach the trace from its caller.
 
 A manual span inside the handler automatically becomes a child of the server span, because the server span is current:
 
@@ -139,7 +145,7 @@ Set these at span creation where possible, so a sampler can use them:
 | Attribute | Source |
 | --- | --- |
 | `http.route`, `http.request.method`, `http.response.status_code` | auto-instrumentation |
-| `app.tenant.tier` or similar bounded segment | authenticated identity |
+| `app.tenant.tier` — one key, everywhere (`../conventions/naming.md`) | authenticated identity |
 | `app.workflow.name` | which product flow this endpoint serves |
 | `user.id`, `session.id` | authenticated identity, if privacy policy allows — traces only, never metrics |
 | `gen_ai.conversation.id` | GenAI services, see `genai/attributes.md` |

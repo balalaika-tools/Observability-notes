@@ -18,6 +18,9 @@ wrap_tool_call     -> tool observability      every physical tool execution
 outer wrapper      -> whole-agent observability the user-visible unit of work
 ```
 
+None of the three sees retrieval — that is your own code, and its spans live in
+`../retrieval.md`.
+
 They compose into the trace you want:
 
 ```
@@ -41,7 +44,7 @@ ModelRetryMiddleware
     ↓
 actual model invocation
     ↓
-OTelLLMCallback          <- fires here, once per physical attempt
+OTelModelCallback          <- fires here, once per physical attempt
 ```
 
 So retries need no retry-specific tracing code. Attempt one, attempt two, and attempt three each produce their own model span, with their own duration, status, and token counts, for free.
@@ -63,15 +66,29 @@ Nothing in the framework emits a span for "one agent invocation." Without it, th
 Each step is independently verifiable, so build and check them in this order:
 
 1. **SDK bootstrap** — providers, exporters, shutdown. `../../../setup/sdk_bootstrap.md`
-2. **Model callback** — attach to the model, confirm one span per model call with token usage. `model_callback.md` + `../token_usage.md`
-3. **Tool middleware** — confirm one span per tool execution. `tools_and_middleware.md`
-4. **Outer agent span** — confirm model and tool spans nest under it. `streaming_and_agent_span.md`
-5. **Metrics** — `../../../metrics/genai.md`
-6. **Logging** — `../../../logging/structlog.md`, then `../../../logging/genai.md`
+2. **The recorder modules** — `observability/genai_metrics.py` and
+   `observability/agent_counters.py`, from `../../../metrics/genai.md`. Every
+   tracing layer below imports them, so they come **before** the tracing code,
+   not after it. Build the module here; the dashboards, cardinality traps, and
+   fan-out rationale in that file can wait until step 6.
+3. **Model callback** — attach to the model, confirm one span per model call with token usage. `model_callback.md` + `../token_usage.md`
+4. **Tool middleware** — confirm one span per tool execution. `tools_and_middleware.md`
+5. **Outer agent span** — confirm model and tool spans nest under it. `streaming_and_agent_span.md`
+6. **Metrics** — the rest of `../../../metrics/genai.md`: instruments beyond the module, dashboards, alerting.
+7. **Logging** — `../../../logging/structlog.md`, then `../../../logging/genai.md`
 
-Do not build all four layers and then debug. A missing token count is trivial to find at step 2 and painful at step 5.
+Do not build every layer and then debug. A missing token count is trivial to find at step 3 and painful at step 6.
 
-If the agent does retrieval, add embedding and retrieval spans as well — they are made by your retriever code, which no callback or middleware can see. The span shapes are in `../provider_sdk.md`, "Other operations", and they are the same on both paths.
+Step 2 is not optional sequencing advice. `model_callback.md`,
+`tools_and_middleware.md`, and `streaming_and_agent_span.md` all import
+`record_model_operation`, `record_time_to_first_chunk`,
+`record_tool_execution`, `record_agent_invocation`, `invocation_counters`,
+`bind_counters`, and `current_counters`. Writing the tracing layer first
+produces a pile of `ImportError`s, and the tempting fix — inventing local
+recorder functions — is exactly the label drift the shared module exists to
+prevent.
+
+If the agent does retrieval, add embedding and retrieval spans as well — they are made by your retriever code, which no callback or middleware can see. The span shapes are in `../retrieval.md`, and they are the same on both paths.
 
 ---
 
@@ -92,11 +109,11 @@ observability/
 
 agents/
     observability/
-        callbacks.py         OTelLLMCallback, OTelStreamingLLMCallback, and
-                             extract_usage_metadata() — the LangChain usage
-                             adapter, specified in ../token_usage.md
+        callbacks.py         OTelModelCallback and extract_usage_metadata() —
+                             the LangChain usage adapter, specified in
+                             ../token_usage.md
         middleware.py        trace_tool_call
-        agent_span.py        invoke_agent / streaming wrappers
+        agent_span.py        invoke_agent / streaming wrappers, agent_step()
 ```
 
 The split is load-bearing: `observability/` is imported by every entry point, including workers with no LLM code. Nothing in it may import `langchain_core`.
@@ -115,20 +132,20 @@ from langchain.agents.middleware import (
 )
 from langchain.chat_models import init_chat_model
 
-from agents.observability.callbacks import OTelLLMCallback
+from agents.observability.callbacks import OTelModelCallback
 from agents.observability.middleware import trace_tool_call
 
 # One handler instance is enough; it keys its state by run_id.
-otel_llm_callback = OTelLLMCallback()
+otel_model_callback = OTelModelCallback()
 
 main_model = init_chat_model("openai:gpt-5", streaming=False).with_config(
-    callbacks=[otel_llm_callback],
+    callbacks=[otel_model_callback],
 )
 
 # The summarization model gets the SAME callback, so its calls appear as
 # ordinary model spans instead of vanishing into the middleware.
 summary_model = init_chat_model("openai:gpt-5-mini", streaming=False).with_config(
-    callbacks=[otel_llm_callback],
+    callbacks=[otel_model_callback],
 )
 
 agent = create_agent(

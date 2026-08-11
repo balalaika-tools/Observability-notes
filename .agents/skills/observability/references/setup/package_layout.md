@@ -64,7 +64,7 @@ observability/
 
 agents/
     observability/
-        callbacks.py            OTelLLMCallback  (imports langchain_core)
+        callbacks.py            OTelModelCallback  (imports langchain_core)
         middleware.py           trace_tool_call  (imports langchain.agents.middleware)
         agent_span.py           invoke_agent wrapper
 ```
@@ -166,7 +166,7 @@ For a plain-dataclass or `os.environ`-based config, add fields in the same style
 | --- | --- | --- |
 | `OTEL_SERVICE_NAME` | Logical service identity. Required. | none — fail loudly |
 | `SERVICE_NAMESPACE` | System/application grouping. Required. | none — fail loudly |
-| `SERVICE_VERSION` | Immutable build identity; full Git SHA for PDMA | `unknown` |
+| `SERVICE_VERSION` | Immutable build identity; prefer the full Git commit SHA | `unknown` |
 | `SERVICE_INSTANCE_ID` | Runtime instance identity; platform-supplied when possible | UUID v4 per process |
 | `ENVIRONMENT` | Becomes `deployment.environment.name` | `development` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Base OTLP endpoint | `http://localhost:4318` |

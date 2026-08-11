@@ -12,7 +12,7 @@ indistinguishable during an incident.
 - [Configuration modes](#configuration-modes)
 - [Version policy](#version-policy)
 - [Runtime routing](#route-runtime-identity)
-- [PDMA mapping](#pdma-mapping)
+- [Repository mapping](#record-the-repositorys-concrete-mapping)
 - [Failure modes](#failure-modes)
 
 ---
@@ -23,8 +23,8 @@ Set these on the `Resource`, not repeatedly on individual spans:
 
 | Attribute | Meaning | Example |
 | --- | --- | --- |
-| `service.namespace` | Stable system or application grouping | `product-data-management-automation` |
-| `service.name` | Logical component; identical across its replicas | `pdma-api`, `pdma-worker` |
+| `service.namespace` | Stable system or application grouping | `order-management` |
+| `service.name` | Logical component; identical across its replicas | `orders-api`, `orders-worker` |
 | `service.instance.id` | One running service instance | platform identity or process UUID |
 | `deployment.environment.name` | Deployment tier | `development`, `test`, `staging`, `production`, custom `uat` |
 | `service.version` | Immutable software version/build | full Git commit SHA |
@@ -56,8 +56,17 @@ Assign ownership before writing configuration:
 | Service instance ID | Runtime platform adapter or process startup |
 | `k8s.*`, `container.*`, `aws.ecs.*`, `cloud.*` | Resource detector or unambiguous Collector enrichment |
 
-The application-provided service identity wins. Configure enrichment with
-`override: false` so a detector cannot replace it.
+The application-provided service identity wins. The mechanism differs by
+component and the two are not interchangeable:
+
+| Component | Setting that preserves the application's value |
+| --- | --- |
+| Collector `resource` / `attributes` processor | `action: insert` (`upsert` overwrites) |
+| Collector `resourcedetection` processor | `override: false` |
+| SDK resource detectors | merge the detected resource *under* the configured one |
+
+Getting this wrong is silent: a service correctly reporting `uat` is relabelled
+`production` by the gateway, and nothing on the application side can see it.
 
 A gateway Collector must not derive `service.instance.id` from its own pod,
 container, task, hostname, or IP. Those values describe the Collector, not the
@@ -80,8 +89,8 @@ Pick one configuration owner for the service attributes.
 **Code-based SDK setup** — the default in this skill:
 
 ```bash
-OTEL_SERVICE_NAME=pdma-worker
-SERVICE_NAMESPACE=product-data-management-automation
+OTEL_SERVICE_NAME=orders-worker
+SERVICE_NAMESPACE=order-management
 SERVICE_VERSION=<full-git-sha>
 SERVICE_INSTANCE_ID=<runtime-supplied-id>
 ENVIRONMENT=development
@@ -93,8 +102,8 @@ set the same keys in `OTEL_RESOURCE_ATTRIBUTES`.
 **Zero-code setup** — the launcher owns the SDK:
 
 ```bash
-OTEL_SERVICE_NAME=pdma-worker
-OTEL_RESOURCE_ATTRIBUTES="service.namespace=product-data-management-automation,deployment.environment.name=development,service.version=<full-git-sha>,service.instance.id=<runtime-supplied-id>"
+OTEL_SERVICE_NAME=orders-worker
+OTEL_RESOURCE_ATTRIBUTES="service.namespace=order-management,deployment.environment.name=development,service.version=<full-git-sha>,service.instance.id=<runtime-supplied-id>"
 ```
 
 Do not add an in-code `TracerProvider` or a second resource builder in this
@@ -141,20 +150,28 @@ identity in the selected startup adapter before building the immutable
 
 ---
 
-## PDMA mapping
+## Record the repository's concrete mapping
 
-The PDMA services use one namespace and distinct logical service names:
+Write the actual values down once, in the repository — its agent-instruction file, deployment manifest, or a `local/` reference next to this skill —
+in this shape:
 
 ```text
-service.namespace = product-data-management-automation
-service.name      = pdma-api | pdma-worker
+service.namespace = <one stable grouping for the whole system>
+service.name      = <one per deployable component>
 service.version   = full Git commit SHA supplied by CI/build
 ```
 
-Each replica receives its instance ID from Kubernetes, Docker, or ECS using the
-rules above. API and worker may share the same `service.version` when they were
-built from the same commit; they remain distinct because `service.name`
-differs.
+Do **not** put a concrete namespace in this file. It is loaded for every
+service, and a namespace sitting in context is a namespace that gets adopted by
+an unrelated one.
+
+Sibling components may share a `service.version` when they were built from the
+same commit; they remain distinct because `service.name` differs. Each replica
+receives its instance ID from Kubernetes, Docker, or ECS using the rules above.
+
+Repository-specific mappings maintained alongside this skill live in
+`references/local/` — see `../local/pdma_identity.md`, which applies **only**
+when the target repository is PDMA.
 
 ---
 

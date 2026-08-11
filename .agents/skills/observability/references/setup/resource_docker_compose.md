@@ -29,3 +29,10 @@ those names, so they are not durable instance identity.
 
 Failure signal: if telemetry records the developer machine hostname, host-side
 Compose interpolation ran before container creation.
+
+---
+
+## Then
+
+- back to `resource_identity.md` if any ownership question is still open;
+- then continue with `sdk_bootstrap.md`.

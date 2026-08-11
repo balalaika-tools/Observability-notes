@@ -1,5 +1,10 @@
 # Production Collector Configuration
 
+**Do not open this file unless a production Collector config is being
+written or changed.** Read `../tracing/production_policy.md` first — it owns
+the retention decisions this file implements, and implementing them without
+the measurements it requires produces a config with unjustified numbers in it.
+
 Production has a different job from staging: keep what explains failures, drop what costs money and teaches nothing, and never leak content into a backend that should not hold it.
 
 ## Contents
@@ -53,7 +58,19 @@ network, and Collector cost. It also hides every status for that URL and may
 suppress HTTP metrics, so verify both effects before enabling it.
 
 Use the Collector filter only for a verified leaf or self-contained server span.
-The pinned Collector uses `trace_conditions`:
+A span whose condition evaluates true is **dropped**.
+
+The pinned Collector accepts two spellings, and **the path prefix rule differs
+between them** — which is the actual trap here, because mixing them fails only
+at startup:
+
+| Key | Paths must be | |
+| --- | --- | --- |
+| `trace_conditions` | fully prefixed: `span.attributes[...]` | context-inference form; unprefixed `attributes[...]` is rejected |
+| `traces: { span: [...] }` | either `span.attributes[...]` or bare `attributes[...]` | the long-standing per-signal, per-context form |
+
+Do not reach for `trace_statements`: that is the *transform* processor's key and
+it modifies telemetry rather than dropping it.
 
 ```yaml
 processors:
@@ -74,11 +91,31 @@ parent with instrumented children creates orphaned telemetry. If the endpoint
 does real child work, retain or tail-sample the whole trace instead.
 
 When enabled, insert this processor after resource enrichment and before
-redaction/tail sampling. Validate the exact config against the pinned image.
+redaction/tail sampling. Validate the exact config against the pinned image —
+`../../scripts/validate_skill.py --collector-image` now does this for **every**
+YAML fence on this page, wrapping partial snippets in a minimal config so a
+processor's schema is checked rather than assumed.
 
 ---
 
 ## Configuration
+
+**Every value marked `# MEASURE:` below is a placeholder that happens to be
+syntactically valid so the file can be image-validated. None of them is a
+default.** Replace each one with the measurement named on its line before this
+config reaches production; the inputs are collected in
+`../tracing/production_policy.md`, "Required measurements". A config still
+carrying the numbers below has not been sized — it has been pasted.
+
+| Knob | Derive from |
+| --- | --- |
+| `decision_wait` | measured p99 complete-trace arrival + export/network jitter |
+| `num_traces`, `expected_new_traces_per_sec` | measured new traces/second × `decision_wait` × burst headroom |
+| `decision_cache` sizes | active capacity × late-span headroom, biased to the more common outcome |
+| `latency.threshold_ms` | the service's own "slow" definition, above normal p95 |
+| `numeric_attribute.min_value` | the token count that actually marks an expensive call here |
+| `sampling_percentage` | measured volume, backend budget, and minimum useful daily samples |
+| `memory_limiter.limit_mib` | the container memory limit, minus headroom |
 
 ```yaml
 # services/otel-collector/config.prod.yaml
@@ -103,14 +140,18 @@ processors:
   # limit_mib must stay below the container memory limit.
   memory_limiter:
     check_interval: 1s
-    limit_mib: 1024
+    limit_mib: 1024              # MEASURE: container memory limit minus headroom
     spike_limit_mib: 256
 
   resource/environment:
     attributes:
       - key: deployment.environment.name
         value: production
-        action: upsert
+        # `insert` fills the gap for a sender that did not set it. `upsert`
+        # would overwrite a correctly self-reporting service — a `uat`
+        # deployment silently relabelled `production`, undetectable from the
+        # application side. One owner per attribute: the application wins.
+        action: insert
 
   # Universal secrets: removed on every path, including Langfuse.
   attributes/drop_secrets:
@@ -125,11 +166,18 @@ processors:
         action: delete
       - key: db.statement
         action: delete
+      - key: user.email
+        action: delete
+
+  # Exception detail on SPANS only. This skill's error contract forbids
+  # first-party exception events, but auto-instrumentation still emits them.
+  # Never apply this to the logs pipeline: the correlated log record is where
+  # the stack trace is supposed to live (`../logging/structlog.md`).
+  attributes/drop_span_exception_detail:
+    actions:
       - key: exception.message
         action: delete
       - key: exception.stacktrace
-        action: delete
-      - key: user.email
         action: delete
 
   # LLM payloads: removed on the general APM path only.
@@ -149,16 +197,23 @@ processors:
         action: delete
 
   tail_sampling:
-    # Long enough for a normal trace to finish. Too short silently truncates
-    # traces; too long grows memory and delays export.
-    decision_wait: 30s
-    num_traces: 50000
-    expected_new_traces_per_sec: 500
-    # Example cache sizes. Keep late-span decisions much longer than active
-    # trace data; bias capacity toward the more common keep/drop result.
+    # Too short silently truncates traces; too long grows memory and delays
+    # export. It must exceed p99 complete-trace ARRIVAL, not p99 duration.
+    decision_wait: 30s           # MEASURE: p99 complete-trace arrival + jitter
+    num_traces: 50000            # MEASURE: traces/s x decision_wait x burst
+    expected_new_traces_per_sec: 500   # MEASURE: peak new traces/second
+    # Keep late-span decisions much longer than active trace data; bias
+    # capacity toward the more common keep/drop result.
     decision_cache:
-      sampled_cache_size: 500000
-      non_sampled_cache_size: 500000
+      sampled_cache_size: 500000       # MEASURE: late-span decision headroom
+      non_sampled_cache_size: 500000   # MEASURE: late-span decision headroom
+    # Policies are evaluated as an OR: a trace is kept if ANY policy votes to
+    # keep it. There is no "everything else" policy and no negation operator,
+    # so the probabilistic policy below is evaluated against every trace. The
+    # traces it selects that an earlier policy already kept are simply kept
+    # once — which is why the net effect still is "errors/slow/important 100%,
+    # normal successes at the configured percentage." It is also why configured
+    # percentages cannot be summed to predict total retention.
     policies:
       - name: keep-errors
         type: status_code
@@ -168,7 +223,7 @@ processors:
       - name: keep-slow
         type: latency
         latency:
-          threshold_ms: 15000
+          threshold_ms: 15000    # MEASURE: this service's "slow", above normal p95
 
       - name: keep-provider-failures
         type: string_attribute
@@ -180,7 +235,7 @@ processors:
         type: numeric_attribute
         numeric_attribute:
           key: gen_ai.usage.input_tokens
-          min_value: 8000
+          min_value: 8000        # MEASURE: token count that marks an expensive call here
 
       - name: keep-guardrail-blocks
         type: boolean_attribute
@@ -188,10 +243,10 @@ processors:
           key: app.guardrail.blocked
           value: true
 
-      - name: sample-the-rest
+      - name: sample-normal-successes
         type: probabilistic
         probabilistic:
-          sampling_percentage: 5
+          sampling_percentage: 5   # MEASURE: volume, backend budget, minimum useful samples
 
   batch:
     timeout: 5s
@@ -258,6 +313,7 @@ service:
         - memory_limiter
         - resource/environment
         - attributes/drop_secrets
+        - attributes/drop_span_exception_detail
         - attributes/drop_payloads
         - tail_sampling
         - batch
@@ -271,6 +327,9 @@ service:
 
     logs:
       receivers: [otlp]
+      # No drop_span_exception_detail here. The error contract moved exception
+      # detail OUT of spans and INTO these records; deleting it here would
+      # delete the only copy that exists.
       processors:
         - memory_limiter
         - resource/environment
@@ -295,6 +354,12 @@ redaction             before data crosses a trust boundary
 tail_sampling         after the attributes its policies read exist
 batch                 last, so exporters send efficient payloads
 ```
+
+Redaction is also **per signal**: `attributes/drop_secrets` belongs on every
+pipeline, `attributes/drop_span_exception_detail` on traces only, and
+`attributes/drop_payloads` on the APM trace path only. A processor written for
+spans and reused on logs is how a stack trace disappears from the one place the
+error contract puts it.
 
 Redaction after fan-out is redaction that already leaked. Tail sampling before enrichment cannot see the attributes it filters on.
 
@@ -321,8 +386,8 @@ processors:
         where resource.attributes["service.version"] != nil
       - >
         set(span.attributes["langfuse.trace.metadata.tenant_tier"],
-            span.attributes["app.trace.dimension.tenant_tier"])
-        where span.attributes["app.trace.dimension.tenant_tier"] != nil
+            span.attributes["app.tenant.tier"])
+        where span.attributes["app.tenant.tier"] != nil
 
 exporters:
   otlphttp/langfuse:
@@ -345,6 +410,7 @@ service:
         - memory_limiter
         - resource/environment
         - attributes/drop_secrets
+        - attributes/drop_span_exception_detail
         - attributes/drop_payloads     # APM does not get payloads
         - tail_sampling
         - batch
@@ -356,11 +422,21 @@ service:
         - memory_limiter
         - resource/environment
         - attributes/drop_secrets      # secrets still go
+        - attributes/drop_span_exception_detail
         - transform/langfuse           # but payloads stay
         - tail_sampling
         - batch
       exporters: [otlphttp/langfuse]
 ```
+
+**Naming `tail_sampling` in two pipelines allocates it twice.** The Collector
+builds a separate processor instance per pipeline, so the configuration above
+holds two `num_traces` buffers and two pairs of decision caches — twice the
+memory `estimate_trace_budget.py` reports for one instance. Either budget for
+`N ×` the single-instance figure (pass `--sampling-pipelines N`), or sample once
+and fan out afterwards using a routing/forward connector so only one sampler
+instance exists. The two instances do agree on which traces to keep: the
+probabilistic policy hashes the trace ID with the same default salt in both.
 
 The mapping **copies**; it does not rename or delete. The neutral `app.*` and `gen_ai.*` attributes survive, so the APM payload stays vendor-neutral and swapping a backend is a Collector change rather than a code deployment.
 
@@ -414,10 +490,11 @@ num_traces >= new_traces_per_second * decision_wait_seconds * burst_headroom
 ```
 
 Use `../../scripts/estimate_trace_budget.py` to calculate a reproducible lower
-bound. Serialized trace size is not Collector heap size, so load-test and tune
-against real memory. Configure decision caches much larger than `num_traces`
-when late spans are possible, and bias them toward the more common sampled or
-non-sampled outcome.
+bound, and pass `--sampling-pipelines N` when `tail_sampling` is named in more
+than one pipeline. Serialized trace size is not Collector heap size, so
+load-test and tune against real memory. Configure decision caches much larger
+than `num_traces` when late spans are possible, and bias them toward the more
+common sampled or non-sampled outcome.
 
 Monitor traces dropped before decision, late spans, policy evaluation errors,
 decision latency, memory-limiter activity, and the actual effective retained
@@ -481,11 +558,14 @@ Telemetry loss is preferable to application downtime. Silent telemetry loss duri
 ## Before calling it done
 
 - [ ] `otelcol validate` passes against the production image.
+- [ ] No `# MEASURE:` value from this file survives unreplaced.
 - [ ] `memory_limiter` is first, and its limit is below the container memory limit.
 - [ ] No metrics pipeline contains a sampling processor.
 - [ ] Errors and slow traces are kept at 100%; the sampled percentage is justified by measured volume.
-- [ ] `decision_wait` exceeds the p99 trace duration.
-- [ ] `num_traces` and decision caches survive measured bursts and late spans.
+- [ ] `decision_wait` exceeds measured **p99 complete-trace arrival plus jitter**, not merely p99 trace duration.
+- [ ] `num_traces` and decision caches survive measured bursts and late spans, multiplied by the number of pipelines that name `tail_sampling`.
+- [ ] `deployment.environment.name` uses `action: insert`, so a service that sets its own environment is not relabelled.
+- [ ] `exception.stacktrace` is deleted on traces only; a canary exception's stack trace still arrives in the log backend.
 - [ ] Trace-ID-aware routing exists in front of any scaled tail-sampling tier.
 - [ ] Successful-noise handling preserves failed probes and does not orphan instrumented children.
 - [ ] Canary secrets do not reach any backend.
