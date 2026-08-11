@@ -15,7 +15,8 @@ attributes on spans." The goal is to make an LLM trace tell the story of one
 user request from the API boundary, through retrieval and model calls, through
 tool execution, and finally into Langfuse or another backend.
 
-Last verified against OpenTelemetry GenAI semantic conventions v1.43.0 and semconv-genai commit c26a2c21 (2026-07-17) on 2026-07-24.
+Compatibility reviewed against OpenTelemetry semantic conventions v1.44.0 and
+semconv-genai commit `46d43c89` (2026-08-09) on 2026-08-10.
 
 ## 🧭 The Mental Model
 
@@ -229,11 +230,14 @@ may not be first-class filters in Langfuse.
 
 ## 📦 Inference Spans
 
-An inference span represents one logical model operation from the caller's point
-of view. It should start when the request is issued and end when the response is
-fully received, an error is raised, or the operation is cancelled. If the client
-performs automatic retries internally, the span should cover the whole logical
-operation.
+An inference span represents one physical model request. It should start when
+that attempt is issued and end when its response is fully received, it fails, or
+it is cancelled. A retry is another physical request and gets another inference
+span; the parent agent/workflow span represents the logical operation across
+attempts. If a provider SDK retries invisibly, use its supported retry hooks or
+configure application-owned retries when per-attempt latency and failures are
+operationally important. Do not wrap an already traced provider/framework call
+with a second inference span.
 
 Recommended inference shape:
 
@@ -245,7 +249,7 @@ Recommended inference shape:
 | Important creation-time attributes | Operation, provider, request model, route, tenant, and sampling-relevant flags. |
 | Response attributes | Response ID, response model, finish reasons. |
 | Usage attributes | Input, output, cache, and reasoning token counts when available. |
-| Error attributes | Span status, recorded exception, and `error.type`. |
+| Error attributes | Span status and bounded `error.type`; exception detail belongs in one correlated log record. |
 
 Common inference attributes:
 
@@ -483,6 +487,13 @@ Prompts, system instructions, tool definitions, tool arguments, retrieved
 documents, and model outputs can contain sensitive data. OpenTelemetry GenAI
 content attributes are opt-in for that reason.
 
+Keep `CAPTURE_AI_CONTENT=false` by default and gate collection itself, not only
+the final `span.set_attribute(...)` calls. A streaming wrapper that always
+buffers chunks, tool results, or retrieved documents still creates a sensitive
+in-memory payload even if it later decides not to export the attribute. With
+capture disabled, retain model identity, token usage, timing, finish reason,
+bounded outcomes, and errors without accumulating content.
+
 Current opt-in content attributes include:
 
 | Attribute | Meaning |
@@ -710,7 +721,9 @@ with tracer.start_as_current_span(
 
 Tools are important because agent failures often come from tools, not the model.
 A tool span should represent the actual tool execution, not merely the model's
-decision to call a tool.
+decision to call a tool. Create one span per execution attempt so a transient
+failure and its successful retry remain separately visible under the agent
+span.
 
 Recommended tool shape:
 
@@ -757,6 +770,12 @@ is not used for metrics or high-cardinality indexing.
 Agents and workflows are the parent concepts around multiple GenAI operations.
 Use them when a single user-visible task may involve several model calls, tool
 calls, retrievals, or memory operations.
+
+Use one trace per user turn or agent invocation. Do not keep a trace open for an
+entire conversation: it creates misleading durations, unbounded trace size, and
+tail-sampling windows that never see a complete trace. Correlate the separate
+turn traces with `gen_ai.conversation.id`; keep that high-cardinality value off
+metrics.
 
 ```text
 invoke_agent support_agent
@@ -820,6 +839,12 @@ def run_support_workflow(request: SupportRequest) -> AgentAnswer:
 
 The agent span should not contain raw chain-of-thought. If you capture a plan,
 capture a product-safe summary or use Langfuse with a deliberate privacy policy.
+
+Measure model time-to-first-chunk, agent time-to-first-chunk, and HTTP/API first
+byte separately. The model value measures provider responsiveness; the agent
+value includes planning, retrieval, tools, and possibly several model calls;
+the API value also includes transport and serialization. Reusing one timestamp
+for all three produces plausible but operationally misleading dashboards.
 
 ## 📦 Memory
 

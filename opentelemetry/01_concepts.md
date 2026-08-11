@@ -1212,9 +1212,10 @@ service should set `service.name` explicitly.
 ```python
 Resource.create(
     {
+        "service.namespace": "support-platform",
         "service.name": "chat-api",
-        "service.version": "git-sha-or-semver",
-        "service.instance.id": "pod-name-or-host-id",
+        "service.version": "immutable-git-sha",
+        "service.instance.id": "runtime-instance-id",
         "deployment.environment.name": "production",
         "cloud.region": "us-east-1",
         "k8s.namespace.name": "prod",
@@ -1224,6 +1225,7 @@ Resource.create(
 
 Good resource attributes:
 
+- stable service namespace;
 - service name;
 - service version;
 - deployment environment;
@@ -1243,6 +1245,22 @@ Bad resource attributes:
 Resources are attached to telemetry by the provider. Once a provider is created
 with a resource, telemetry from tracers and meters from that provider carries
 that resource.
+
+Production identity has stricter rules than the example values suggest:
+
+- `service.namespace` and `service.name` identify the logical service and stay
+  the same across replicas.
+- `service.instance.id` stays stable for one process/runtime instance and is
+  different between replicas. A request ID, Lambda invocation ID, deployment
+  name, or static service name is not an instance identity.
+- `service.version` is the immutable artifact version, preferably the full Git
+  SHA supplied by CI; do not use `latest`, a branch, or a rollout label.
+- Preserve native platform identity such as `k8s.pod.uid`, `container.id`, or
+  an ECS task ARN alongside service identity.
+- Give each attribute one owner. Do not set conflicting values in code,
+  deployment environment, and Collector enrichment.
+- A gateway Collector must not stamp application telemetry with the
+  Collector's own pod, container, host, or instance identity.
 
 ## 🔗 Context Propagation
 
@@ -1571,7 +1589,8 @@ exporters:
   otlphttp/traces:
     endpoint: https://apm.example.com/otlp
   prometheus_remote_write:
-    endpoint: https://prometheus.example.com/api/v1/write
+    http:
+      endpoint: https://prometheus.example.com/api/v1/write
 
 service:
   pipelines:

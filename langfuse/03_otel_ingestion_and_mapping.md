@@ -707,4 +707,4 @@ The real OTLP encoding may be protobuf or JSON. Before the transform, the same s
 - OpenTelemetry Collector telemetry transformations: <https://opentelemetry.io/docs/collector/transforming-telemetry/>
 - OpenTelemetry Collector transform processor: <https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/transformprocessor>
 - OpenTelemetry GenAI semantic conventions: <https://github.com/open-telemetry/semantic-conventions-genai>
-- OpenTelemetry GenAI spans, pinned revision: <https://github.com/open-telemetry/semantic-conventions-genai/blob/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a/docs/gen-ai/gen-ai-spans.md>
+- OpenTelemetry GenAI spans, pinned revision: <https://github.com/open-telemetry/semantic-conventions-genai/blob/46d43c8949afb53765a202e89f4534eeb75ca3fa/docs/gen-ai/gen-ai-spans.md>

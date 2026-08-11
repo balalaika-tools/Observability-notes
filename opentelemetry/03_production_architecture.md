@@ -277,7 +277,7 @@ processors:
       - key: db.statement
         action: delete
       - key: user.email
-        action: hash
+        action: delete
       - key: exception.message
         action: delete
       - key: exception.stacktrace
@@ -334,9 +334,10 @@ exporters:
       api-key: "${env:APM_API_KEY}"
 
   prometheus_remote_write:
-    endpoint: https://prometheus.example.com/api/v1/write
-    headers:
-      authorization: "Bearer ${env:PROMETHEUS_TOKEN}"
+    http:
+      endpoint: https://prometheus.example.com/api/v1/write
+      headers:
+        authorization: "Bearer ${env:PROMETHEUS_TOKEN}"
 
   otlphttp/logs:
     endpoint: https://logs.example.com/otlp
@@ -390,7 +391,9 @@ A practical default order:
 ```text
 memory_limiter
   -> resource enrichment
-  -> redaction/filter/transform
+  -> deterministic noise filter
+  -> universal secret redaction
+  -> destination-specific redaction/transform
   -> sampling or routing
   -> batch
   -> exporters
@@ -400,7 +403,10 @@ Reasons:
 
 - `memory_limiter` should run early so the Collector protects itself.
 - resource enrichment should happen before routing rules that use resource attributes.
-- redaction should happen before data crosses trust boundaries.
+- known leaf/self-contained noise can be removed before paying for redaction
+  and tail-sampling CPU, but only when the filter preserves trace shape;
+- universal redaction must run before destination-specific transforms and
+  before data crosses any trust boundary;
 - tail sampling needs enough trace attributes available to make decisions.
 - `batch` is usually near the end so exporters send efficient payloads.
 
@@ -526,6 +532,42 @@ Cons:
 Use it for broad volume reduction when losing some interesting traces is
 acceptable. Prefer parent-aware probability sampling.
 
+### Remove Deterministic Noise Before Sampling
+
+Filtering and sampling solve different problems. Suppress a span at the source
+when it is proven to be useless; use a Collector filter for telemetry that has
+already been produced; use tail sampling when the decision must preserve or
+drop the complete trace coherently.
+
+Typical candidates are successful liveness/readiness probes, metrics scrapes,
+static assets, and framework-internal heartbeat spans. Source exclusion saves
+SDK allocation, exporter queue space, network bandwidth, and Collector CPU, but
+it also removes every matching status. Before enabling it, verify that failed
+probe traces are either still required or fully covered by metrics and logs,
+that the instrumentation does not also suppress required HTTP metrics, and that
+the handler cannot create unrelated root spans through child instrumentation.
+
+When source suppression is too broad, a service- and route-specific Collector
+filter can remove only successful noise:
+
+```yaml
+processors:
+  filter/successful_probes:
+    error_mode: ignore
+    trace_conditions:
+      - >
+        resource.attributes["service.name"] == "my-api" and
+        IsMatch(span.attributes["http.route"],
+                "^/(health|healthz|live|ready|metrics)$") and
+        span.attributes["http.response.status_code"] == 200
+```
+
+Prefer the stable `http.route` template over span name and include service and
+outcome in the predicate. The filter processor removes individual spans, not
+complete traces. Dropping a parent can orphan children and correlated logs, so
+span filters belong only on verified leaf or self-contained telemetry. Use a
+trace-aware policy when the endpoint performs instrumented downstream work.
+
 ### Tail Sampling
 
 Tail sampling decides after the Collector has seen most or all spans in a trace:
@@ -575,8 +617,42 @@ Tail sampling requirements:
 
 - all spans for a trace must reach the same sampling decision point;
 - the Collector must hold traces in memory until the decision;
-- `decision_wait` must be long enough for normal traces to finish;
+- `decision_wait` must exceed measured p99 complete-trace arrival time plus
+  SDK/export/network jitter;
 - Collector memory, queue sizes, and dropped spans must be monitored.
+
+Choose production values from measurements, not from the `5%`, `10s`, or other
+numbers in examples. Record at least:
+
+- new traces per second, including high-volume routes and workflows;
+- average and p95 spans per trace;
+- p99 complete-trace arrival time;
+- error and slow-trace rates measured from full-fidelity metrics;
+- serialized bytes per span or trace;
+- critical outcomes and the minimum useful daily sample per route/workflow;
+- backend ingest/retention budget and expected outage-buffer window.
+
+A first capacity model is:
+
+```text
+daily retained spans
+  ~= traces_per_second
+     * average_spans_per_trace
+     * 86,400
+     * effective_retained_ratio
+
+minimum active trace capacity
+  ~= traces_per_second
+     * decision_wait_seconds
+     * burst_headroom
+```
+
+Important policies overlap, so measure the effective retained ratio from
+Collector output instead of adding configured percentages. Size sampled and
+non-sampled decision caches above the active trace buffer when late spans are
+possible, and load-test memory, early drops, late spans, and decision latency.
+If measurements do not exist yet, label the policy provisional and state what
+must be measured before it can be called production-ready.
 
 At scale, use trace-ID-aware load balancing before the tail-sampling tier so all
 spans for the same trace land on the same Collector instance.
@@ -701,6 +777,13 @@ Do not mark every span as failed merely because it emitted an error-level log: a
 successful fallback can make the containing operation successful even though a
 child operation failed.
 
+A handled 4xx response normally means the service enforced its contract, not
+that the server span failed. Decide explicitly how timeouts, cancellations, and
+client disconnects map to span status and a bounded `app.outcome`; apply the
+same policy in trace attributes, metrics, and logs. Test failure paths directly:
+an error-biased sampler cannot retain a trace whose failed boundary remained
+`UNSET`.
+
 > 💡 **Key insight:** `logger.error(...)` does not set the active span to ERROR — span status and log severity are completely independent fields that must both be set explicitly when an operation fails.
 
 #### Recommended Production Default
@@ -724,6 +807,27 @@ set the relevant span status or bounded `error.type`. Accept that an ordinary
 informational log may point to a trace that was not retained. Correlation depends
 on correct trace context and backend retention, not on traces and logs passing
 through the same Collector.
+
+### Critical Outcomes, Diagnostics, And Policy Ownership
+
+Retain critical outcomes using bounded attributes that exist before the tail
+decision: route templates, workflow names, immutable `service.version`,
+guardrail results, fallback use, step-limit stops, bounded error types, and
+approved usage thresholds. Low-volume critical workflows may require 100%
+retention even when high-volume normal traffic keeps much less.
+
+A forced diagnostic trace is an operational privilege. Accept it only from an
+authenticated internal control with an allowlisted attribute, audit record,
+owner, expiry, and automatic removal. Never trust a public header, queue field,
+or caller-supplied baggage value to force retention. Raw user, tenant, request,
+session, conversation, and workflow-run IDs are not general sampling
+dimensions; use bounded tiers or cohorts unless a trace-only identity use has
+explicit privacy approval.
+
+Keep the policy in version control with its owner, rationale, thresholds,
+expected volume, start/review dates, and expiry for temporary release-burn-in or
+diagnostic rules. Review it when traffic, routes, workflows, models,
+instrumentation, or backend pricing changes.
 
 ## 📊 Metrics Are Not Sampled Traces
 
@@ -840,6 +944,13 @@ afterthought. Decide which backend is allowed to receive prompt and completion
 payloads, how masking works, who can access the data, and how long it is
 retained.
 
+Hashing is not automatically anonymization. Delete low-entropy personal fields
+such as email by default: an attacker can cheaply enumerate likely inputs to an
+unsalted hash. When a stable pseudonym is genuinely required, create it before
+telemetry emission with a reviewed keyed HMAC, key rotation, access controls,
+and a retention policy. Collector redaction remains a second line of defense,
+not the only control.
+
 ## 🔍 Collector Self-Telemetry
 
 The Collector emits its own logs and metrics. Scrape or export them.
@@ -942,9 +1053,16 @@ Before production:
 - Sensitive attributes are removed, hashed, or routed only to approved backends.
 - Trace context propagates across HTTP, gRPC, queues, and workers.
 - Sampling policy is documented and tested.
+- Sampling percentages, thresholds, decision windows, trace capacity, and
+  exporter queues are justified by measured traffic and budget.
+- Temporary release-burn-in and diagnostic rules have an owner and expiry.
 - Metrics are emitted independently from traces.
 - Short-lived workloads flush on shutdown.
 - Backends are tested with realistic telemetry volume.
+- A complete golden trace is searchable in every intended backend, and canary
+  secrets are absent from every destination.
+- The Collector configuration is canaried with a tested rollback path before a
+  fleet-wide rollout.
 
 During incidents:
 

@@ -1,0 +1,363 @@
+# Structured Logging with structlog
+
+Logs are the third signal: metrics detect, traces explain causality, logs carry the local detail. They earn their place only if you can get from a log line to its trace and back.
+
+Logging lives in `core/logging.py`, `observability/logging.py`, or whatever shared logging module the service already has. Extend the existing one — do not add a second logging configuration.
+
+---
+
+## Trace correlation
+
+Every log emitted inside a span must carry `trace_id` and `span_id`. Without them the log is an isolated sentence with no context.
+
+structlog does not have to route through the stdlib formatter. If stdout or a file agent is the transport, add the trace context in the processor chain:
+
+```python
+# observability/logging.py
+import structlog
+from opentelemetry import trace
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.trace import format_span_id, format_trace_id
+
+from core.config import get_settings
+
+
+def add_otel_trace_context(_, __, event_dict):
+    context = trace.get_current_span().get_span_context()
+    if context.is_valid:
+        event_dict["trace_id"] = format_trace_id(context.trace_id)
+        event_dict["span_id"] = format_span_id(context.span_id)
+        event_dict["trace_sampled"] = context.trace_flags.sampled
+    return event_dict
+
+
+def configure_logging(logger_provider: LoggerProvider | None = None) -> None:
+    settings = get_settings()
+
+    processors = [
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.format_exc_info,
+    ]
+    if logger_provider is not None:
+        # OtelEventProcessor is defined below in this same module. It drops
+        # named events after export so stdout collection cannot duplicate them.
+        processors.append(OtelEventProcessor(logger_provider, "chat-api.events"))
+    processors.extend(
+        [
+            # Must run before the renderer, or the fields never reach the output.
+            add_otel_trace_context,
+            structlog.processors.JSONRenderer(),
+        ]
+    )
+
+    structlog.configure(
+        processors=processors,
+        wrapper_class=structlog.make_filtering_bound_logger(
+            structlog.stdlib.NAME_TO_LEVEL[settings.log_level.lower()]
+        ),
+        cache_logger_on_first_use=True,
+    )
+
+
+log = structlog.get_logger().bind(**{"service.name": get_settings().otel_service_name})
+```
+
+Call `configure_logging(providers.logger_provider)` after
+`providers = configure_observability()`. The provider is `None` unless named
+OTel events are enabled, so ordinary JSON stdout logging needs no second setup
+path.
+
+The output should look like:
+
+```json
+{
+  "event": "retrieval_completed",
+  "level": "info",
+  "timestamp": "2026-08-10T09:12:44.113Z",
+  "service.name": "chat-api",
+  "trace_id": "9f4a1c2b3d4e5f60718293a4b5c6d7e8",
+  "span_id": "1a2b3c4d5e6f7081",
+  "trace_sampled": true,
+  "returned_documents": 5
+}
+```
+
+`trace_id` is 32 lowercase hex characters, `span_id` is 16. If they are missing entirely, the call happened outside an active span. If they are present but all zeros, the span context is invalid — usually because a background task lost context (see `../tracing/worker_runtime.md`).
+
+If the service already uses stdlib `logging`, `LoggingInstrumentor().instrument(set_logging_format=True)` adds the same fields to stdlib records. Do not run both mechanisms for the same records.
+
+---
+
+## Linked traces and durable workflows
+
+Logs carry **execution correlation**; traces carry **causal topology**. A log
+record has one current `trace_id`/`span_id` pair. Parent relationships and
+`SpanLink`s belong on spans and are not copied into every log record.
+
+This distinction matters for a DB-backed worker or state machine that starts a
+new trace with a link to the transition that scheduled it:
+
+```text
+producer trace A
+  -> persisted carrier in work row
+
+worker trace B, SpanLink -> A
+  -> worker logs use trace_id B and the current worker span_id
+```
+
+Never put trace A's ID into the worker log's top-level `trace_id`. That falsely
+claims the log was emitted inside trace A and breaks log-to-span navigation.
+The automatic trace-context processor must always use the active worker span.
+
+For a workflow that crosses several linked traces, add a stable business
+correlation key to the root/transition spans and the small set of logs someone
+will query independently:
+
+```json
+{
+  "event": "workflow_transition_started",
+  "service.name": "order-worker",
+  "trace_id": "<current-worker-trace-id>",
+  "span_id": "<current-worker-span-id>",
+  "workflow_run_id": "wf-123",
+  "workflow_state": "capture_payment",
+  "attempt": 2
+}
+```
+
+The documented cross-signal mapping is:
+
+```text
+span attribute  app.workflow.run.id
+log field       workflow_run_id
+metric label    never — this value is high-cardinality
+```
+
+If the trace backend cannot navigate links, a boundary log such as
+`workflow_transition_started` may additionally carry `causal_trace_id`. Keep
+it separate from `trace_id` and add it only for a demonstrated query need; do
+not copy it to every log. The preferred cross-trace search key remains
+`workflow_run_id`.
+
+---
+
+## Event names
+
+The `event` field names what happened, in past tense or as a state change, and stays stable. Varying values are fields.
+
+```
+request_received          job_started            queue_message_received
+request_completed         job_completed          queue_message_processed
+request_failed            job_failed             queue_message_failed
+workflow_transition_started      workflow_transition_completed
+workflow_transition_failed
+```
+
+Not: `processing`, `done`, `something_failed`, `error`, `here`. An event name you cannot write a query against is not an event name.
+
+The GenAI events — model, tool, agent, retrieval, guardrail — are in `genai.md`.
+
+---
+
+## Fields
+
+Three are effectively mandatory on operational logs:
+
+```
+trace_id      span_id      service.name
+```
+
+Then the bounded request context that makes the record findable and groupable:
+
+```
+http.route          model               attempt
+app.job.type        gen_ai.tool.name    app.outcome
+error.type          queue               duration_s
+```
+
+And the domain identifiers that let you find *this* record later — this is where high-cardinality values belong, because logs index them and metrics cannot:
+
+```
+exception_id      order_id          supplier_id      document_count
+workflow_run_id   workflow_state    operation        tenant_id
+```
+
+Never log:
+
+```
+raw prompts and completions      access tokens, API keys
+full request/response bodies     cookies, authorization headers
+retrieved document text          personal data without explicit permission
+```
+
+An LLM service is where this rule gets broken, and it has its own file: `genai.md` covers what a GenAI service must keep out of its logs, which events are worth emitting, and where the exception record goes when a model call is retried inside an agent.
+
+---
+
+## Don't mirror the trace into the logs
+
+Logs and traces overlap; duplicating one into the other doubles cost and halves signal.
+
+| Fact                                                                   | Belongs in                               |
+| ---------------------------------------------------------------------- | ---------------------------------------- |
+| Describes the whole operation (model, duration, token counts, outcome) | span attribute                           |
+| A point-in-time occurrence needing its own timestamp and severity      | log record                               |
+| Needs to be queryable without opening a trace                          | log record                               |
+| Detail of a failure — message, stack trace                            | log record, once, at the owning boundary |
+
+Emitting a log at every step of a traced pipeline recreates the trace in a worse format. Log the operational records someone would actually query on their own.
+
+Span events are not an option: they are deprecated (`../conventions/errors.md`). What used to be a span event is now a correlated log record.
+
+---
+
+## Exception logging
+
+Once, at the boundary that handles the exception, with `exc_info=True`. Inner frames add `error.type` to their span and re-raise.
+
+```python
+try:
+    return call_model(model, messages)
+except TimeoutError as exc:
+    span.set_status(Status(StatusCode.ERROR))
+    span.set_attribute("error.type", type(exc).__name__)
+    log.error(
+        "model_request_failed",
+        # Only needed if named OTel events are enabled; see below.
+        otel_event_name="app.model.request.failed",
+        exc_info=True,
+        **{
+            "error.type": type(exc).__name__,
+            "gen_ai.request.model": model,
+            "gen_ai.provider.name": provider,
+            "attempt": attempt,
+        },
+    )
+    raise
+```
+
+Logging at every level produces one incident with six stack traces and no way to tell which one is the cause.
+
+---
+
+## Named OpenTelemetry events (optional)
+
+A correlated JSON log is not automatically an OpenTelemetry **Event**. In the OTel data model an Event is a `LogRecord` whose top-level `event_name` is non-empty — an `event.name` *attribute* is not the same thing and backends may not treat it as one.
+
+Add this only if the project exports the OTel logs signal. If logs go to stdout and a log agent, the correlation above is sufficient.
+
+```python
+from time import time_ns
+from typing import Any
+
+import structlog
+from opentelemetry._logs import SeverityNumber, get_logger
+from opentelemetry.context import get_current
+from opentelemetry.sdk._logs import LoggerProvider
+
+
+class OtelEventProcessor:
+    """Turn structlog calls carrying otel_event_name into named OTel events."""
+
+    _severity = {
+        "debug": SeverityNumber.DEBUG,
+        "info": SeverityNumber.INFO,
+        "warning": SeverityNumber.WARN,
+        "error": SeverityNumber.ERROR,
+        "critical": SeverityNumber.FATAL,
+    }
+
+    def __init__(self, provider: LoggerProvider, name: str) -> None:
+        self._logger = get_logger(name, logger_provider=provider)
+
+    def __call__(self, _logger, method_name: str, event_dict: dict[str, Any]):
+        event_name = event_dict.pop("otel_event_name", None)
+        if event_name is None:
+            return event_dict
+
+        level = str(event_dict.get("level", method_name)).lower()
+        attributes = {
+            k: v
+            for k, v in event_dict.items()
+            if k not in {"event", "level", "timestamp", "exception"}
+        }
+        if "exception" in event_dict:
+            attributes["exception.stacktrace"] = event_dict["exception"]
+
+        self._logger.emit(
+            timestamp=time_ns(),
+            event_name=str(event_name),
+            body=event_dict.get("event"),
+            severity_number=self._severity.get(level, SeverityNumber.INFO),
+            severity_text=level.upper(),
+            attributes=attributes,
+            # This is what attaches trace_id and span_id.
+            context=get_current(),
+        )
+
+        # The record already entered the OTel pipeline. Dropping it here
+        # prevents a log agent from ingesting a second copy from stdout.
+        raise structlog.DropEvent
+```
+
+The shared provider owner in `../setup/sdk_bootstrap.md` creates and registers
+the optional `LoggerProvider`; this module only consumes it. Register the event
+processor before the renderer by passing that provider into the configuration
+function shown above:
+
+```python
+providers = configure_observability()
+configure_logging(providers.logger_provider)
+```
+
+Do not shut the logger provider down here. `shutdown_observability()` owns it
+and stops logging, tracing, and metrics through one idempotent lifecycle.
+
+The `DropEvent` matters: without it, a service whose stdout is also collected sends every named event twice, through two different paths, with two different schemas.
+
+Event names must be stable. Model names, request IDs, and user IDs are attributes.
+
+Named events go to a log backend or the Collector's logs pipeline — not to Langfuse, whose OTLP endpoint ingests traces only (`genai.md`).
+
+---
+
+## Trace sampling does not sample logs
+
+Collector pipelines are signal-specific, and tail sampling operates on traces. If a trace is rejected, its logs still flow:
+
+```
+log backend    records with trace_id=abc123
+trace backend  no trace abc123
+```
+
+These orphan logs are normal. Aligning the two requires a stateful component that buffers logs by trace ID until the sampling decision exists — real custom infrastructure, with memory pressure, log latency, and a temporary store of potentially sensitive data. Only build it against a strict retention requirement.
+
+The practical default is independent, importance-aware retention:
+
+```
+traces  keep all failed and slow traces; sample normal traffic
+logs    keep WARN/ERROR; sample or drop noisy INFO/DEBUG
+```
+
+And a corollary with teeth here specifically: because a tail policy keeps traces by **span status**, a failure that was logged but left its span `UNSET` is sampled away exactly when you need it — and the orphan log above is all that survives. `log.error(...)` does not set span status; see `../conventions/errors.md`, which owns that rule.
+
+---
+
+## Verify
+
+- A log emitted inside a span has 32-hex `trace_id` and 16-hex `span_id`.
+- The same trace ID appears on the span in the trace backend.
+- For a new trace with a link, worker logs carry the worker trace ID, never the
+  linked producer trace ID; `workflow_run_id` finds the complete durable run.
+- Event names are stable strings, with variable data in fields.
+- No prompt, completion, token, cookie, or authorization header appears in any log line — grep a captured log sample for a canary secret to prove it.
+- An exception produces exactly one record with a stack trace, not one per frame.
+- If named events are enabled: `event_name` is populated at the top level, and the record appears exactly once.
+
+---
+
+## Then
+
+- GenAI services: `genai.md`
+- final checks: `../verification.md`

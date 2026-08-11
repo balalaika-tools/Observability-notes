@@ -8,6 +8,7 @@ This section is a beginner-to-production guide. It starts with the mental model,
 
 | File | Purpose |
 | --- | --- |
+| [../PRODUCTION_TRACING_PLAYBOOK.md](../PRODUCTION_TRACING_PLAYBOOK.md) | Compact production tracing policy, acceptance checklist, and links to the detailed chapters below. |
 | [01_concepts.md](01_concepts.md) | The full OTel mental model: signals, context, SDKs, exporters, Collector pipelines, backends, and common pitfalls. |
 | [02_python_instrumentation.md](02_python_instrumentation.md) | Practical Python setup for traces, metrics, logs, exporters, and auto-instrumentation. |
 | [03_production_architecture.md](03_production_architecture.md) | Collector topologies, deployment patterns, sampling, security, and operations. |
@@ -53,10 +54,10 @@ OpenTelemetry Collector
 
 ## 📌 Official References Used
 
-This guide was checked on July 20, 2026. Core semantic-convention guidance is
-anchored to `v1.43.0`; the faster-moving GenAI material is separately anchored
-to `open-telemetry/semantic-conventions-genai` commit
-`c26a2c21d1ee70d5231bd440c7b48d3c94ee506a` from 2026-07-17. Keep both anchors:
+This guide's compatibility contract was reviewed on August 10, 2026. Core
+semantic-convention guidance is anchored to `v1.44.0`; the faster-moving GenAI
+material is separately anchored to `open-telemetry/semantic-conventions-genai`
+commit `46d43c8949afb53765a202e89f4534eeb75ca3fa` from 2026-08-09. Keep both anchors:
 the dedicated GenAI repository can change without a new core release.
 
 References:
@@ -88,8 +89,8 @@ References:
 - [OpenTelemetry sampling](https://opentelemetry.io/docs/concepts/sampling/)
 - [Collector tail-sampling processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor)
 - [Collector CloudWatch Logs exporter](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/awscloudwatchlogsexporter)
-- [OpenTelemetry GenAI semantic conventions, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/tree/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a)
-- [OpenTelemetry GenAI spans, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a/docs/gen-ai/gen-ai-spans.md)
-- [OpenTelemetry GenAI metrics, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a/docs/gen-ai/gen-ai-metrics.md)
-- [OpenTelemetry GenAI agent spans, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/c26a2c21d1ee70d5231bd440c7b48d3c94ee506a/docs/gen-ai/gen-ai-agent-spans.md)
+- [OpenTelemetry GenAI semantic conventions, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/tree/46d43c8949afb53765a202e89f4534eeb75ca3fa)
+- [OpenTelemetry GenAI spans, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/46d43c8949afb53765a202e89f4534eeb75ca3fa/docs/gen-ai/gen-ai-spans.md)
+- [OpenTelemetry GenAI metrics, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/46d43c8949afb53765a202e89f4534eeb75ca3fa/docs/gen-ai/gen-ai-metrics.md)
+- [OpenTelemetry GenAI agent spans, pinned revision](https://github.com/open-telemetry/semantic-conventions-genai/blob/46d43c8949afb53765a202e89f4534eeb75ca3fa/docs/gen-ai/gen-ai-agent-spans.md)
 - [Langfuse OpenTelemetry integration](https://langfuse.com/integrations/native/opentelemetry)

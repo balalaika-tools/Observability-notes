@@ -329,7 +329,8 @@ exporters:
       max_elapsed_time: 10m
 
   prometheus_remote_write:
-    endpoint: https://prometheus.example.com/api/v1/write
+    http:
+      endpoint: https://prometheus.example.com/api/v1/write
     translation_strategy: UnderscoreEscapingWithoutSuffixes
     resource_to_telemetry_conversion:
       enabled: true

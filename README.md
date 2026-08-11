@@ -1,6 +1,9 @@
 # OpenTelemetry and Langfuse Guide
 
-Last verified against official OpenTelemetry and Langfuse documentation on 2026-06-16.
+Repository compatibility contract reviewed on 2026-08-10. Version-sensitive
+examples target OpenTelemetry semantic conventions 1.44.0, the pinned GenAI
+convention revision documented below, and Collector Contrib 0.158.0 unless a
+chapter states a narrower integration-specific range.
 
 This repo is a production-focused guide to OpenTelemetry and Langfuse for engineers building modern distributed systems, LLM applications, RAG pipelines, and agentic systems.
 
@@ -14,6 +17,7 @@ It has three goals:
 
 | Path | Use it when |
 | --- | --- |
+| [Production tracing playbook](PRODUCTION_TRACING_PLAYBOOK.md) | You want the compact production policy, rollout checklist, and links into the deeper notes. |
 | [opentelemetry/README.md](opentelemetry/README.md) | You want to deeply understand OpenTelemetry and production observability architecture. |
 | [opentelemetry/deployment/README.md](opentelemetry/deployment/README.md) | You need to deploy, discover, scale, secure, or upgrade OpenTelemetry Collectors. |
 | [langfuse/README.md](langfuse/README.md) | You want to instrument, evaluate, and operate LLM applications with Langfuse. |
@@ -23,6 +27,7 @@ It has three goals:
 
 ```text
 LangFuseNotes/
+|-- PRODUCTION_TRACING_PLAYBOOK.md
 |-- opentelemetry/
 |   |-- 01_concepts.md
 |   |-- 02_python_instrumentation.md
@@ -66,10 +71,11 @@ New to both topics:
 
 Already an OpenTelemetry engineer:
 
-1. [Production architecture](opentelemetry/03_production_architecture.md)
-2. [GenAI and LLM observability](opentelemetry/06_genai_and_llm_observability.md)
-3. [Langfuse OTLP ingestion and mapping](langfuse/03_otel_ingestion_and_mapping.md)
-4. [Collector, Prometheus, Langfuse, and alerts](examples/03_collector_prometheus_langfuse.md)
+1. [Production tracing playbook](PRODUCTION_TRACING_PLAYBOOK.md)
+2. [Production architecture](opentelemetry/03_production_architecture.md)
+3. [GenAI and LLM observability](opentelemetry/06_genai_and_llm_observability.md)
+4. [Langfuse OTLP ingestion and mapping](langfuse/03_otel_ingestion_and_mapping.md)
+5. [Collector, Prometheus, Langfuse, and alerts](examples/03_collector_prometheus_langfuse.md)
 
 Building production LLM or agent systems:
 

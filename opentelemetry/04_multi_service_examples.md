@@ -714,6 +714,80 @@ database, and client instrumentations enabled. The Python-specific ownership
 and selective-disable choices are covered in
 [Python Instrumentation](02_python_instrumentation.md).
 
+## 🗄️ Durable Database Handoffs
+
+A database-backed queue, outbox, lease, or persisted workflow transition is a
+transport boundary even though SQL instrumentation already emits database
+spans. The `SELECT`, claim, or polling span describes storage activity; it is
+not the causal parent of work that was scheduled earlier.
+
+Persist a W3C carrier with the work item or runnable state:
+
+```text
+work row
+  payload / state
+  trace carrier = {
+    "traceparent": "00-...",
+    "tracestate": "..."   # optional
+  }
+  workflow_run_id = "..." # business correlation, not propagation
+```
+
+Store `traceparent` plus optional `tracestate`, not a bare trace ID or a
+serialized SDK context. Inject the carrier while the scheduling/transition span
+is current and commit it atomically with the work or state change. If the
+transaction rolls back, neither the runnable work nor its carrier may become
+visible.
+
+Durable, delayed, or independently retried work normally starts a new root with
+a link to the scheduling context:
+
+```python
+from opentelemetry import context as otel_context, propagate, trace
+from opentelemetry.trace import Link
+
+
+def run_claimed_transition(row) -> None:
+    incoming = propagate.extract(
+        row.otel_context or {},
+        context=otel_context.Context(),
+    )
+    scheduling_context = trace.get_current_span(incoming).get_span_context()
+    links = [Link(scheduling_context)] if scheduling_context.is_valid else []
+
+    with tracer.start_as_current_span(
+        "run workflow transition",
+        context=otel_context.Context(),
+        links=links,
+        attributes={
+            "app.workflow.name": row.workflow_name,
+            "app.workflow.run.id": row.workflow_run_id,
+            "app.workflow.attempt": row.attempt,
+        },
+        record_exception=False,
+    ):
+        apply_transition(row)
+```
+
+Extract from an explicit empty context and create the processing span from an
+explicit empty context. Otherwise a poll-loop, lease, or DB client span that
+happens to be current can become the accidental parent. A valid linked trace
+has a new `trace_id`, no parent span ID, and exactly one link to the scheduling
+context.
+
+Lifecycle rules:
+
+- Preserve the original scheduling carrier across retries of the same work
+  item; change only a bounded attempt attribute.
+- When a successful transition makes the next state runnable, inject a fresh
+  carrier from that transition span and persist it with the next state.
+- Treat stored carriers as untrusted input. Missing, malformed, or oversized
+  values must produce an unlinked root and must never fail or authorize work.
+- Put a stable workflow/run ID on transition spans and important boundary logs
+  so several linked traces remain searchable. Never use it as a metric label.
+- Ensure exactly one owner creates the work-processing boundary; generic DB
+  instrumentation remains useful for queries but does not replace it.
+
 ## 🔄 Async Tasks And Threads
 
 Context usually flows through normal async call paths, but it can be lost when
@@ -885,6 +959,10 @@ Queue jobs have an unexpected trace shape:
 - Drop untrusted inbound baggage and confirm third-party calls do not receive
   internal baggage.
 - Use span links for decoupled or batch work.
+- Persist durable-work W3C carriers atomically with the work/state transition.
+- Start delayed or independently retried durable work as an empty-context root
+  linked to the scheduling carrier, never as a child of a poll/claim span.
+- Keep workflow/run IDs on spans and important logs, never on metrics.
 - Keep metrics independent from traces.
 - Confirm trace IDs match across services in a local or staging trace.
 - Confirm logs include trace IDs for request-scoped messages.

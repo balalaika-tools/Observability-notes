@@ -330,6 +330,21 @@ process starts
   -> serve traffic
 ```
 
+Shutdown reverses the ownership order:
+
+```text
+stop accepting work
+  -> stop background tasks
+  -> close instrumented clients
+  -> force-flush and shut down telemetry last
+```
+
+Make initialization and shutdown idempotent. A short-lived job or serverless
+invocation must flush within its remaining execution budget, while a warm
+runtime must not rebuild and shut down the provider on every invocation.
+Exporter failures, queue pressure, and timeouts may drop telemetry, but must not
+fail the business request.
+
 ### Bad: Application Work Happens Before Instrumentation
 
 This module performs an HTTP warm-up and creates a long-lived client before OTel

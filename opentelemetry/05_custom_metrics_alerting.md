@@ -278,7 +278,8 @@ processors:
 
 exporters:
   prometheus_remote_write:
-    endpoint: https://prometheus.example.com/api/v1/write
+    http:
+      endpoint: https://prometheus.example.com/api/v1/write
 
 service:
   pipelines:
