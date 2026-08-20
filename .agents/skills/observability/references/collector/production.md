@@ -298,6 +298,16 @@ exporters:
 service:
   extensions: [health_check, file_storage]
   telemetry:
+    # Self-telemetry is a separate plane from the application telemetry below.
+    # Use a different stable service.name for an agent or tail-sampling tier.
+    resource:
+      service.name: otel-collector-gateway
+      deployment.environment.name: production
+    # Collected from stderr by an independent platform log agent. Sending these
+    # records into this Collector's own receiver couples them to its failures.
+    logs:
+      level: info
+      encoding: json
     metrics:
       level: normal
       readers:
@@ -306,6 +316,8 @@ service:
               prometheus:
                 host: 0.0.0.0
                 port: 8888
+                without_type_suffix: true
+                without_units: true
   pipelines:
     traces:
       receivers: [otlp]
@@ -572,6 +584,13 @@ Telemetry loss is preferable to application downtime. Silent telemetry loss duri
 - [ ] Email and other low-entropy personal fields are deleted, not presented as anonymized hashes.
 - [ ] Credentials come from a secret store and appear in no committed file.
 - [ ] Receivers are bound to private networks.
-- [ ] Collector self-telemetry is scraped and alerted on.
+- [ ] Collector self-metrics are delivered through an independent private
+      scrape or direct monitoring path, and structured internal logs leave via
+      an independent platform log agent or direct endpoint.
+- [ ] Collector self-telemetry has stable role/environment identity, preserves
+      the per-replica `service.instance.id`, and alerts use rates/increases for
+      counters rather than historical values.
+- [ ] Health probes, self-telemetry, and an end-to-end backend canary are all
+      present; none is treated as proof supplied by another.
 - [ ] Temporary burn-in/diagnostic rules have an owner and expiry.
 - [ ] Langfuse exporters use OTLP/HTTP and send `x-langfuse-ingestion-version: "4"`.

@@ -104,7 +104,7 @@ references/
       langchain/      architecture + the three agent layers
   metrics/            service.md + genai.md
   logging/            structlog.md + genai.md
-  collector/          component, dev_staging, production
+  collector/          component (including self-telemetry), dev_staging, production
   testing.md          in-memory exporter harness for telemetry assertions
   verification.md     the exported-telemetry checks
   local/              repository-specific mappings; load only on a match
@@ -239,7 +239,7 @@ label drift the shared module exists to prevent.
 
 | File | When |
 | --- | --- |
-| `references/collector/component.md` | Always, for layout, image pinning, and backend routing choices |
+| `references/collector/component.md` | Always, for layout, image pinning, backend routing, and the Collector self-telemetry/alerting contract |
 | `references/collector/dev_staging.md` | Writing the dev/staging configs |
 | `references/collector/production.md` | Writing the production config: sampling, redaction, resilience |
 

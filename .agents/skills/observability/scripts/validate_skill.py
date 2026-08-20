@@ -354,9 +354,15 @@ def validate_collector_yaml(skill_root: Path) -> str:
     # Every block must at least be parseable YAML, wherever it lives.
     for label, block in collector_yaml_blocks(skill_root):
         try:
-            yaml.safe_load(block)
+            candidate = yaml.safe_load(block)
         except yaml.YAMLError as exc:
             raise ValidationError(f"invalid YAML in {label}:\n{exc}") from exc
+        if (
+            isinstance(candidate, dict)
+            and "receivers" in candidate
+            and "pipelines" in candidate.get("service", {})
+        ):
+            validate_collector_self_telemetry(candidate, label)
 
     config_text = production_yaml(skill_root)
     parsed = yaml.safe_load(config_text)
@@ -383,6 +389,62 @@ def validate_collector_yaml(skill_root: Path) -> str:
     validate_exception_detail_split(parsed)
     validate_environment_ownership(parsed)
     return config_text
+
+
+def validate_collector_self_telemetry(parsed: dict, label: str) -> None:
+    """Every complete Collector template has an observable, stable identity."""
+    telemetry = parsed.get("service", {}).get("telemetry", {})
+    resource = telemetry.get("resource", {})
+    require(
+        isinstance(resource.get("service.name"), str)
+        and bool(resource["service.name"].strip()),
+        f"{label} has no stable self-telemetry service.name",
+    )
+    require(
+        isinstance(resource.get("deployment.environment.name"), str)
+        and bool(resource["deployment.environment.name"].strip()),
+        f"{label} has no self-telemetry deployment.environment.name",
+    )
+    require(
+        "service.instance.id" not in resource,
+        f"{label} hard-codes service.instance.id; each Collector replica must keep "
+        "the automatically generated instance identity",
+    )
+
+    logs = telemetry.get("logs", {})
+    require(
+        str(logs.get("level", "")).lower() == "info",
+        f"{label} self-logs must use the INFO baseline",
+    )
+    require(
+        logs.get("encoding") in {"console", "json"},
+        f"{label} self-logs must select console or json encoding explicitly",
+    )
+
+    metrics = telemetry.get("metrics", {})
+    require(
+        metrics.get("level") == "normal",
+        f"{label} self-metrics must use the normal baseline",
+    )
+    readers = metrics.get("readers", [])
+    require(
+        isinstance(readers, list) and readers,
+        f"{label} has no explicit self-metrics delivery reader",
+    )
+    for reader in readers:
+        prometheus = (
+            reader.get("pull", {}).get("exporter", {}).get("prometheus")
+            if isinstance(reader, dict)
+            else None
+        )
+        if prometheus is None:
+            continue
+        require(
+            prometheus.get("without_type_suffix") is True
+            and prometheus.get("without_units") is True,
+            f"{label} manual Prometheus self-reader must preserve canonical "
+            "otelcol_* names",
+        )
 
 
 def validate_exception_detail_split(parsed: dict) -> None:
@@ -1149,7 +1211,7 @@ LINE_CAPS = {
     "references/tracing/production_policy.md": 240,
     "references/tracing/genai/retrieval.md": 140,
     "references/tracing/genai/langchain/model_callback.md": 520,
-    "references/collector/production.md": 580,
+    "references/collector/production.md": 610,
     "references/metrics/genai.md": 400,
     "references/logging/structlog.md": 400,
 }

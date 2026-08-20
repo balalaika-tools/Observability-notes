@@ -35,6 +35,12 @@ These are compatibility bounds for the templates, not a demand to downgrade a se
   it with the ordinary `xray` propagator, and do not use it for a non-X-Ray
   trace backend.
 - `prometheus_remote_write` is the Collector component name. `prometheusremotewrite` is a deprecated alias. Contrib 0.158.0 still requires its HTTP client settings at top level; migrate them under `http` only after the upgraded image validates that schema.
+- Collector self-metrics use the declarative
+  `service.telemetry.metrics.readers` schema. The manual Prometheus readers set
+  `without_type_suffix` and `without_units` so alert names match the canonical
+  OTLP `otelcol_*` inventory. Internal logs remain at `INFO` and go to
+  `stderr`; internal traces are experimental and opt-in, not a production
+  baseline.
 - Langfuse receives complete traces over OTLP/HTTP and the v4 ingestion header. The endpoint remains configurable for region and self-hosting.
 
 ## Upgrade checklist
@@ -49,9 +55,14 @@ Before changing any version above:
 4. Run capture-on and capture-off streaming tests against the real LangChain/LangGraph stream shape. Cover an empty stream, cancellation, and an error after the first chunk.
 5. Re-run model/provider metadata fixtures so `gen_ai.request.model` can never become a model type such as `chat` or `llm`.
 6. Validate **every** Collector YAML block under `references/collector/` with the exact candidate image and inspect its `components` output for renamed or removed components. Re-test whether `prometheus_remote_write` now accepts nested `http.endpoint` and `http.headers`.
-7. Confirm whether the `batch` **processor** is still the recommended batching mechanism at the candidate version, or whether exporter-level `sending_queue.batch` supersedes it. If batching moves into the exporter, the "`batch` last, after `tail_sampling`" ordering advice in `collector/production.md` changes with it.
-8. Re-check every `gen_ai.*` attribute this skill uses against the pinned convention revision, not only the metric names. `validate_skill.py` pins the attribute set as an allowlist, so a convention change shows up as a validation failure with the exact key — resolve each one deliberately rather than widening the allowlist.
-9. Re-check backend authentication, endpoints, required headers, and whether trace ingestion remains real-time.
-10. Run `python scripts/validate_skill.py` (add `--collector-image` in CI), then perform the exported-telemetry checks in `verification.md`. The script runs without any external toolchain; `--official-validator` additionally requires the Codex skill-creator validator.
+7. Re-check the Collector internal-telemetry declarative schema, metric names
+   and stability levels, Prometheus suffix behaviour, log options, and the
+   maturity of internal traces. Validate the self-telemetry resource, logs, and
+   reader blocks against the candidate image, then test the actual scrape and
+   alert queries before promotion.
+8. Confirm whether the `batch` **processor** is still the recommended batching mechanism at the candidate version, or whether exporter-level `sending_queue.batch` supersedes it. If batching moves into the exporter, the "`batch` last, after `tail_sampling`" ordering advice in `collector/production.md` changes with it.
+9. Re-check every `gen_ai.*` attribute this skill uses against the pinned convention revision, not only the metric names. `validate_skill.py` pins the attribute set as an allowlist, so a convention change shows up as a validation failure with the exact key — resolve each one deliberately rather than widening the allowlist.
+10. Re-check backend authentication, endpoints, required headers, and whether trace ingestion remains real-time.
+11. Run `python scripts/validate_skill.py` (add `--collector-image` in CI), then perform the exported-telemetry checks in `verification.md`. The script runs without any external toolchain; `--official-validator` additionally requires the Codex skill-creator validator.
 
 Record the new version set, convention tag or commit, and review date in this file in the same change.

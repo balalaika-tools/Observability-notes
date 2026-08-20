@@ -72,6 +72,14 @@ exporters:
 service:
   extensions: [health_check]
   telemetry:
+    # This resource belongs to the Collector itself. The
+    # resource/environment processor below labels telemetry passing through it.
+    resource:
+      service.name: otel-collector-gateway
+      deployment.environment.name: development
+    logs:
+      level: info
+      encoding: console
     metrics:
       level: normal
       readers:
@@ -80,6 +88,10 @@ service:
               prometheus:
                 host: 0.0.0.0
                 port: 8888
+                # Keep dashboard and alert names equal to the canonical OTLP
+                # names documented in component.md.
+                without_type_suffix: true
+                without_units: true
   pipelines:
     traces:
       receivers: [otlp]
@@ -214,6 +226,14 @@ exporters:
 service:
   extensions: [health_check]
   telemetry:
+    resource:
+      service.name: otel-collector-gateway
+      deployment.environment.name: staging
+    # The platform log agent collects stderr. Do not feed these records back
+    # through this Collector's own OTLP receiver.
+    logs:
+      level: info
+      encoding: json
     metrics:
       level: normal
       readers:
@@ -222,6 +242,8 @@ service:
               prometheus:
                 host: 0.0.0.0
                 port: 8888
+                without_type_suffix: true
+                without_units: true
   pipelines:
     traces:
       receivers: [otlp]
@@ -264,7 +286,7 @@ Send one request through an instrumented service and confirm:
 
 ```bash
 docker compose logs --tail=200 otel-collector | head -60
-# 8888 = the Collector's own health
+# 8888 = the Collector's internal operational metrics
 curl --fail http://127.0.0.1:8888/metrics | grep -E 'otelcol_(receiver_accepted|exporter_sent|exporter_send_failed)'
 # 8889 = the application's metrics, via the dev-only prometheus exporter
 curl --fail http://127.0.0.1:8889/metrics | grep -E '^(app_|gen_ai_|http_server_)'

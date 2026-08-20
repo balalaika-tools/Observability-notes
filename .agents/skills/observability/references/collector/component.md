@@ -198,18 +198,108 @@ A health check proves the process is running. It does **not** prove the backend 
 
 ---
 
-## Monitor it like a service
+## Self-telemetry is part of the deployment
 
-The Collector emits its own metrics on `:8888`. Alert on:
+A Collector is another production service. Its workload is telemetry, so its
+own failure mode is a blind spot unless a separate monitoring path observes it.
+Do not call a deployment complete with only an OTLP receiver and backend
+exporters.
 
-- exporter send failures above zero for 10 minutes;
-- dropped spans, metric points, or log records above zero;
-- exporter queue utilisation above 80%;
-- memory above 85% of the `memory_limiter` limit;
-- OTLP receiver refusals;
-- tail-sampling late or errored decisions.
+The minimum baseline is:
 
-Silent telemetry loss during an incident is worse than no telemetry, because you will trust the empty dashboard.
+| Signal | Baseline |
+| --- | --- |
+| Internal metrics | `service.telemetry.metrics.level: normal`, delivered by an explicit private Prometheus reader or directly to a monitoring backend with the embedded OTLP reader |
+| Internal logs | `INFO`; JSON in shared environments, emitted to `stderr` for the platform log agent or sent directly to an independent OTLP endpoint |
+| Resource identity | A stable logical `service.name` per Collector role, `deployment.environment.name`, and the automatically generated `service.instance.id` |
+| Internal traces | Off by default. They are experimental and useful only for time-bounded diagnosis when metrics and logs cannot explain a pipeline problem |
+
+The examples in `dev_staging.md` and `production.md` make this baseline
+explicit. The Collector supplies its own name, version, and random instance ID
+by default, but explicitly naming the logical role keeps dashboards stable and
+separates `otel-collector-agent`, `otel-collector-gateway`, and
+`otel-collector-tail-sampler`. Do not hard-code `service.instance.id`; each
+replica needs its own value.
+
+`service.telemetry.resource` labels the Collector's **own** metrics, logs, and
+traces. A `resource/environment` processor in `service.pipelines` labels the
+application telemetry passing through the Collector and does not affect
+self-telemetry. Configure both planes deliberately.
+
+The health extension and self-telemetry answer different questions:
+
+- `health_check` proves that the process is responsive enough to answer a
+  probe;
+- internal metrics and logs show whether receivers, processors, queues, and
+  exporters are working;
+- a canary found in the backend proves end-to-end delivery.
+
+None of the three substitutes for another.
+
+### Keep the monitoring path independent
+
+Prefer a pull scrape of the private `:8888` endpoint and platform collection of
+the Collector's `stderr`. Those paths still report a blocked application
+pipeline or broken backend exporter. If pull is unavailable, use the embedded
+OTLP readers/processors under `service.telemetry` to send directly to a
+separate monitoring endpoint.
+
+Do not send a Collector's internal logs, metrics, or experimental traces to its
+own OTLP receiver and then through the same pipeline being observed. That
+couples the observer to the failure, can create feedback or recursion, and
+makes an exporter outage erase the evidence of the outage. When a two-tier
+deployment must observe itself, have the agent and gateway report to a separate
+monitoring tier or backend, with an explicit loop analysis.
+
+The self-metrics listener is an operational endpoint, not a public API:
+
+- bind to loopback for a same-host scraper;
+- in a container or pod, bind to the required private interface and restrict it
+  with a Service/network policy/firewall;
+- never publish `:8888`, pprof, or zPages to the internet;
+- use TLS/authentication for direct OTLP export across a trust boundary, with
+  credentials from the same secret-management path as other exporters.
+
+`normal` is the production starting level. `detailed` adds cost and dimensions;
+enable it for a stated diagnostic need, verify cardinality, and roll it back.
+Keep production internal logs at `INFO` unless a time-bounded incident requires
+`DEBUG`. Internal metric names, attributes, log formats, and especially trace
+spans have different stability levels, so verify dashboards and alerts against
+the pinned image during every upgrade; `../compatibility.md` owns that check.
+
+The authoritative schema and metric inventory are in the
+[Collector internal telemetry documentation](https://opentelemetry.io/docs/collector/internal-telemetry/).
+
+### Monitor and alert on rates, not historical counter values
+
+Collector counters are cumulative. Alert on a sustained positive `rate()` or
+`increase()` over an operationally justified window, not on `counter > 0`; one
+old failure would otherwise alert forever. With a manually configured
+Prometheus reader, metric type and unit suffixes can change the exposed names.
+The configs in this skill set `without_type_suffix` and `without_units` so the
+names below remain the canonical `otelcol_*` names. Inspect `/metrics` after an
+image upgrade before promoting alert rules.
+
+| Condition | What to use | Meaning |
+| --- | --- | --- |
+| Collector unavailable | scrape target absent/down, missing internal telemetry, process restarts | The observer itself is unavailable; this is the first page |
+| Receiver backpressure | increasing `otelcol_receiver_refused_{spans,metric_points,log_records}` | Senders were refused; data loss depends on their retry behaviour |
+| Definite queue loss | increasing `otelcol_exporter_enqueue_failed_{spans,metric_points,log_records}` | Telemetry could not enter an exporter queue and was dropped |
+| Delivery impairment | sustained increase in `otelcol_exporter_send_failed_*` | The destination is failing; retries mean this alone is not proof of permanent loss |
+| Queue saturation | `otelcol_exporter_queue_size / otelcol_exporter_queue_capacity` high and rising | The downstream outage or throughput deficit is consuming the buffer; choose a threshold and window from measured bursts |
+| Memory pressure | RSS approaching the container limit, OOM/restarts, or increasing `otelcol_processor_memory_limiter_refused_*` | The Collector is shedding load; alert before the hard container limit, not at a copied percentage |
+| Pipeline stall | accepted input rises while processor output or exporter sent counts stop, adjusted for intentional filtering and sampling | Data entered but is no longer progressing |
+| Tail-sampling failure | increasing `otelcol_processor_tail_sampling_sampling_trace_dropped_too_early` or `otelcol_processor_tail_sampling_sampling_policy_evaluation_error`, late-span age/ratio, or excessive decision latency | The sampling tier is undersized, late, or evaluating policies incorrectly |
+
+Dashboard accepted/refused input, processor ingress/egress, sent/failed output,
+queue size/capacity, CPU, RSS, uptime/restarts, and component-specific processor
+metrics per signal, component, and Collector instance. Compare these with
+producer-side counts and backend ingest. Do not demand equality across a
+pipeline that intentionally filters, aggregates, or tail-samples; reconcile
+each deliberate reduction instead.
+
+Silent telemetry loss during an incident is worse than no telemetry, because
+you will trust the empty dashboard.
 
 ---
 
@@ -225,5 +315,6 @@ Silent telemetry loss during an incident is worse than no telemetry, because you
 
 ## Then
 
-- `dev_staging.md` for the development and staging configs;
+- `dev_staging.md` for the development and staging configs, including their
+  self-telemetry identity and delivery path;
 - `production.md` for sampling, redaction, and resilience in production.
