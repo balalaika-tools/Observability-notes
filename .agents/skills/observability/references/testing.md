@@ -184,7 +184,7 @@ def test_linked_consumer_starts_new_trace(span_exporter, tracer):
 
     consumer = assert_one_span(
         span_exporter,
-        "consume sqs pricing-jobs",
+        "process pricing-jobs",
         parent_name=None,                                 # a root
         linked_to_trace_ids={producer_trace_id},          # with one link
     )

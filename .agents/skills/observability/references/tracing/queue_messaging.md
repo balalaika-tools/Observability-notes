@@ -28,12 +28,13 @@ tracer = trace.get_tracer(__name__)
 
 def publish_pricing_job(queue, payload: dict) -> None:
     with tracer.start_as_current_span(
-        "publish sqs pricing-jobs",
+        "send pricing-jobs",
         kind=trace.SpanKind.PRODUCER,
         record_exception=False,
         attributes={
             "messaging.system": "aws_sqs",
             "messaging.destination.name": "pricing-jobs",
+            "messaging.operation.name": "send",
             "messaging.operation.type": "send",
         },
     ) as span:
@@ -119,13 +120,14 @@ def handle_message(message) -> None:
     parent_ctx = extract(message.headers)
 
     with tracer.start_as_current_span(
-        "consume sqs pricing-jobs",
+        "process pricing-jobs",
         context=parent_ctx,
         kind=trace.SpanKind.CONSUMER,
         record_exception=False,
         attributes={
             "messaging.system": "aws_sqs",
             "messaging.destination.name": "pricing-jobs",
+            "messaging.operation.name": "process",
             "messaging.operation.type": "process",
         },
     ) as span:
@@ -152,7 +154,7 @@ def handle_message(message) -> None:
     links = [Link(producer_ctx)] if producer_ctx.is_valid else []
 
     with tracer.start_as_current_span(
-        "consume sqs pricing-jobs",
+        "process pricing-jobs",
         # An explicit empty Context is what makes this a root span.
         # Passing None (or omitting it) reuses the CURRENT context instead.
         context=otel_context.Context(),
@@ -162,6 +164,7 @@ def handle_message(message) -> None:
         attributes={
             "messaging.system": "aws_sqs",
             "messaging.destination.name": "pricing-jobs",
+            "messaging.operation.name": "process",
             "messaging.operation.type": "process",
             "app.message.attempt": message.receive_count,
         },
@@ -180,7 +183,7 @@ def handle_message(message) -> None:
 Look at an exported consumer span, not at whether `links` is non-empty:
 
 ```
-consume sqs pricing-jobs
+process pricing-jobs
   trace_id       != the producer's trace_id
   parent_span_id  empty
   links           one entry, with the producer's valid SpanContext
@@ -201,13 +204,19 @@ for message in messages:
         links.append(Link(sc))
 
 with tracer.start_as_current_span(
-    "consume sqs pricing-jobs",
+    "process pricing-jobs",
     context=otel_context.Context(),
     kind=trace.SpanKind.CONSUMER,
     links=links,
     record_exception=False,
+    attributes={
+        "messaging.system": "aws_sqs",
+        "messaging.destination.name": "pricing-jobs",
+        "messaging.operation.name": "process",
+        "messaging.operation.type": "process",
+        "messaging.batch.message_count": len(messages),
+    },
 ) as span:
-    span.set_attribute("messaging.batch.message_count", len(messages))
     process_all(messages)
 ```
 
@@ -217,12 +226,21 @@ If individual messages can fail independently, add one child span per message so
 
 `opentelemetry-instrumentation-boto3sqs` creates a `CONSUMER` receive span and a per-message process span that links to the producer. That is already a new trace with a causal link — close to the linked pattern above, but with an extra receive parent.
 
+On the pinned `0.65b0` line, propagation is current but the instrumentor's
+telemetry schema is not: it declares schema URL `1.11.0`, uses legacy
+destination/operation attributes and `messaging.system="aws.sqs"`, and names
+spans destination-first. Do not describe that output as semantic-convention
+1.44 telemetry. If current messaging names and attributes are a requirement,
+disable the instrumentor and use the manual templates above (or perform an
+explicit, tested migration at the Collector).
+
 Choose one owner:
 
 | If | Then |
 | --- | --- |
-| The automatic shape is acceptable | Use it. Add only business child spans. Do not write a consumer span. |
+| Its extra receive span **and legacy 1.11 telemetry schema** are acceptable | Use it. Add only business child spans. Do not write a consumer span. |
 | You need different parent/link semantics | Disable that instrumentor in the worker process and own the boundary manually |
+| You require the pinned 1.44 messaging schema | Disable it and own the boundary manually with the templates above |
 
 ```bash
 OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=boto3 opentelemetry-instrument python worker.py
@@ -239,7 +257,7 @@ detection signals, so here is what each one needs:
 | Transport | Carrier | Ownership note |
 | --- | --- | --- |
 | Kafka (`confluent_kafka`, `aiokafka`) | Record headers: `list[tuple[str, bytes]]`. Needs a getter/setter that decodes/encodes UTF-8, because W3C values are strings and headers are bytes. | Kafka instrumentation, where installed, owns produce and consume spans. Pick one. |
-| Celery | Celery's own message headers | **`opentelemetry-instrumentation-celery` already owns both the publish and the task-execution span, and links them.** Do not add your own; add business child spans inside the task. This is a live duplicate-owner risk, because `../setup/auto_instrumentation.md` recommends installing it. |
+| Celery | Celery's own message headers | **`opentelemetry-instrumentation-celery` already owns both the publish and task-execution spans.** On `0.65b0`, its default `use_span_links=False` continues the producer context as parent; code-based `.instrument(use_span_links=True)` starts the task span without that parent and adds a link instead. Zero-code activation cannot pass that Python argument. Both modes still declare the legacy `1.11.0` messaging schema. Do not add another boundary; choose the relationship explicitly and add only business child spans inside the task. |
 | RabbitMQ / AMQP via `kombu` or `pika` | AMQP `headers` property — already a string map, so `inject(headers)` / `extract(headers)` work directly | No first-party instrumentation for raw `pika`; you own the boundary. |
 | Redis Streams | No header space. Put the carrier in a named field of the entry, e.g. `otel_traceparent`, and document the field name as a contract. | `redis` instrumentation traces the `XADD`/`XREADGROUP` commands, not the work. Those are transport spans, never the parent of processing. |
 | Google Cloud Pub/Sub | Message `attributes`, a string map | Check whether the client library already injects; some versions do. |
@@ -252,7 +270,7 @@ client instrumentation is never the causal parent of the work.
 
 | Attribute | Why |
 | --- | --- |
-| `messaging.system`, `messaging.destination.name`, `messaging.operation.type` | Standard, and what queue dashboards group on |
+| `messaging.system`, `messaging.destination.name`, `messaging.operation.name`, `messaging.operation.type` | Standard. `messaging.operation.name` is required and determines the span-name prefix; `messaging.operation.type` is the bounded category (`send`, `process`, and so on). |
 | `app.message.attempt` / receive count | Distinguishes a first attempt from a fifth |
 | `app.outcome` | `success` / `error` / `skipped`, bounded |
 | Domain identifiers (`order_id`, `supplier_id`) | Only when they are worth finding one trace by; keep them off metrics |

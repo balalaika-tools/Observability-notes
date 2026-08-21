@@ -43,8 +43,10 @@ from opentelemetry.trace import Span
 from observability.genai_attributes import (
     APP_INPUT_TOKEN_DETAILS,
     APP_OUTPUT_TOKEN_DETAILS,
-    GENAI_CACHE_CREATION_INPUT_TOKENS,
+    GENAI_AUDIO_INPUT_TOKENS,
+    GENAI_AUDIO_OUTPUT_TOKENS,
     GENAI_CACHE_READ_INPUT_TOKENS,
+    GENAI_CACHE_WRITE_INPUT_TOKENS,
     GENAI_INPUT_TOKENS,
     GENAI_OUTPUT_TOKENS,
     GENAI_REASONING_OUTPUT_TOKENS,
@@ -60,6 +62,11 @@ def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any]:
     usage = usage or {}
     input_details = usage.get("input_token_details") or {}
     output_details = usage.get("output_token_details") or {}
+    # LangChain still calls a cache write `cache_creation`. Keep that source
+    # compatibility at the adapter boundary; the OTel convention says write.
+    cache_write = input_details.get("cache_write")
+    if cache_write is None:
+        cache_write = input_details.get("cache_creation")
 
     return {
         "input_tokens": usage.get("input_tokens"),
@@ -67,9 +74,11 @@ def normalize_usage(usage: dict[str, Any] | None) -> dict[str, Any]:
         "total_tokens": usage.get("total_tokens"),
         "input_token_details": input_details or None,
         "output_token_details": output_details or None,
-        "cache_read_tokens": input_details.get("cache_read", 0),
-        "cache_creation_tokens": input_details.get("cache_creation", 0),
-        "reasoning_tokens": output_details.get("reasoning", 0),
+        "cache_read_tokens": input_details.get("cache_read"),
+        "cache_write_tokens": cache_write,
+        "reasoning_tokens": output_details.get("reasoning"),
+        "audio_input_tokens": input_details.get("audio"),
+        "audio_output_tokens": output_details.get("audio"),
     }
 
 
@@ -82,29 +91,27 @@ def set_usage_attributes(span: Span, usage: dict[str, Any] | None) -> None:
     if normalized["output_tokens"] is not None:
         span.set_attribute(GENAI_OUTPUT_TOKENS, normalized["output_tokens"])
 
-    # Default to 0 rather than omitting: "no cache hit" and "provider does not
-    # report caching" look identical on a dashboard if the attribute is absent.
-    span.set_attribute(
-        GENAI_CACHE_READ_INPUT_TOKENS, normalized["cache_read_tokens"]
-    )
-    span.set_attribute(
-        GENAI_CACHE_CREATION_INPUT_TOKENS, normalized["cache_creation_tokens"]
-    )
-    span.set_attribute(
-        GENAI_REASONING_OUTPUT_TOKENS, normalized["reasoning_tokens"]
-    )
+    # Breakdown attributes are Recommended only when applicable. Preserve the
+    # difference between an explicit zero and a provider that reports no split.
+    for attribute, value in (
+        (GENAI_CACHE_READ_INPUT_TOKENS, normalized["cache_read_tokens"]),
+        (GENAI_CACHE_WRITE_INPUT_TOKENS, normalized["cache_write_tokens"]),
+        (GENAI_REASONING_OUTPUT_TOKENS, normalized["reasoning_tokens"]),
+        (GENAI_AUDIO_INPUT_TOKENS, normalized["audio_input_tokens"]),
+        (GENAI_AUDIO_OUTPUT_TOKENS, normalized["audio_output_tokens"]),
+    ):
+        if value is not None:
+            span.set_attribute(attribute, value)
 
-    # Everything else the provider reported — audio, accepted/rejected
-    # prediction tokens, provider-specific buckets — survives here verbatim.
-    # "" when unavailable, so the attribute's presence is stable.
+    # The complete source maps survive here for provider-specific buckets and
+    # forensic fidelity. Known scalars such as audio are also projected onto
+    # their standard attributes above.
     input_details = normalized["input_token_details"]
     output_details = normalized["output_token_details"]
-    span.set_attribute(
-        APP_INPUT_TOKEN_DETAILS, json.dumps(input_details) if input_details else ""
-    )
-    span.set_attribute(
-        APP_OUTPUT_TOKEN_DETAILS, json.dumps(output_details) if output_details else ""
-    )
+    if input_details:
+        span.set_attribute(APP_INPUT_TOKEN_DETAILS, json.dumps(input_details))
+    if output_details:
+        span.set_attribute(APP_OUTPUT_TOKEN_DETAILS, json.dumps(output_details))
 ```
 
 The same normalized dict goes to `record_model_operation(usage=...)` so the span and the token histogram can never disagree — see `../../metrics/genai.md`.
@@ -118,19 +125,21 @@ everything else in the detail maps       ->  one serialized app.* attribute per 
 
 Three decisions behind it:
 
-- **`reasoning` is promoted to a standard attribute.** `gen_ai.usage.reasoning.output_tokens` exists, so it should not be buried inside a JSON blob where no backend can aggregate it.
+- **Known scalar subsets are promoted to standard attributes.** Cache read/write, reasoning output, and audio input/output each have a standard `gen_ai.usage.*` attribute. The complete source detail maps remain under `app.*` for fields that have no standard projection and for forensic fidelity.
 - **`total_tokens` is dropped, not stored.** It is `input + output`, and a derived scalar is one more field every dashboard has to reconcile against the two it was derived from. Note that the writer discards it outright — it is a sibling of the detail maps, not inside them, so it does not survive in `app.gen_ai.usage.*_token_details` either. Recompute it at query time. If a provider's total genuinely differs from `input + output` (some count differently for billing), that is a real fact and needs its own `app.*` attribute rather than being silently lost.
 - **The detail maps go under `app.*`, not `gen_ai.*`.** `gen_ai.usage.input_token_details` is not a real convention. Inventing a key inside a standard namespace collides with whatever OTel eventually ships there.
 
 Capture every figure the source exposes. Token counts drive cost, prompt-growth detection, and cache-effectiveness analysis, and none of them can be reconstructed after the fact. If a provider reports billable and raw tokens separately, use billable tokens for the standard attributes.
 
-When the provider reports no details, the writer still emits a stable set:
+When the provider reports no details, the flattened form preserves that absence:
 
 ```json
 {
   "input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200,
   "input_token_details": null, "output_token_details": null,
-  "cache_read_tokens": 0, "cache_creation_tokens": 0, "reasoning_tokens": 0
+  "cache_read_tokens": null, "cache_write_tokens": null,
+  "reasoning_tokens": null, "audio_input_tokens": null,
+  "audio_output_tokens": null
 }
 ```
 
@@ -212,7 +221,7 @@ def extract_usage(response) -> dict | None:
 
 Write the equivalent adapter from this table:
 
-| Provider | Input / output totals | Cache read | Cache creation | Reasoning |
+| Provider | Input / output totals | Cache read | Cache write | Reasoning |
 | --- | --- | --- | --- | --- |
 | OpenAI | `usage.prompt_tokens` / `completion_tokens` | `prompt_tokens_details.cached_tokens` | — | `completion_tokens_details.reasoning_tokens` |
 | Anthropic | `usage.input_tokens` / `output_tokens` | `usage.cache_read_input_tokens` | `usage.cache_creation_input_tokens` | reported per model, check the response |
@@ -226,7 +235,7 @@ Verify against the SDK version actually pinned in the project — these field na
 
 ## Streaming: usage is opt-in at the request
 
-Most providers omit token counts from a streamed response unless asked, and the omission is **silent**. The spans look correct; usage is simply zero everywhere.
+Most providers omit token counts from a streamed response unless asked, and the omission is **silent**. The spans look correct; usage attributes and observations are simply absent.
 
 ```python
 # Direct SDK: the counts arrive on a final chunk whose `choices` list is empty.
@@ -245,8 +254,8 @@ The equivalent for other providers differs; check the integration. **If `gen_ai.
 ## Verify
 
 - `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens` are non-zero on a real call.
-- `gen_ai.usage.cache_read.input_tokens` and `gen_ai.usage.cache_creation.input_tokens` are present, even when `0`.
-- `app.gen_ai.usage.input_token_details` / `output_token_details` are populated when the provider reports details, and `""` when it does not.
+- `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens`, reasoning, and audio breakdowns are present when the provider reports them, including an explicit `0`, and absent when unavailable.
+- `app.gen_ai.usage.input_token_details` / `output_token_details` are populated only when the provider reports details.
 - Streamed and non-streamed calls to the same model both carry usage.
 - The token histogram in `../../metrics/genai.md` and the span attributes come from the same normalized dict.
 

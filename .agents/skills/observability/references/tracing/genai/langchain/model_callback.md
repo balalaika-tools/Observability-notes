@@ -68,16 +68,22 @@ def resolve_provider(metadata: dict[str, Any] | None) -> str:
     provider = (metadata or {}).get("ls_provider")
     return {
         "openai": "openai",
+        # Current LangChain integrations expose these short/legacy labels;
+        # normalize them to the OTel well-known provider values.
+        "azure": "azure.ai.openai",
         "azure_openai": "azure.ai.openai",
         "anthropic": "anthropic",
+        "amazon_bedrock": "aws.bedrock",
         "bedrock": "aws.bedrock",
         "bedrock_converse": "aws.bedrock",
         "google_genai": "gcp.gemini",
         "google_vertexai": "gcp.vertex_ai",
         "cohere": "cohere",
+        "mistral": "mistral_ai",
         "mistralai": "mistral_ai",
         "groq": "groq",
         "deepseek": "deepseek",
+        "xai": "x_ai",
     }.get(provider, provider or "unknown")
 ```
 
@@ -199,7 +205,7 @@ class OTelModelCallback(AsyncCallbackHandler):
     ) -> None:
         model = resolve_request_model(serialized, metadata, kwargs)
         provider = resolve_provider(metadata)
-        span_name_model = model or "unknown_model"
+        span_name = f"chat {model}" if model else "chat"
 
         counters = current_counters()
         if counters is not None:
@@ -217,7 +223,7 @@ class OTelModelCallback(AsyncCallbackHandler):
         # the model call finishes, so this span cannot be a context manager.
         # Its parent is whatever span is current right now — the agent span.
         span = tracer.start_span(
-            f"chat {span_name_model}",
+            span_name,
             kind=trace.SpanKind.CLIENT,
             attributes=attributes,
         )
@@ -311,7 +317,10 @@ class OTelModelCallback(AsyncCallbackHandler):
             if run["chunk_count"]:
                 span.set_attribute(
                     GENAI_OUTPUT_MESSAGES,
-                    serialize_text_output("".join(run["captured_chunks"])),
+                    serialize_text_output(
+                        "".join(run["captured_chunks"]),
+                        (metadata.get("finish_reasons") or ["unknown"])[0],
+                    ),
                 )
                 if run["capture_truncated"]:
                     span.set_attribute(
@@ -445,7 +454,7 @@ streaming_model = init_chat_model(
 ).with_config(callbacks=[OTelModelCallback(streaming=True)])
 ```
 
-Miss it and the spans look correct with zero usage everywhere. Why, and the equivalent for other providers: `../token_usage.md`.
+Miss it and the spans look correct but usage attributes and observations are absent. Why, and the equivalent for other providers: `../token_usage.md`.
 
 ### Chunk count and captured content
 

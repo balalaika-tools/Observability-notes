@@ -128,11 +128,12 @@ def complete_chat(
 
         choice = response.choices[0]
         answer = choice.message.content or ""
+        finish_reason = choice.finish_reason or "unknown"
 
         if response_model:
             span.set_attribute(GENAI_RESPONSE_MODEL, response_model)
         span.set_attribute(GENAI_RESPONSE_ID, response.id)
-        span.set_attribute(GENAI_FINISH_REASONS, [choice.finish_reason])
+        span.set_attribute(GENAI_FINISH_REASONS, [finish_reason])
 
         # Same dict the metric got, so span and histogram cannot disagree.
         set_usage_attributes(span, usage)
@@ -140,7 +141,7 @@ def complete_chat(
         if settings.capture_ai_content:
             span.set_attribute(
                 GENAI_OUTPUT_MESSAGES,
-                serialize_text_output(answer, choice.finish_reason),
+                serialize_text_output(answer, finish_reason),
             )
 
         return answer
@@ -196,6 +197,7 @@ def stream_chat(client, messages: list[dict], *, model: str):
     usage: dict | None = None
     response_model: str | None = None
     response_id: str | None = None
+    finish_reason: str | None = None
 
     try:
         # Only the non-yielding work is made current, so any span the SDK or a
@@ -230,6 +232,11 @@ def stream_chat(client, messages: list[dict], *, model: str):
                 span.set_attribute(GENAI_RESPONSE_MODEL, response_model)
             if response_id:
                 span.set_attribute(GENAI_RESPONSE_ID, response_id)
+            for choice in getattr(chunk, "choices", None) or []:
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                    span.set_attribute(GENAI_FINISH_REASONS, [finish_reason])
+                    break
 
             # Arrives on a final chunk whose `choices` list is empty.
             if chunk.usage is not None:
@@ -266,7 +273,10 @@ def stream_chat(client, messages: list[dict], *, model: str):
         if captured_chunks is not None:
             span.set_attribute(
                 GENAI_OUTPUT_MESSAGES,
-                serialize_text_output("".join(captured_chunks)),
+                serialize_text_output(
+                    "".join(captured_chunks),
+                    finish_reason or ("error" if error_type else "unknown"),
+                ),
             )
             if error_type:
                 span.set_attribute("app.gen_ai.output.capture_mode", "partial")

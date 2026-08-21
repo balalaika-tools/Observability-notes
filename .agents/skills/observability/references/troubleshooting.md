@@ -25,7 +25,7 @@ Two things first, because they explain a surprising share of reports:
 | A CLI job or scheduled run produces nothing | Process exited before the batch processor flushed | `tracing/scheduled_jobs.md` |
 | Spans from only one worker process | Provider built before the fork | `setup/startup_prefork.md` |
 | Metrics missing but traces fine | No metric reader, or export interval longer than the test run | `setup/sdk_bootstrap.md` |
-| `curl localhost:8889/metrics` refuses the connection | No `prometheus` exporter in the Collector config; `8888` is the Collector's own telemetry | `collector/dev_staging.md` |
+| Metrics appear in the debug exporter but not in the backend | Metrics OTLP endpoint, protocol, authentication, or Collector exporter routing is wrong | `collector/dev_staging.md` |
 
 ## Too much arrives
 
@@ -55,7 +55,7 @@ Two things first, because they explain a surprising share of reports:
 
 | Symptom | Likely cause | File |
 | --- | --- | --- |
-| Token counts zero on streamed calls only | Usage not requested: `stream_usage=True` on the model, or `stream_options={"include_usage": True}` on the SDK call | `tracing/genai/token_usage.md` |
+| Token attributes absent on streamed calls only | Usage not requested: `stream_usage=True` on the model, or `stream_options={"include_usage": True}` on the SDK call | `tracing/genai/token_usage.md` |
 | `gen_ai.request.model` is `chat` or `llm` | `ls_model_type` used as a model-name fallback; omit the attribute instead | `tracing/genai/langchain/model_callback.md` |
 | Every call reports the same model | Hardcoded model name; the summarization model exposes it | `tracing/genai/langchain/model_callback.md` |
 | No model spans at all from a LangChain agent | Handler/invocation style mismatch (`AsyncCallbackHandler` with `invoke`), or the callback was attached at invoke time only | `tracing/genai/langchain/model_callback.md`, "Sync versus async invocation" |
@@ -98,6 +98,7 @@ Two things first, because they explain a surprising share of reports:
 | Retained percentage does not match the configured one | Tail-sampling policies OR together and overlap; measure the effective ratio | `collector/production.md` |
 | Sampler memory twice the estimate | `tail_sampling` named in two pipelines is two processor instances | `collector/production.md` |
 | Export counters flat while receive counters climb | Backend rejecting or credentials wrong; watch `otelcol_exporter_send_failed_*` | `collector/component.md` |
+| `docker stop` stalls near the grace period, or exits `1` only when the self-metrics backend is impaired | A periodic self-metrics reader is attempting its final export with a missing or oversized reader timeout | `collector/component.md`, "Keep the monitoring path independent" |
 
 ---
 

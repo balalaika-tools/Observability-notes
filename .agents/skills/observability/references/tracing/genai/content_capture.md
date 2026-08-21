@@ -25,7 +25,10 @@ settings = get_settings()
 
 if settings.capture_ai_content:
     span.set_attribute(GENAI_INPUT_MESSAGES, serialize_messages(messages))
-    span.set_attribute(GENAI_OUTPUT_MESSAGES, serialize_text_output(answer))
+    span.set_attribute(
+        GENAI_OUTPUT_MESSAGES,
+        serialize_text_output(answer, finish_reason),
+    )
 ```
 
 The attributes it gates:
@@ -85,12 +88,22 @@ def _part(value: Any) -> dict[str, Any]:
             "content": value.get("content", value.get("text", "")),
         }
     if part_type in {"tool_call", "tool_use"}:
-        return {
+        name = value.get("name")
+        if not name:
+            # A standard tool_call requires a name. Keep malformed provider
+            # data as an extensible generic part instead of inventing identity.
+            return {
+                "type": "unknown_tool_call",
+                "arguments": value.get("arguments", value.get("args", {})),
+            }
+        result = {
             "type": "tool_call",
-            "id": value.get("id", ""),
-            "name": value.get("name", ""),
+            "name": str(name),
             "arguments": value.get("arguments", value.get("args", {})),
         }
+        if call_id := value.get("id"):
+            result["id"] = str(call_id)
+        return result
 
     # Preserve normalized multimodal blocks when available. Content capture is
     # already opt-in; default=str below prevents SDK-specific objects raising.
@@ -118,8 +131,8 @@ def _parts(message: Any) -> list[dict[str, Any]]:
                     _part(
                         {
                             "type": "tool_call",
-                            "id": getattr(call, "id", ""),
-                            "name": getattr(call, "name", ""),
+                            "id": getattr(call, "id", None),
+                            "name": getattr(call, "name", None),
                             "args": getattr(call, "args", {}),
                         }
                     )
@@ -128,7 +141,22 @@ def _parts(message: Any) -> list[dict[str, Any]]:
 
 
 def _message(message: Any, default_role: str = "user") -> dict[str, Any]:
-    return {"role": _role(message, default_role), "parts": _parts(message)}
+    role = _role(message, default_role)
+    if role == "tool":
+        if isinstance(message, dict):
+            response = message.get("content", "")
+            tool_call_id = message.get("tool_call_id")
+        else:
+            response = getattr(message, "content", "")
+            tool_call_id = getattr(message, "tool_call_id", None)
+        part: dict[str, Any] = {
+            "type": "tool_call_response",
+            "response": response,
+        }
+        if tool_call_id:
+            part["id"] = str(tool_call_id)
+        return {"role": role, "parts": [part]}
+    return {"role": role, "parts": _parts(message)}
 
 
 def serialize_messages(messages: list[Any]) -> str:
@@ -155,14 +183,15 @@ def serialize_chat_model_input(
     return serialize_messages(list(batches[0])), len(batches)
 
 
-def serialize_text_output(text: str, finish_reason: str | None = None) -> str:
+def serialize_text_output(text: str, finish_reason: str | None) -> str:
     """A completed assistant response, streamed or not."""
     message: dict[str, Any] = {
         "role": "assistant",
         "parts": [{"type": "text", "content": text}],
+        # Required by the pinned output-message schema. `unknown` is used only
+        # when a framework omitted the provider's reason.
+        "finish_reason": str(finish_reason or "unknown"),
     }
-    if finish_reason:
-        message["finish_reason"] = finish_reason
     return json.dumps([message])
 
 
@@ -182,8 +211,7 @@ def serialize_llm_result(response: Any) -> str:
                 response_metadata.get("finish_reason")
                 or generation_info.get("finish_reason")
             )
-            if finish_reason:
-                message["finish_reason"] = finish_reason
+            message["finish_reason"] = str(finish_reason or "unknown")
             output_messages.append(message)
     return json.dumps(output_messages, default=str)
 
@@ -197,6 +225,8 @@ def serialize_tool_output(result: Any) -> str:
 ```
 
 `default=str` on the tool serializers is deliberate: a tool returning a dataclass, a `Decimal`, or a `datetime` must not make `json.dumps` raise inside a span.
+
+Every output choice carries `finish_reason`, as required by the pinned JSON schema. Preserve the provider value; `unknown` is only a fail-soft fallback when a framework omits it. Optional tool-call IDs are omitted when unavailable, and a malformed nameless tool call is retained as a generic `unknown_tool_call` part rather than assigned a fabricated standard identity.
 
 For batched LangChain input, record `app.gen_ai.input.batch_size` from the returned integer. If it is greater than one, set `app.gen_ai.input.capture_mode="truncated"`; the standard attribute intentionally contains only the first conversation rather than merging independent inputs.
 
@@ -239,7 +269,7 @@ grep -E 'gen_ai\.(input\.messages|output\.messages|system_instructions|tool\.def
 Expect no matches.
 
 - With it enabled, the attributes appear and hold the standard message-array schema.
-- Multiple generations appear as independent assistant messages, with finish reasons and tool/multimodal parts preserved where available.
+- Multiple generations appear as independent assistant messages, each with a finish reason; tool responses, tool calls, and multimodal parts are preserved where available.
 - Batched input records its batch size and marks the first-conversation capture as truncated.
 - If capture is filtered or truncated, `app.gen_ai.input.capture_mode` marks it.
 - With capture off, a long streamed response allocates nothing — check the chunk buffer is empty, not just the attribute absent.

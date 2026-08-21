@@ -54,15 +54,6 @@ exporters:
     sampling_initial: 5
     sampling_thereafter: 200
 
-  # Application metrics, scrapeable locally on :8889. This is what the
-  # `curl localhost:8889/metrics` checks in ../verification.md and
-  # ../metrics/service.md read. Development only — production sends metrics
-  # onward with prometheus_remote_write and exposes no scrape endpoint.
-  # Note the port split: 8888 is the Collector's OWN telemetry, 8889 is the
-  # application's. Grepping the wrong one finds nothing and looks like a bug.
-  prometheus:
-    endpoint: 0.0.0.0:8889
-
   otlphttp/traces:
     endpoint: ${env:TRACES_ENDPOINT}
 
@@ -75,23 +66,24 @@ service:
     # This resource belongs to the Collector itself. The
     # resource/environment processor below labels telemetry passing through it.
     resource:
-      service.name: otel-collector-gateway
-      deployment.environment.name: development
+      attributes:
+        - name: service.name
+          value: otel-collector-gateway
+        - name: deployment.environment.name
+          value: development
     logs:
       level: info
       encoding: console
     metrics:
       level: normal
       readers:
-        - pull:
+        - periodic:
+            # Bound the final shutdown export inside the 30 s Compose budget.
+            timeout: 5000
             exporter:
-              prometheus:
-                host: 0.0.0.0
-                port: 8888
-                # Keep dashboard and alert names equal to the canonical OTLP
-                # names documented in component.md.
-                without_type_suffix: true
-                without_units: true
+              otlp:
+                protocol: http/protobuf
+                endpoint: ${env:SELF_METRICS_ENDPOINT}
   pipelines:
     traces:
       receivers: [otlp]
@@ -101,7 +93,7 @@ service:
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, resource/environment, batch]
-      exporters: [debug, prometheus, otlphttp/metrics]
+      exporters: [debug, otlphttp/metrics]
 
     logs:
       receivers: [otlp]
@@ -113,7 +105,8 @@ Notes on the choices:
 
 - **No sampling processor at all.** Every trace is kept.
 - **`debug` with `verbosity: detailed`** prints full spans. The `sampling_*` settings stop a busy local run from flooding the terminal. It prints *everything on the span*, so with `CAPTURE_AI_CONTENT` enabled it writes prompts and completions into the Collector's own logs — do not point a log shipper at a Collector running this exporter, and do not enable it anywhere with real user content.
-- **`prometheus` on :8889** exists so the metric checks in `../verification.md` have something to scrape. Remove it from any config that leaves a developer machine.
+- **Application and self-metrics both leave by push.** The debug exporter gives
+  local visibility; the configured OTLP destinations prove delivery.
 - **Short batch timeout.** Five seconds feels broken when you are watching a terminal for a span you just triggered.
 - **`memory_limiter` is still present.** It is cheap, and its absence in dev is how you discover in production that nobody ever tested with it.
 
@@ -133,8 +126,6 @@ services:
       - 127.0.0.1:4317:4317
       - 127.0.0.1:4318:4318
       - 127.0.0.1:13133:13133
-      - 127.0.0.1:8888:8888     # Collector self-telemetry
-      - 127.0.0.1:8889:8889     # application metrics, dev verification only
     stop_grace_period: 30s
 ```
 
@@ -183,6 +174,8 @@ processors:
         action: delete
       - key: db.query.text
         action: delete
+      - key: db.statement
+        action: delete
       - key: user.email
         action: delete
 
@@ -227,8 +220,11 @@ service:
   extensions: [health_check]
   telemetry:
     resource:
-      service.name: otel-collector-gateway
-      deployment.environment.name: staging
+      attributes:
+        - name: service.name
+          value: otel-collector-gateway
+        - name: deployment.environment.name
+          value: staging
     # The platform log agent collects stderr. Do not feed these records back
     # through this Collector's own OTLP receiver.
     logs:
@@ -237,13 +233,14 @@ service:
     metrics:
       level: normal
       readers:
-        - pull:
+        - periodic:
+            timeout: 5000
             exporter:
-              prometheus:
-                host: 0.0.0.0
-                port: 8888
-                without_type_suffix: true
-                without_units: true
+              otlp:
+                protocol: http/protobuf
+                endpoint: ${env:SELF_METRICS_ENDPOINT}
+                headers:
+                  Authorization: ${env:SELF_METRICS_AUTHORIZATION}
   pipelines:
     traces:
       receivers: [otlp]
@@ -258,7 +255,7 @@ service:
 
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, resource/environment, batch]
+      processors: [memory_limiter, resource/environment, attributes/drop_secrets, batch]
       exporters: [otlphttp/metrics]
 
     logs:
@@ -286,14 +283,13 @@ Send one request through an instrumented service and confirm:
 
 ```bash
 docker compose logs --tail=200 otel-collector | head -60
-# 8888 = the Collector's internal operational metrics
-curl --fail http://127.0.0.1:8888/metrics | grep -E 'otelcol_(receiver_accepted|exporter_sent|exporter_send_failed)'
-# 8889 = the application's metrics, via the dev-only prometheus exporter
-curl --fail http://127.0.0.1:8889/metrics | grep -E '^(app_|gen_ai_|http_server_)'
 ```
 
-- receive counters increase;
-- export counters increase, and `send_failed` stays at zero;
+- the metrics backend contains application metrics such as `app.*`, `gen_ai.*`,
+  or `http.server.*` from the canary;
+- the monitoring destination contains this Collector's
+  `otelcol_process_uptime`; receiver/export counters increase and
+  `otelcol_exporter_send_failed_*` stays at zero;
 - the debug exporter prints spans with your `service.name` and populated attributes;
 - the backend can find `service.name=<your service>`.
 

@@ -40,11 +40,14 @@ GENAI_OUTPUT_TYPE = "gen_ai.output.type"
 GENAI_INPUT_TOKENS = "gen_ai.usage.input_tokens"
 GENAI_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
 GENAI_CACHE_READ_INPUT_TOKENS = "gen_ai.usage.cache_read.input_tokens"
-GENAI_CACHE_CREATION_INPUT_TOKENS = "gen_ai.usage.cache_creation.input_tokens"
+GENAI_CACHE_WRITE_INPUT_TOKENS = "gen_ai.usage.cache_write.input_tokens"
 GENAI_REASONING_OUTPUT_TOKENS = "gen_ai.usage.reasoning.output_tokens"
+GENAI_AUDIO_INPUT_TOKENS = "gen_ai.usage.audio.input_tokens"
+GENAI_AUDIO_OUTPUT_TOKENS = "gen_ai.usage.audio.output_tokens"
 
-# Organisation-owned: the complete normalized detail maps, serialized.
-# No OTel attribute carries these, so they must not live under gen_ai.*.
+# Organisation-owned: complete source detail maps, serialized for fidelity.
+# Standard scalar projections above are emitted as well; never invent a
+# catch-all detail-map attribute under gen_ai.*.
 APP_INPUT_TOKEN_DETAILS = "app.gen_ai.usage.input_token_details"
 APP_OUTPUT_TOKEN_DETAILS = "app.gen_ai.usage.output_token_details"
 
@@ -114,6 +117,7 @@ anthropic         aws.bedrock          gcp.gemini
 gcp.vertex_ai     gcp.gen_ai           cohere
 mistral_ai        deepseek             groq
 x_ai              perplexity           ibm.watsonx.ai
+moonshot_ai
 ```
 
 Through a proxy or gateway, set the platform you can actually see at span start. If the upstream provider becomes known later, record it as `app.gen_ai.upstream_provider`.

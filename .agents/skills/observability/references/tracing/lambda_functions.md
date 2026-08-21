@@ -176,15 +176,20 @@ Keep the common `service.namespace`, `service.name`, immutable
 
 ```text
 cloud.provider = aws
+cloud.platform = aws_lambda
 cloud.region   = AWS_REGION
 faas.name      = AWS_LAMBDA_FUNCTION_NAME
 faas.version   = AWS_LAMBDA_FUNCTION_VERSION
+faas.instance  = AWS_LAMBDA_LOG_STREAM_NAME
 ```
 
 Do not use `context.aws_request_id` as `service.instance.id`; it identifies an
-invocation, not the reused execution environment. When the backend requires an
-instance ID, generate one UUID once at module initialization and reuse it for
-the lifetime of that warm environment.
+invocation, not the reused execution environment. This skill requires an
+instance ID, so reuse the full `AWS_LAMBDA_LOG_STREAM_NAME` as
+`service.instance.id` when available; it identifies the warm execution
+environment and is also the prescribed `faas.instance` value. If a custom
+runtime does not expose it, generate one UUID once at module initialization
+and reuse it for the lifetime of that warm environment.
 
 ## Mock trigger fixtures
 

@@ -127,7 +127,7 @@ def metric_views() -> list[View]:
         ),
         "gen_ai.client.token.usage": GENAI_TOKEN_BUCKETS,
         "app.gen_ai.client.token.cache_read.usage": GENAI_TOKEN_BUCKETS,
-        "app.gen_ai.client.token.cache_creation.usage": GENAI_TOKEN_BUCKETS,
+        "app.gen_ai.client.token.cache_write.usage": GENAI_TOKEN_BUCKETS,
         "app.gen_ai.client.token.reasoning.usage": GENAI_TOKEN_BUCKETS,
         "gen_ai.execute_tool.duration": GENAI_CLIENT_DURATION_BUCKETS,
         "gen_ai.invoke_agent.duration": GENAI_AGENT_DURATION_BUCKETS,
@@ -261,7 +261,7 @@ Keep these values in the service's settings object. Although the SDK can read th
 | literal passed | the literal wins and the SDK ignores its environment variable |
 | settings field passed, as above | the service config validates the environment value and supplies its documented default |
 
-This keeps every deployment override in the same typed configuration path instead of splitting ownership between the application and the SDK. A 60-second metric interval means an alert cannot fire on data younger than a minute, which is usually too slow for a request-rate or error-rate alert. Shortening it costs more export requests and more series churn; leave the documented default at 15 s unless the metrics backend complains, and never shorten it below the Collector's own scrape or batch interval.
+This keeps every deployment override in the same typed configuration path instead of splitting ownership between the application and the SDK. A 60-second metric interval means an alert cannot fire on data younger than a minute, which is usually too slow for a request-rate or error-rate alert. Shortening it costs more export requests and more series churn; leave the documented default at 15 s unless the metrics backend complains, and coordinate it with the Collector batch/export cadence.
 
 Drops from an undersized queue are silent. If spans go missing only under load, this is the first thing to check — and the Collector's `otelcol_receiver_accepted_spans` next to the application's own export count is how you confirm it (`../collector/component.md`).
 
@@ -345,12 +345,11 @@ Start the service and hit it once. You should see a span printed with your `serv
 
 Remove the console exporter before committing.
 
-Also export metrics once and inspect the bucket boundaries. For Prometheus,
-`gen_ai_client_operation_duration_bucket` must include `le="81.92"`, agent
-duration must include `le="409.6"`, workflow duration must include
-`le="7200"`, and token usage must include `le="67108864"`. If only generic
-SDK boundaries appear, the `views=metric_views()` argument was omitted or the
-instrument name no longer matches the view.
+Also export metrics once over OTLP and inspect the histogram boundaries in the
+backend: client duration must include `81.92`, agent duration `409.6`, workflow
+duration `7200`, and token usage `67108864`. If only generic SDK boundaries
+appear, the `views=metric_views()` argument was omitted or the instrument name
+no longer matches the view.
 
 ---
 

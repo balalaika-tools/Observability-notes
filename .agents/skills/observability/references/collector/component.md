@@ -62,10 +62,10 @@ Most production configs in this skill need **Contrib**, because `tail_sampling` 
 Verify before deploying:
 
 ```bash
-docker run --rm otel/opentelemetry-collector-contrib:0.158.0 components
+docker run --rm otel/opentelemetry-collector-contrib:0.159.0 components
 ```
 
-Compare the output against every component ID in your config. Look up the current release before pinning — the Collector moves fast, and `0.158.0` was current in early August 2026.
+Compare the output against every component ID in your config. Look up the current release before pinning — the Collector moves fast, and `0.159.0` was released in mid-August 2026.
 
 ## Pin three things independently
 
@@ -77,7 +77,7 @@ Never run `latest`. A chart upgrade can change Services, probes, and security de
 
 ```dockerfile
 # services/otel-collector/Dockerfile
-FROM otel/opentelemetry-collector-contrib:0.158.0
+FROM otel/opentelemetry-collector-contrib:0.159.0
 
 # Config is baked in per environment via build arg, or mounted at runtime.
 ARG CONFIG_FILE=config.dev.yaml
@@ -136,6 +136,7 @@ service:
 ### If Langfuse is one of the destinations
 
 - Langfuse ingests over **OTLP/HTTP** only. An OTLP/gRPC exporter pointed at it fails.
+- Name pipeline exporters `otlphttp/...` or `otlp_grpc/...` explicitly. A bare `otlp` exporter (as opposed to the `otlp` receiver, which is still the correct name) is a deprecated alias for `otlp_grpc` on 0.159.0 and logs a startup warning: `"otlp" alias is deprecated; use "otlp_grpc" instead`.
 - Authentication is HTTP Basic with base64 of `public_key:secret_key`. Build it without a trailing newline and inject it from a secret store.
 - Send **complete traces**, not just the spans containing `gen_ai.request.model`. Filtering to model leaves discards the root, HTTP, retrieval, and tool spans and produces orphaned, unreadable agent traces.
 - Langfuse is a trace backend. Operational metrics go to the metrics backend.
@@ -181,7 +182,7 @@ Run the exact production image against the exact config:
 ```bash
 docker run --rm \
   --volume "${PWD}/config.prod.yaml:/etc/otelcol/config.yaml:ro" \
-  otel/opentelemetry-collector-contrib:0.158.0 \
+  otel/opentelemetry-collector-contrib:0.159.0 \
   validate --config=/etc/otelcol/config.yaml
 ```
 
@@ -191,10 +192,12 @@ Then check both ends:
 
 ```bash
 curl --fail http://127.0.0.1:13133/            # health
-curl --fail http://127.0.0.1:8888/metrics | grep '^otelcol_'
 ```
 
-A health check proves the process is running. It does **not** prove the backend is accepting data — for that, watch the exporter counters and then find the data in the backend.
+A health check proves the process is running. It does **not** prove the backend
+is accepting data. Query the monitoring backend for this Collector's
+`otelcol_process_uptime`, then confirm receiver/exporter counters change after
+sending a canary through the application pipeline.
 
 ---
 
@@ -209,7 +212,7 @@ The minimum baseline is:
 
 | Signal | Baseline |
 | --- | --- |
-| Internal metrics | `service.telemetry.metrics.level: normal`, delivered by an explicit private Prometheus reader or directly to a monitoring backend with the embedded OTLP reader |
+| Internal metrics | `service.telemetry.metrics.level: normal`, pushed directly to an independent monitoring destination with the embedded periodic OTLP reader |
 | Internal logs | `INFO`; JSON in shared environments, emitted to `stderr` for the platform log agent or sent directly to an independent OTLP endpoint |
 | Resource identity | A stable logical `service.name` per Collector role, `deployment.environment.name`, and the automatically generated `service.instance.id` |
 | Internal traces | Off by default. They are experimental and useful only for time-bounded diagnosis when metrics and logs cannot explain a pipeline problem |
@@ -238,11 +241,52 @@ None of the three substitutes for another.
 
 ### Keep the monitoring path independent
 
-Prefer a pull scrape of the private `:8888` endpoint and platform collection of
-the Collector's `stderr`. Those paths still report a blocked application
-pipeline or broken backend exporter. If pull is unavailable, use the embedded
-OTLP readers/processors under `service.telemetry` to send directly to a
-separate monitoring endpoint.
+Use the embedded periodic OTLP reader under `service.telemetry` to push
+self-metrics directly to a separate monitoring endpoint. It bypasses the
+application pipelines, so a broken application exporter cannot erase its own
+evidence. Do not create a Prometheus reader or expose a metrics listener.
+
+On the pinned 0.159.0 image, the direct self-metrics path has this exact shape:
+
+```yaml
+service:
+  telemetry:
+    metrics:
+      level: normal
+      readers:
+        - periodic:
+            # Reader-level budget for collection, export, and the final
+            # shutdown flush. This example assumes a 30 s termination budget.
+            timeout: 5000
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: ${env:SELF_METRICS_ENDPOINT}
+                headers:
+                  Authorization: ${env:SELF_METRICS_AUTHORIZATION}
+```
+
+The exporter key is `otlp`, not `otlp_http`, and this pin expects `headers` as
+a plain map. Validate that schema again on every image upgrade: the declarative
+SDK configuration is still development-status. The destination must not be
+this Collector's own OTLP receiver or another path that depends on the pipeline
+being observed.
+
+A periodic reader performs one final collection and export when its meter
+provider shuts down. Never leave that reader's `timeout` implicit: a monitoring
+endpoint that accepts a connection and then hangs can otherwise consume the
+Collector's whole termination grace period, preventing application exporters
+and their sending queues from finishing cleanly. Choose a measured reader
+timeout comfortably below the platform grace period and leave explicit budget
+for application-pipeline shutdown. The `5000` above is a reviewed example for
+the 30-second Compose/ECS budget, not a universal production value.
+
+Test the bound with a sink that accepts the TCP connection but never responds;
+an invalid hostname exercises fast DNS failure and does not prove the timeout.
+Confirm the Collector stops before the platform deadline and that queued
+application telemetry still drains. A failed final self-metrics export can
+still produce a non-zero process exit; do not hide it with a PID-1 wrapper or
+alarm on a bare non-zero exit without also distinguishing expected stops.
 
 Do not send a Collector's internal logs, metrics, or experimental traces to its
 own OTLP receiver and then through the same pipeline being observed. That
@@ -251,14 +295,13 @@ makes an exporter outage erase the evidence of the outage. When a two-tier
 deployment must observe itself, have the agent and gateway report to a separate
 monitoring tier or backend, with an explicit loop analysis.
 
-The self-metrics listener is an operational endpoint, not a public API:
-
-- bind to loopback for a same-host scraper;
-- in a container or pod, bind to the required private interface and restrict it
-  with a Service/network policy/firewall;
-- never publish `:8888`, pprof, or zPages to the internet;
-- use TLS/authentication for direct OTLP export across a trust boundary, with
-  credentials from the same secret-management path as other exporters.
+Use TLS and authentication for direct OTLP export across a trust boundary, with
+credentials from the same secret-management path as other exporters. If the
+embedded reader cannot satisfy the destination's authentication mechanism —
+for example, an extension-owned signer — push to a distinct monitoring
+Collector or agent that can authenticate onward. Never route self-metrics into
+this Collector's own receiver merely to gain access to its application
+pipeline exporters.
 
 `normal` is the production starting level. `detailed` adds cost and dimensions;
 enable it for a stated diagnostic need, verify cardinality, and roll it back.
@@ -274,15 +317,13 @@ The authoritative schema and metric inventory are in the
 
 Collector counters are cumulative. Alert on a sustained positive `rate()` or
 `increase()` over an operationally justified window, not on `counter > 0`; one
-old failure would otherwise alert forever. With a manually configured
-Prometheus reader, metric type and unit suffixes can change the exposed names.
-The configs in this skill set `without_type_suffix` and `without_units` so the
-names below remain the canonical `otelcol_*` names. Inspect `/metrics` after an
-image upgrade before promoting alert rules.
+old failure would otherwise alert forever. OTLP preserves the instrument names,
+but a backend can still translate them on ingest. Inspect the actual backend
+series after an image or backend upgrade before promoting alert rules.
 
 | Condition | What to use | Meaning |
 | --- | --- | --- |
-| Collector unavailable | scrape target absent/down, missing internal telemetry, process restarts | The observer itself is unavailable; this is the first page |
+| Collector unavailable | backend absence-over-window query, for example `absent_over_time(otelcol_process_uptime{...}[5m])`, plus platform restarts | The observer itself is unavailable; this is the first page |
 | Receiver backpressure | increasing `otelcol_receiver_refused_{spans,metric_points,log_records}` | Senders were refused; data loss depends on their retry behaviour |
 | Definite queue loss | increasing `otelcol_exporter_enqueue_failed_{spans,metric_points,log_records}` | Telemetry could not enter an exporter queue and was dropped |
 | Delivery impairment | sustained increase in `otelcol_exporter_send_failed_*` | The destination is failing; retries mean this alone is not proof of permanent loss |

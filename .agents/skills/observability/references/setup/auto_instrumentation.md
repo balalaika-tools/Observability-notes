@@ -16,9 +16,9 @@ Install an instrumentation package only when the service uses that library in a 
 | calls HTTP with httpx / requests | `opentelemetry-instrumentation-httpx` / `-requests` |
 | uses SQLAlchemy / psycopg / asyncpg | `opentelemetry-instrumentation-sqlalchemy` / `-psycopg` / `-asyncpg` |
 | uses Redis | `opentelemetry-instrumentation-redis` |
-| runs Celery tasks | `opentelemetry-instrumentation-celery` — **it owns the publish and task spans**; do not also write your own (`../tracing/queue_messaging.md`, "Other brokers") |
+| runs Celery tasks | `opentelemetry-instrumentation-celery` — **it owns the publish and task spans**; do not also write your own. Its `0.65b0` parent-vs-link option and legacy schema are in `../tracing/queue_messaging.md`, "Other brokers". |
 | runs as an AWS Lambda function | `opentelemetry-instrumentation-aws-lambda`, normally supplied by one selected Lambda instrumentation layer |
-| needs trace IDs in stdlib `logging` records | `opentelemetry-instrumentation-logging` |
+| needs trace IDs in stdlib `logging` records or direct OTel export of them | `opentelemetry-instrumentation-logging` — on `0.65b0` it installs an export handler by default; choose that path or stdout collection, and use `OTEL_PYTHON_LOG_AUTO_INSTRUMENTATION=false` when stdout owns delivery |
 
 Plus the SDK and exporter:
 
@@ -149,7 +149,7 @@ opentelemetry-instrument python worker.py
 
 ## When automatic and manual instrumentation collide
 
-Two owners of one boundary means two spans per operation — the failure mode SKILL.md rule 5 exists to prevent. It bites hardest on queue libraries: `boto3sqs` instrumentation already creates a receive span and a per-message process span linked to the producer, so a hand-written consumer span on top of it doubles every message.
+Two owners of one boundary means two spans per operation — the failure mode SKILL.md rule 5 exists to prevent. It bites hardest on queue libraries: `boto3sqs` instrumentation already creates a receive span and a per-message process span linked to the producer, so a hand-written consumer span on top of it doubles every message. On the pinned `0.65b0` line that automatic shape still declares the legacy `1.11.0` messaging schema; `../tracing/queue_messaging.md` owns the compatibility decision as well as the span-shape decision.
 
 **`../tracing/queue_messaging.md` owns that decision** — which shape the instrumentor actually produces, how to disable just that entry point, and what disabling it costs on the producer side. Read it before installing or removing a queue instrumentor.
 

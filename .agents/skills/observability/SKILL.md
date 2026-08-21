@@ -1,6 +1,6 @@
 ---
 name: observability
-description: "Add, audit, repair, upgrade, or troubleshoot OpenTelemetry tracing, metrics, and structured logging in an existing Python application or service — FastAPI/HTTP APIs, background workers, queue consumers, DB-backed state machines, scheduled jobs, AWS Lambda functions, LangChain/LangGraph agents, and direct provider-SDK LLM code — including GenAI semantic conventions, token and TTFC capture, trace propagation across queues and durable database handoffs, allowlisted baggage, an OpenTelemetry Collector component, and Langfuse/APM/Prometheus routing. Use whenever the user wants to instrument a service, fix or review existing telemetry, investigate missing or duplicate signals, or update an observability implementation."
+description: "Add, audit, repair, upgrade, or troubleshoot OpenTelemetry tracing, metrics, and structured logging in an existing Python application or service — FastAPI/HTTP APIs, background workers, queue consumers, DB-backed state machines, scheduled jobs, AWS Lambda functions, LangChain/LangGraph agents, and direct provider-SDK LLM code — including GenAI semantic conventions, token and TTFC capture, trace propagation across queues and durable database handoffs, allowlisted baggage, an OpenTelemetry Collector component, and OTLP-first backend routing. Use whenever the user wants to instrument a service, fix or review existing telemetry, investigate missing or duplicate signals, or update an observability implementation."
 ---
 
 # Observability Implementation
@@ -62,8 +62,14 @@ Everything else has a documented default or a condition under which to ask.
 
 These hold regardless of service type. They are short on purpose; the reasoning lives in the reference files.
 
-1. **Repository guidance wins.** Read `opentelemetry/` and `architecture/02_metrics_design_cheatsheet.md` in this repo when present. Where they disagree with an example in a reference file, follow the repo. Read `references/compatibility.md` before relying on any version-sensitive GenAI, LangChain, Collector, or backend example.
-2. **Never create span events.** Do not call `span.record_exception()` or `span.add_event()`; both are deprecated in favour of correlated log records. Pass `record_exception=False`, set a low-cardinality `error.type`, and emit the exception through the logging boundary. Full contract: `references/conventions/errors.md`.
+1. **Repository guidance wins.** Read `opentelemetry/` and `architecture/02_metrics_design_cheatsheet.md` in this repo when present. Where they disagree with an example in a reference file, follow the repo, except for older pull/scrape transport examples: this skill's OTLP-first push contract below is the explicit current policy. Read `references/compatibility.md` before relying on any version-sensitive GenAI, LangChain, Collector, or backend example.
+2. **Do not create first-party span events.** At the pinned Python version,
+   `span.record_exception()` and `span.add_event()` remain supported Trace APIs;
+   the exception-on-span semantic convention is deprecated as OpenTelemetry
+   moves exception events to correlated logs. This skill adopts that migration
+   as a house contract: pass `record_exception=False`, set a low-cardinality
+   `error.type`, and emit the exception through the logging boundary. Full
+   contract: `references/conventions/errors.md`.
 3. **Standard conventions first.** Use an OpenTelemetry semantic attribute when one exists. Use the organisation namespace `app.*` when none does. Never invent a key inside a standard namespace such as `gen_ai.*`.
 4. **Span names are low-cardinality.** `chat gpt-5`, `execute_tool order_lookup`, `GET /orders/{order_id}`. Never an ID, prompt, or user value. Dynamic values are attributes.
 5. **One owner per boundary.** A request, Lambda invocation, queue message, durable state transition, or model call gets exactly one span from exactly one source. Automatic instrumentation, a framework integration, a gateway, and your own code are all candidates — pick one and disable or skip the others. Two owners means duplicated spans and doubled token and cost analytics.
@@ -73,6 +79,9 @@ These hold regardless of service type. They are short on purpose; the reasoning 
 9. **Metrics are not derived from sampled traces.** They are emitted independently, with bounded attributes only.
 10. **Instrument boundaries, not functions.** HTTP request, queue publish/consume, durable work claim/state transition, database query, external call, LLM call, tool call, agent invocation. Not every helper.
 11. **Durable handoffs carry context.** Queue messages, outbox rows, leased jobs, and persisted state transitions carry an allowlisted W3C trace carrier written atomically with the work. Delayed or retried work normally starts a new trace with a link. Logs keep the current span's `trace_id`/`span_id`; a stable workflow/run ID correlates important logs and linked traces and never labels metrics.
+12. **OTLP push is the default.** Applications send traces, metrics, and logs over OTLP to the Collector, which pushes them to their backends.
+    Collector self-metrics use a bounded periodic OTLP reader to independent monitoring. Do not add Prometheus pull readers, scrape endpoints, or scrape verification.
+    A backend-specific push exporter such as Prometheus remote write is allowed only when the selected backend requires it.
 
 ### Material to load conditionally
 

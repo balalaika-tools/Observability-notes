@@ -94,9 +94,11 @@ The owning boundary is whichever layer decides the request's outcome — the exc
 The exception to that rule is a failure that is **handled and recovered**: a tool attempt that a retry then fixes, or a model fallback that succeeds. Those never reach the boundary, so if you want them visible they need their own record where they happen — at `warning`, with `app.outcome` describing the recovery, and without marking the parent span `ERROR`.
 
 For a recovered model-client attempt exported through the OTel logs signal,
-set `otel_event_name="gen_ai.client.operation.exception"`. For a recovered tool
-attempt, keep the application-owned event because the standard client-operation
-exception event does not describe tool execution.
+set `otel_event_name="gen_ai.client.operation.exception"`. The shared structlog
+pipeline derives the required `exception.type` / `exception.message` from
+`exc_info` before rendering the stack and exports this standard event at
+`WARN`. For a recovered tool attempt, keep the application-owned event because
+the standard client-operation exception event does not describe tool execution.
 
 ```python
 log.warning(

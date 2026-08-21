@@ -29,8 +29,8 @@ Format: **operation, then a stable subject**. No IDs, no user input, no prompt t
 | `invoke_agent support_agent` | `agent invocation` | Loses which agent when there are several |
 | `chat gpt-5` | `chat` | Cannot compare models |
 | `execute_tool web_search` | `tool call` | Cannot find the failing tool |
-| `publish sqs pricing-jobs` | `publish message` | Loses the queue |
-| `consume sqs pricing-jobs` | `worker loop` | Describes the code, not the operation |
+| `send pricing-jobs` | `publish message` | Loses the queue |
+| `process pricing-jobs` | `worker loop` | Describes the code, not the operation |
 | `run workflow transition` | `run transition wf-123` | Puts a workflow-run ID in the name |
 
 GenAI spans follow the semantic convention shape `{gen_ai.operation.name} {subject}`:
@@ -72,7 +72,7 @@ app.retrieval.result_count       not   n
 | --- | --- | --- |
 | Resource attributes | OTel | `service.name`, `service.version`, `deployment.environment.name`, `service.instance.id` |
 | HTTP | OTel | `http.request.method`, `http.route`, `http.response.status_code`, `server.address` |
-| Messaging | OTel | `messaging.system`, `messaging.destination.name`, `messaging.operation.type` |
+| Messaging | OTel | `messaging.system`, `messaging.destination.name`, `messaging.operation.name`, `messaging.operation.type` |
 | Database | OTel | `db.system.name`, `db.operation.name` |
 | Errors | OTel | `error.type` — low-cardinality class or code, never a message |
 | GenAI | OTel | `gen_ai.*` — the full set lives in `../tracing/genai/attributes.md` |
@@ -147,7 +147,8 @@ Every unique attribute combination is a time series. Bounded values only:
 
 ```
 allowed    service.name, deployment.environment.name, http.route, http.request.method,
-           http.response.status_code, messaging.destination.name, messaging.operation.type,
+           http.response.status_code, messaging.destination.name, messaging.operation.name,
+           messaging.operation.type,
            gen_ai.operation.name, gen_ai.provider.name, gen_ai.request.model,
            gen_ai.response.model, gen_ai.tool.name (bounded), gen_ai.agent.name (bounded),
            app.job.type, app.outcome, app.tenant.tier, error.type (normalized)

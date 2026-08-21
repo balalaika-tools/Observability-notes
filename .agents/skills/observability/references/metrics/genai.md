@@ -55,8 +55,8 @@ cache_read_token_usage = meter.create_histogram(
     unit="{token}",
     description="Input tokens served from a provider cache.",
 )
-cache_creation_token_usage = meter.create_histogram(
-    "app.gen_ai.client.token.cache_creation.usage",
+cache_write_token_usage = meter.create_histogram(
+    "app.gen_ai.client.token.cache_write.usage",
     unit="{token}",
     description="Input tokens written to a provider cache.",
 )
@@ -145,17 +145,18 @@ def record_model_operation(
         ("input", normalized["input_tokens"]),
         ("output", normalized["output_tokens"]),
     ):
-        if value:
+        # Preserve an explicit zero; only absence suppresses an observation.
+        if value is not None:
             token_usage.record(
                 value, {**attributes, "gen_ai.token.type": token_type}
             )
 
     for instrument, value in (
         (cache_read_token_usage, normalized["cache_read_tokens"]),
-        (cache_creation_token_usage, normalized["cache_creation_tokens"]),
+        (cache_write_token_usage, normalized["cache_write_tokens"]),
         (reasoning_token_usage, normalized["reasoning_tokens"]),
     ):
-        if value:
+        if value is not None:
             instrument.record(value, attributes)
 
 
@@ -172,13 +173,21 @@ def record_time_to_first_chunk(
 
 
 def record_tool_execution(
-    *, duration_s: float, tool_name: str, error_type: str | None = None
+    *,
+    duration_s: float,
+    tool_name: str,
+    error_type: str | None = None,
+    agent_name: str | None = None,
+    tool_type: str | None = None,
 ) -> None:
-    attributes = {
-        "gen_ai.operation.name": "execute_tool",
-        # Must already be normalized to a bounded set by the caller.
-        "gen_ai.tool.name": tool_name,
-    }
+    # These are the attributes declared for gen_ai.execute_tool.duration.
+    # gen_ai.operation.name belongs on the span, not on this metric.
+    attributes = {"gen_ai.tool.name": tool_name}
+    if agent_name:
+        attributes["gen_ai.agent.name"] = agent_name
+    if tool_type:
+        # Standard values: function, extension, datastore.
+        attributes["gen_ai.tool.type"] = tool_type
     if error_type:
         attributes["error.type"] = error_type
     tool_duration.record(duration_s, attributes)
@@ -192,10 +201,9 @@ def record_agent_invocation(
     inference_calls: int | None = None,
     tool_calls: int | None = None,
 ) -> None:
-    attributes = {
-        "gen_ai.operation.name": "invoke_agent",
-        "gen_ai.agent.name": agent_name,
-    }
+    # Agent duration and fan-out instruments do not declare
+    # gen_ai.operation.name as a metric attribute.
+    attributes = {"gen_ai.agent.name": agent_name}
     duration_attributes = dict(attributes)
     if error_type:
         duration_attributes["error.type"] = error_type
@@ -221,6 +229,12 @@ def record_workflow_invocation(
 ```
 
 `gen_ai.token.type` has exactly two standard values: `input` and `output`. Never extend that enum with cache or reasoning categories. The application-owned breakdown histograms preserve those provider-neutral subsets without making the standard total unsafe to aggregate.
+
+Metric attribute sets are per instrument, not a global bag of valid GenAI
+keys. In particular, keep `gen_ai.operation.name` on model metrics and spans;
+do not add it to `gen_ai.execute_tool.duration`, the agent duration/fan-out
+metrics, or the workflow duration metric unless a later pinned revision
+declares it there.
 
 The `View` definitions that apply the convention's explicit boundaries to these instruments live in `../setup/sdk_bootstrap.md`. Declaring a histogram here does not configure its boundaries.
 
@@ -329,7 +343,7 @@ Only where a product fact has no standard equivalent:
 | `app.guardrail.decisions` | Counter, by bounded decision + policy | Safety and policy trends |
 | `app.gen_ai.estimated_cost_usd` | Histogram | Spend by workflow, model, tenant tier |
 | `app.gen_ai.client.token.cache_read.usage` | Histogram | Cached-input token subset, separate from standard totals |
-| `app.gen_ai.client.token.cache_creation.usage` | Histogram | Cache-write input-token subset |
+| `app.gen_ai.client.token.cache_write.usage` | Histogram | Cache-write input-token subset |
 | `app.gen_ai.client.token.reasoning.usage` | Histogram | Reasoning output-token subset |
 
 Do not add `app.agent.tool_calls` as a counter alongside `gen_ai.invoke_agent.tool_calls` unless you specifically need an event-rate view as well as a per-invocation distribution — and if you do, document that they are not interchangeable.
@@ -365,8 +379,8 @@ If quality scores are exported as metrics, publish the sample count next to ever
 ## Verify
 
 - One `gen_ai.client.operation.duration` observation per **physical** model request, including retries.
-- The standard token histogram has only `input` and `output`; their sum matches provider totals without cache or reasoning double-counting.
-- Cache-read, cache-creation, and reasoning subsets appear only on the three application-owned breakdown histograms.
+- The standard token histogram has only `input` and `output`; their sum matches provider totals without cache or reasoning double-counting. Explicit zero observations survive, while unavailable token types produce no observation.
+- Cache-read, cache-write, and reasoning subsets appear only on the three application-owned breakdown histograms.
 - Forcing a provider error still produces a duration observation, with `error.type` set.
 - Successful standard GenAI measurements omit `error.type` rather than using a success sentinel.
 - `gen_ai.invoke_agent.inference_calls` records once per invocation, and its value matches the number of model spans in that trace.

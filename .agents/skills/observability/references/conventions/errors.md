@@ -6,15 +6,15 @@ Every code sample in this skill records failures the same way. Use this contract
 
 ## Why not `record_exception()`
 
-OpenTelemetry has been moving exception detail off span events and onto log
-records correlated with the active span: a log record has its own timestamp,
-severity, and schema, and can be retained, sampled, and redacted independently
-of the trace. **This file states the contract; it does not state the spec.**
-Before relying on the deprecation itself, check the status of `AddEvent` /
-`RecordException` and of the `exception` semantic conventions in the revision
-pinned by `../compatibility.md`, and record what you found there. The SDK you
-are using may still document both as stable API, and the rule below then reads
-as house preference — which is fine, as long as it is not presented as spec.
+OpenTelemetry is moving exception detail off span events and onto log records
+correlated with the active span: a log record has its own timestamp, severity,
+and schema, and can be retained, sampled, and redacted independently of the
+trace. At the revisions pinned by `../compatibility.md`, the exception-on-span
+semantic convention is deprecated, while the Trace API still requires
+`AddEvent` and documents `RecordException` as its specialized exception-event
+variant. **The rule below is this skill's forward-looking house contract, not a
+claim that those Python methods have already been removed or deprecated.**
+Re-check both API and semantic-convention status on every compatibility update.
 
 Practical consequence, either way: **do not add new span events.** Not for
 exceptions, not for checkpoints. The span carries status and bounded attributes;
@@ -50,7 +50,9 @@ Nothing else. No `str(exc)` in the span status message, no exception message as 
 
 ## Case 1 — the exception escapes the span
 
-The common case. Pass `record_exception=False` so the context manager does not create the legacy event, but leave `set_status_on_exception` at its default so it still sets `ERROR` on the way out.
+The common case. Pass `record_exception=False` so the context manager does not
+create the automatic exception span event, but leave `set_status_on_exception`
+at its default so it still sets `ERROR` on the way out.
 
 ```python
 from opentelemetry import trace
@@ -61,8 +63,9 @@ tracer = trace.get_tracer(__name__)
 def retrieve_documents(query: str, top_k: int) -> list[dict]:
     with tracer.start_as_current_span(
         "retrieval product_docs",
-        # Suppresses the deprecated exception span event. Status is still set
-        # to ERROR by the context manager when the exception escapes.
+        # Suppresses the automatic exception span event; this skill sends the
+        # detail as a correlated log. Status is still set to ERROR when the
+        # exception escapes.
         record_exception=False,
         attributes={
             "gen_ai.operation.name": "retrieval",

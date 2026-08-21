@@ -64,9 +64,10 @@ async def trace_tool_call(request, handler):
                 GENAI_OPERATION_NAME: "execute_tool",
                 GENAI_TOOL_NAME: tool_name,
                 GENAI_TOOL_TYPE: "function",
-                GENAI_TOOL_CALL_ID: request.tool_call.get("id", ""),
             },
         ) as span:
+            if tool_call_id := request.tool_call.get("id"):
+                span.set_attribute(GENAI_TOOL_CALL_ID, tool_call_id)
             if tool_name != raw_name:
                 # Keep the real name findable without letting it into the
                 # span name.
@@ -192,7 +193,10 @@ Each retry is a separate physical request, so each produces its own span automat
 
 ## Do not retry everything
 
-`ToolRetryMiddleware` defaults to `retry_on=(Exception,)`. That is almost never right.
+`ToolRetryMiddleware` defaults to `default_retry_on`: it retries all
+unclassified exceptions and retries a LangChain `ModelError` only when that
+error marks itself retryable. That broad fallback is almost never the right
+policy for production tools.
 
 Retry **transient, system-recoverable** failures:
 

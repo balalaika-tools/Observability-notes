@@ -208,16 +208,10 @@ Business metrics are not a loophole for cardinality. `app.pricing.updates` label
 
 Export once and check the actual output:
 
-```bash
-# Requires the dev-only `prometheus` exporter on :8889 from
-# ../collector/dev_staging.md. 8888 is the Collector's own telemetry and will
-# not contain application metrics — grepping it finds nothing and looks like a
-# missing instrument.
-curl -s localhost:8889/metrics | grep '^app_'
-```
-
-Without a Collector, use an in-process `ConsoleMetricExporter` with a short
-export interval instead; the checks below apply to either output.
+Send one canary through the OTLP path and query the metrics backend for its
+`service.name` and expected `app.*` instruments. Without a Collector, use an
+in-process `ConsoleMetricExporter` with a short export interval; the checks
+below apply to either output.
 
 Confirm:
 
@@ -228,4 +222,5 @@ Confirm:
 - long-job histograms expose the intended `1, 5, 10, 30, ... 7200` second boundaries;
 - the series count is stable across a load test. Growing series count under steady traffic means a high-cardinality label slipped in.
 
-Backends rename metrics on ingest. Prometheus turns `app.worker.jobs` into `app_worker_jobs_total` and `app.worker.job.duration` into `app_worker_job_duration_bucket`/`_count`/`_sum`. Write alerts against the names the backend actually exposes, not the names in the code.
+Backends can rename metrics on ingest. Write alerts against the names the
+selected backend actually exposes, not names inferred only from the code.

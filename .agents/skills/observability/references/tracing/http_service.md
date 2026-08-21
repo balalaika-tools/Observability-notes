@@ -18,7 +18,7 @@ POST /orders                          SERVER   (auto-instrumentation)
   SELECT customers                    CLIENT   (auto)
   price order                         INTERNAL (manual)
     POST pricing-service /quote       CLIENT   (auto)
-  publish sqs order-events            PRODUCER (manual)
+  send order-events                   PRODUCER (manual)
 ```
 
 Auto-instrumentation gives you the first, third, and fifth lines. You write the rest.

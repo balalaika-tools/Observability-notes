@@ -267,17 +267,14 @@ exporters:
       max_interval: 30s
       max_elapsed_time: 10m
 
-  prometheus_remote_write:
-    # Collector Contrib 0.158.0 accepts the new component identifier but still
-    # requires these HTTP settings at top level. Move them under `http:` only
-    # after the exact upgraded image validates that schema.
-    endpoint: ${env:PROMETHEUS_WRITE_ENDPOINT}
+  otlphttp/metrics:
+    endpoint: ${env:METRICS_ENDPOINT}
     headers:
-      Authorization: ${env:PROMETHEUS_AUTHORIZATION}
-    remote_write_queue:
+      Authorization: ${env:METRICS_AUTHORIZATION}
+    sending_queue:
       enabled: true
       queue_size: 10000
-      num_consumers: 5
+      storage: file_storage
     retry_on_failure:
       enabled: true
       initial_interval: 5s
@@ -301,8 +298,11 @@ service:
     # Self-telemetry is a separate plane from the application telemetry below.
     # Use a different stable service.name for an agent or tail-sampling tier.
     resource:
-      service.name: otel-collector-gateway
-      deployment.environment.name: production
+      attributes:
+        - name: service.name
+          value: otel-collector-gateway
+        - name: deployment.environment.name
+          value: production
     # Collected from stderr by an independent platform log agent. Sending these
     # records into this Collector's own receiver couples them to its failures.
     logs:
@@ -311,13 +311,15 @@ service:
     metrics:
       level: normal
       readers:
-        - pull:
+        - periodic:
+            # Reader shutdown must leave time for application queues to drain.
+            timeout: 5000
             exporter:
-              prometheus:
-                host: 0.0.0.0
-                port: 8888
-                without_type_suffix: true
-                without_units: true
+              otlp:
+                protocol: http/protobuf
+                endpoint: ${env:SELF_METRICS_ENDPOINT}
+                headers:
+                  Authorization: ${env:SELF_METRICS_AUTHORIZATION}
   pipelines:
     traces:
       receivers: [otlp]
@@ -334,8 +336,8 @@ service:
     # Metrics are NOT sampled. Full fidelity, always.
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, resource/environment, batch]
-      exporters: [prometheus_remote_write]
+      processors: [memory_limiter, resource/environment, attributes/drop_secrets, batch]
+      exporters: [otlphttp/metrics]
 
     logs:
       receivers: [otlp]
@@ -350,11 +352,9 @@ service:
       exporters: [otlphttp/logs]
 ```
 
-The `prometheus_remote_write` identifier is current; the older
-`prometheusremotewrite` alias emits a deprecation warning. The pinned 0.158.0
-binary does not yet accept `http.endpoint` / `http.headers`, even though the
-component's newer documentation prefers that nesting. The exact-image
-validation command below is authoritative for this compatibility set.
+The default metrics path is OTLP/HTTP. Use a backend-specific push exporter
+only when the selected backend requires it; do not introduce a pull reader or
+receiver as an intermediate transport.
 
 ### Processor order is not cosmetic
 
@@ -584,9 +584,12 @@ Telemetry loss is preferable to application downtime. Silent telemetry loss duri
 - [ ] Email and other low-entropy personal fields are deleted, not presented as anonymized hashes.
 - [ ] Credentials come from a secret store and appear in no committed file.
 - [ ] Receivers are bound to private networks.
-- [ ] Collector self-metrics are delivered through an independent private
-      scrape or direct monitoring path, and structured internal logs leave via
+- [ ] Collector self-metrics are pushed over OTLP to an independent monitoring
+      path, and structured internal logs leave via
       an independent platform log agent or direct endpoint.
+- [ ] Any periodic self-metrics reader has an explicit, measured reader-level
+      timeout comfortably below the platform termination grace period, and a
+      hanging-destination shutdown test proves application queues still drain.
 - [ ] Collector self-telemetry has stable role/environment identity, preserves
       the per-replica `service.instance.id`, and alerts use rates/increases for
       counters rather than historical values.

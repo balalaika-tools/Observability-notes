@@ -13,8 +13,11 @@ lifecycle code.
 | **New trace + link** | empty context; producer context becomes a `Link` | Work is delayed, batched, independently retried, fanned in or out, or owned by a different lifecycle |
 
 Default to **new trace + link** for anything retried or delayed. A message that
-sits in a queue for ten minutes and retries three times produces a trace whose
-root span lasts half an hour; the latency numbers on it are meaningless.
+sits in a queue for ten minutes does not extend the already-ended producer root
+span, but it stretches the trace's temporal envelope and may arrive after a
+backend or tail sampler has finalized that trace. Independent retries make the
+topology harder to interpret and can be split or dropped as late spans. A new
+trace per attempt plus a causal link keeps each execution lifetime honest.
 
 Whichever you choose, say so explicitly in your report — this is a policy
 decision, not an implementation detail.

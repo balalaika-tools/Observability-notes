@@ -65,14 +65,14 @@ Exercise one representative operation end to end, then check the exported spans.
 
 - [ ] A root span exists, and it is the boundary you intended — the HTTP server span, Lambda invocation, job run, or message.
 - [ ] Every span has a low-cardinality name. No IDs, prompts, or user values.
-- [ ] Child spans are actually **children**. Siblings where you expected nesting mean context was lost — usually at a thread-pool, executor, or background-task boundary.
+- [ ] Child spans are actually **children**. Siblings where you expected nesting mean context was lost — usually at a raw-thread or non-propagating executor boundary; modern `asyncio.create_task()` and `asyncio.to_thread()` copy context.
 - [ ] There is exactly one span per logical operation. Two means automatic and manual instrumentation both own the boundary.
 - [ ] Span count per request is proportional to what the request does. A health check producing forty spans means an instrumentation package is too chatty.
 - [ ] `service.namespace`, `service.name`, `service.instance.id`, `service.version`, and `deployment.environment.name` appear on every span.
 - [ ] Start two replicas and confirm their `service.instance.id` values differ while `service.namespace` and `service.name` remain identical.
 - [ ] `service.instance.id` remains unchanged across several operations from one process; a value that changes per request destroys instance-level analysis.
 - [ ] Production `service.version` is the immutable artifact version, not `unknown`, `latest`, a branch name, or a rollout label — normally the full Git commit SHA supplied by CI/build.
-- [ ] Platform telemetry carries its native identity too: Kubernetes has `k8s.pod.uid`, containers have `container.id`, ECS has `aws.ecs.task.arn` plus container identity when available, and Lambda has `faas.name`, `faas.version`, `cloud.provider`, and `cloud.region`.
+- [ ] Platform telemetry carries its native identity too: Kubernetes has `k8s.pod.uid`, containers have `container.id`, ECS has `aws.ecs.task.arn` plus container identity when available, and Lambda has `faas.name`, `faas.version`, `faas.instance`, `cloud.provider`, `cloud.platform=aws_lambda`, and `cloud.region`.
 
 ## 3. Error handling
 
@@ -141,19 +141,21 @@ linked trace      consumer trace_id != producer trace_id, parent_span_id empty,
 - [ ] The deployed instrumentation and Collector layers match the function's
   region, architecture, runtime, and pinned package line. No documentation or
   code hardcodes an obsolete layer ARN.
-- [ ] `context.aws_request_id` is not `service.instance.id`; a required
-  execution-environment UUID stays stable across warm invocations.
+- [ ] `context.aws_request_id` is not `service.instance.id`; the full
+  `AWS_LAMBDA_LOG_STREAM_NAME` is reused for `faas.instance` and
+  `service.instance.id`, or a module-level fallback UUID stays stable across
+  warm invocations.
 
 ## 5. GenAI spans
 
 - [ ] One model span per **physical** model request, including each retry attempt.
 - [ ] `gen_ai.request.model` is the real model name — and differs between the main and summarization models. A hardcoded name passes casual inspection and is wrong.
-- [ ] Missing model identity omits `gen_ai.request.model`; it never records LangChain's `ls_model_type` values `chat` or `llm` as a model.
+- [ ] Missing model identity omits `gen_ai.request.model` and names the span `chat`, without an invented model sentinel; it never records LangChain's `ls_model_type` values `chat` or `llm` as a model.
 - [ ] `gen_ai.provider.name` and `gen_ai.operation.name` are set at span creation.
 - [ ] `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens` are non-zero.
-- [ ] `gen_ai.usage.cache_read.input_tokens` and `gen_ai.usage.cache_creation.input_tokens` are present, even when `0`.
-- [ ] `app.gen_ai.usage.input_token_details` / `output_token_details` are populated when the provider reports details, and `""` when it does not.
-- [ ] Streaming: `gen_ai.response.time_to_first_chunk` is set, and is **smaller** than the span duration. If token counts are zero on streamed calls only, the model was not configured to include usage in the stream.
+- [ ] Cache read/write, reasoning, and audio breakdown attributes are present when the provider reports them, including an explicit `0`, and absent when unavailable. Cache writes use `gen_ai.usage.cache_write.input_tokens`, never the retired `cache_creation` spelling.
+- [ ] `app.gen_ai.usage.input_token_details` / `output_token_details` are populated only when the provider reports details.
+- [ ] Streaming: `gen_ai.response.time_to_first_chunk` is set, and is **smaller** than the span duration. If token attributes are absent on streamed calls only, the model was not configured to include usage in the stream.
 - [ ] Streaming: `app.gen_ai.stream.chunk_count` is non-zero with content capture off and matches capture-on runs for the same fixture.
 - [ ] Provider-returned `gen_ai.response.model` appears on both the span and model metric attributes when it differs from the request model.
 - [ ] Agent runs: model and tool spans nest under `invoke_agent`, and `app.agent.time_to_first_chunk` is **larger** than the first model span's TTFC.
@@ -180,12 +182,9 @@ Expect no matches.
 
 - [ ] Every instrument produces data. Export once and look:
 
-```bash
-# :8889 is the dev-only `prometheus` exporter in collector/dev_staging.md.
-# :8888 is the Collector's OWN telemetry and holds no application metrics.
-# With no Collector, use an in-process ConsoleMetricExporter instead.
-curl -s localhost:8889/metrics | grep -E '^(app_|gen_ai_|http_server_)'
-```
+Query the metrics backend for the canary service's `app.*`, `gen_ai.*`, and
+`http.server.*` instruments. With no Collector, use an in-process
+`ConsoleMetricExporter`; do not add a scrape endpoint only for verification.
 
 - [ ] Counters and duration histograms increment on the **failure** path too. An error rate whose denominator excludes errors gets quieter as the service degrades.
 - [ ] Histogram values land in real buckets, not all in `+Inf`. Default buckets are tuned for sub-second HTTP calls and are wrong for a 30-second LLM histogram.
@@ -193,15 +192,11 @@ curl -s localhost:8889/metrics | grep -E '^(app_|gen_ai_|http_server_)'
 - [ ] Units are correct — seconds, not milliseconds, in an `s` histogram.
 - [ ] `gen_ai.invoke_agent.inference_calls` records once per invocation, and its value equals the number of model spans in that trace.
 - [ ] Standard `gen_ai.client.token.usage` has only `gen_ai.token.type=input|output`; cache and reasoning subsets appear only on application-owned breakdown histograms.
+- [ ] An explicitly reported zero token or breakdown count is recorded as zero; a missing count produces no observation.
 - [ ] Successful standard GenAI observations omit `error.type`; failures carry a bounded value.
 - [ ] **No forbidden label.** This is the check that prevents an expensive backend incident:
-
-```bash
-# Same endpoint as above.
-curl -s localhost:8889/metrics | grep -E 'user_id|session_id|conversation_id|trace_id|request_id|response_id'
-```
-
-Expect no matches.
+  inspect the exported backend series and confirm no `user_id`, `session_id`,
+  `conversation_id`, `trace_id`, `request_id`, or `response_id` label exists.
 
 - [ ] Series count is flat under sustained load. Growth under steady traffic means a high-cardinality label slipped in.
 
@@ -239,6 +234,8 @@ Expect no matches.
 - [ ] No `# MEASURE:` placeholder value from `collector/production.md` survives in a deployed config.
 - [ ] Complete traces reach the GenAI backend: root, HTTP, retrieval, tool, and model spans, not just model leaves.
 - [ ] The health endpoint responds — and remember it proves only that the process is up, not that the backend is accepting data.
+- [ ] Collector self-metrics use a periodic OTLP reader with no pull reader or
+  metrics listener; the monitoring backend contains `otelcol_process_uptime`.
 - [ ] A Langfuse exporter uses OTLP/HTTP and sends `x-langfuse-ingestion-version: "4"`.
 
 ## 11. Production retention and rollout (if production or sampling changed)
@@ -275,6 +272,16 @@ Expect no matches.
 ## 12. Shutdown
 
 - [ ] A CLI job or worker exits and its final spans still arrive. Run once, then look in the backend — this is the most commonly missed step, and it fails silently.
+- [ ] If the Collector pushes self-metrics with a periodic reader, its
+  reader-level timeout is explicit, measured, and comfortably below the
+  platform termination grace period, leaving budget for application exporter
+  queues to drain.
+- [ ] Stop that Collector while the self-metrics destination accepts a TCP
+  connection but never responds. It exits before the platform deadline and
+  queued application telemetry still drains. Do not substitute an invalid
+  hostname: fast DNS failure does not exercise the hanging-export path. Record
+  the exit code separately; a failed final self-metrics export may still exit
+  non-zero even when the timeout bound works.
 - [ ] A Lambda invocation force-flushes within its remaining-time budget but
   keeps providers alive for a warm reuse.
 - [ ] A cancelled or disconnected streaming request still ends its spans.

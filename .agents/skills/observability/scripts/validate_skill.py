@@ -21,7 +21,7 @@ except ImportError as exc:  # pragma: no cover - actionable environment failure
     raise SystemExit("PyYAML is required: install it before running validation") from exc
 
 
-COLLECTOR_IMAGE = "otel/opentelemetry-collector-contrib:0.158.0"
+COLLECTOR_IMAGE = "otel/opentelemetry-collector-contrib:0.159.0"
 
 # Every `gen_ai.*` string literal this package is allowed to use, pinned to the
 # convention revision in references/compatibility.md. Rule 3 of SKILL.md says
@@ -60,8 +60,10 @@ STANDARD_GENAI_ATTRIBUTES = {
     "gen_ai.tool.definitions",
     "gen_ai.tool.name",
     "gen_ai.tool.type",
-    "gen_ai.usage.cache_creation.input_tokens",
+    "gen_ai.usage.audio.input_tokens",
+    "gen_ai.usage.audio.output_tokens",
     "gen_ai.usage.cache_read.input_tokens",
+    "gen_ai.usage.cache_write.input_tokens",
     "gen_ai.usage.input_tokens",
     "gen_ai.usage.output_tokens",
     "gen_ai.usage.reasoning.output_tokens",
@@ -181,7 +183,7 @@ def validate_standard_genai_contract(skill_root: Path) -> None:
     unknown = sorted(declared - STANDARD_GENAI_METRICS)
     require(not unknown, f"unknown standard gen_ai.* metrics: {unknown}")
     require("gen_ai.workflow.duration" not in text, "deprecated workflow metric remains")
-    for forbidden in ("cache_read", "cache_creation", "reasoning"):
+    for forbidden in ("cache_read", "cache_write", "reasoning"):
         require(
             f'(\"{forbidden}\", normalized[' not in text,
             f"standard token histogram still records {forbidden}",
@@ -198,6 +200,24 @@ def validate_standard_genai_contract(skill_root: Path) -> None:
         set(literal_token_types) <= {"input", "output"},
         f"custom values used under gen_ai.token.type: {literal_token_types}",
     )
+    model_recorder = text.split("def record_model_operation(", 1)[1].split(
+        "\ndef ", 1
+    )[0]
+    require(
+        "if value:" not in model_recorder
+        and model_recorder.count("if value is not None:") >= 2,
+        "token metric recorder must preserve explicit zero and suppress only None",
+    )
+    for recorder in (
+        "record_tool_execution",
+        "record_agent_invocation",
+        "record_workflow_invocation",
+    ):
+        body = text.split(f"def {recorder}(", 1)[1].split("\ndef ", 1)[0]
+        require(
+            '"gen_ai.operation.name"' not in body,
+            f"{recorder} adds undeclared gen_ai.operation.name metric attribute",
+        )
 
 
 def complete_python_blocks(document: Path) -> list[str]:
@@ -318,6 +338,32 @@ def validate_serializer_fixtures(skill_root: Path) -> None:
         and any(part["type"] == "tool_call" for part in outputs[0]["parts"]),
         "finish reason, multimodal part, or tool call was not preserved",
     )
+    require(
+        all(output.get("finish_reason") for output in outputs),
+        "an output message omitted its schema-required finish reason",
+    )
+
+    fallback_output = json.loads(namespace["serialize_text_output"]("done", None))
+    require(
+        fallback_output[0]["finish_reason"] == "unknown",
+        "missing framework finish reason does not use the documented fallback",
+    )
+    no_id = json.loads(
+        namespace["serialize_messages"](
+            [{"role": "assistant", "tool_calls": [{"name": "lookup", "args": {}}]}]
+        )
+    )[0]["parts"][-1]
+    require("id" not in no_id, "optional tool-call ID is emitted as an empty value")
+    tool_response = json.loads(
+        namespace["serialize_messages"](
+            [{"role": "tool", "tool_call_id": "call-1", "content": "sunny"}]
+        )
+    )[0]["parts"][0]
+    require(
+        tool_response
+        == {"type": "tool_call_response", "id": "call-1", "response": "sunny"},
+        "tool result is not represented by the standard response part",
+    )
 
 
 def yaml_blocks(document: Path) -> list[str]:
@@ -350,6 +396,37 @@ def production_yaml(skill_root: Path) -> str:
     return match.group(1)
 
 
+def validate_otlp_first_contract(skill_root: Path) -> None:
+    """Keep executable Collector guidance push-only and OTLP-first."""
+    skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    require(
+        "OTLP push is the default" in skill_text,
+        "SKILL.md no longer declares the OTLP-first push contract",
+    )
+
+    collector_documents = list((skill_root / "references/collector").glob("*.md"))
+    collector_text = "\n".join(
+        document.read_text(encoding="utf-8") for document in collector_documents
+    )
+    require(
+        re.search(r"(?m)^\s*(?:-\s+)?pull:\s*$", collector_text) is None,
+        "Collector guidance contains a pull self-metrics reader",
+    )
+    require(
+        re.search(r"(?m)^\s+prometheus:\s*$", collector_text) is None,
+        "Collector guidance contains a Prometheus scrape exporter",
+    )
+    for forbidden in (":8888", ":8889"):
+        require(
+            forbidden not in collector_text,
+            f"Collector guidance exposes legacy scrape port {forbidden}",
+        )
+    require(
+        re.search(r"(?i)curl[^\n]*/metrics", collector_text) is None,
+        "Collector guidance verifies telemetry through a scrape endpoint",
+    )
+
+
 def validate_collector_yaml(skill_root: Path) -> str:
     # Every block must at least be parseable YAML, wherever it lives.
     for label, block in collector_yaml_blocks(skill_root):
@@ -363,18 +440,46 @@ def validate_collector_yaml(skill_root: Path) -> str:
             and "pipelines" in candidate.get("service", {})
         ):
             validate_collector_self_telemetry(candidate, label)
+            pipelines = candidate["service"]["pipelines"]
+            if "attributes/drop_secrets" in candidate.get("processors", {}):
+                drop_actions = candidate["processors"]["attributes/drop_secrets"].get(
+                    "actions", []
+                )
+                deleted_keys = {
+                    action.get("key")
+                    for action in drop_actions
+                    if action.get("action") == "delete"
+                }
+                for secret_key in (
+                    "http.request.header.authorization",
+                    "http.request.header.cookie",
+                    "http.response.header.set_cookie",
+                    "db.query.text",
+                    "db.statement",
+                    "user.email",
+                ):
+                    require(
+                        secret_key in deleted_keys,
+                        f"{label} universal redaction does not delete {secret_key}",
+                    )
+                for pipeline_name, pipeline in pipelines.items():
+                    require(
+                        "attributes/drop_secrets" in pipeline.get("processors", []),
+                        f"{label} {pipeline_name} pipeline bypasses universal secret redaction",
+                    )
 
     config_text = production_yaml(skill_root)
     parsed = yaml.safe_load(config_text)
     require(isinstance(parsed, dict), "production Collector config is not a mapping")
     exporters = parsed.get("exporters", {})
     require(
-        "prometheus_remote_write" in exporters,
-        "production config must use prometheus_remote_write",
+        "otlphttp/metrics" in exporters,
+        "production config must use the OTLP-first metrics exporter",
     )
+    metrics_pipeline = parsed.get("service", {}).get("pipelines", {}).get("metrics", {})
     require(
-        "prometheusremotewrite" not in exporters,
-        "deprecated prometheusremotewrite alias remains",
+        "otlphttp/metrics" in metrics_pipeline.get("exporters", []),
+        "production metrics pipeline must push through the OTLP metrics exporter",
     )
     processors = parsed.get("processors", {})
     email_actions = [
@@ -396,19 +501,60 @@ def validate_collector_self_telemetry(parsed: dict, label: str) -> None:
     telemetry = parsed.get("service", {}).get("telemetry", {})
     resource = telemetry.get("resource", {})
     require(
-        isinstance(resource.get("service.name"), str)
-        and bool(resource["service.name"].strip()),
+        isinstance(resource, dict),
+        f"{label} self-telemetry resource is not a mapping",
+    )
+    supported_resource_keys = {
+        "attributes",
+        "schema_url",
+        "detectors",
+        "detection/development",
+    }
+    legacy_keys = sorted(set(resource) - supported_resource_keys)
+    require(
+        not legacy_keys,
+        f"{label} uses legacy inline self-telemetry resource attributes: "
+        + ", ".join(legacy_keys),
+    )
+    attributes = resource.get("attributes")
+    require(
+        isinstance(attributes, list) and attributes,
+        f"{label} must use service.telemetry.resource.attributes",
+    )
+    resource_attributes: dict[str, object] = {}
+    for index, attribute in enumerate(attributes):
+        require(
+            isinstance(attribute, dict),
+            f"{label} resource attribute #{index + 1} is not a mapping",
+        )
+        name = attribute.get("name")
+        require(
+            isinstance(name, str) and bool(name.strip()) and "value" in attribute,
+            f"{label} resource attribute #{index + 1} needs name and value",
+        )
+        require(
+            name not in resource_attributes,
+            f"{label} repeats self-telemetry resource attribute {name}",
+        )
+        resource_attributes[name] = attribute["value"]
+    require(
+        isinstance(resource_attributes.get("service.name"), str)
+        and bool(str(resource_attributes["service.name"]).strip()),
         f"{label} has no stable self-telemetry service.name",
     )
     require(
-        isinstance(resource.get("deployment.environment.name"), str)
-        and bool(resource["deployment.environment.name"].strip()),
+        isinstance(resource_attributes.get("deployment.environment.name"), str)
+        and bool(str(resource_attributes["deployment.environment.name"]).strip()),
         f"{label} has no self-telemetry deployment.environment.name",
     )
     require(
-        "service.instance.id" not in resource,
+        "service.instance.id" not in resource_attributes,
         f"{label} hard-codes service.instance.id; each Collector replica must keep "
         "the automatically generated instance identity",
+    )
+    require(
+        "service.version" not in resource_attributes,
+        f"{label} hard-codes service.version; the Collector image supplies it",
     )
 
     logs = telemetry.get("logs", {})
@@ -432,18 +578,33 @@ def validate_collector_self_telemetry(parsed: dict, label: str) -> None:
         f"{label} has no explicit self-metrics delivery reader",
     )
     for reader in readers:
-        prometheus = (
-            reader.get("pull", {}).get("exporter", {}).get("prometheus")
-            if isinstance(reader, dict)
-            else None
-        )
-        if prometheus is None:
-            continue
         require(
-            prometheus.get("without_type_suffix") is True
-            and prometheus.get("without_units") is True,
-            f"{label} manual Prometheus self-reader must preserve canonical "
-            "otelcol_* names",
+            isinstance(reader, dict),
+            f"{label} self-metrics reader is not a mapping",
+        )
+        require(
+            "pull" not in reader and set(reader) == {"periodic"},
+            f"{label} self-metrics must use only an OTLP periodic push reader",
+        )
+        periodic = reader.get("periodic")
+        require(
+            isinstance(periodic, dict),
+            f"{label} periodic self-metrics reader is not a mapping",
+        )
+        timeout = periodic.get("timeout")
+        require(
+            type(timeout) is int and 1 <= timeout <= 10_000,
+            f"{label} periodic self-metrics reader must pin a 1..10000 ms "
+            "shutdown/export budget; deployments must also keep it "
+            "comfortably below their platform termination grace period",
+        )
+        otlp = periodic.get("exporter", {}).get("otlp")
+        require(
+            isinstance(otlp, dict)
+            and otlp.get("protocol") == "http/protobuf"
+            and isinstance(otlp.get("endpoint"), str)
+            and bool(otlp["endpoint"].strip()),
+            f"{label} periodic self-metrics reader must push over OTLP/HTTP",
         )
 
 
@@ -573,7 +734,13 @@ def fragment_as_config(parsed: object) -> dict | None:
     processors = dict(parsed.get("processors") or {})
     exporters = dict(parsed.get("exporters") or {})
     extensions = dict(parsed.get("extensions") or {})
-    if not processors and not exporters and not extensions:
+    service_fragment = parsed.get("service") or {}
+    telemetry = (
+        service_fragment.get("telemetry")
+        if isinstance(service_fragment, dict)
+        else None
+    )
+    if not processors and not exporters and not extensions and telemetry is None:
         return None
 
     exporters.setdefault("debug", {})
@@ -595,6 +762,8 @@ def fragment_as_config(parsed: object) -> dict | None:
     if extensions:
         config["extensions"] = extensions
         config["service"]["extensions"] = list(extensions)
+    if telemetry is not None:
+        config["service"]["telemetry"] = telemetry
     return config
 
 
@@ -610,6 +779,8 @@ def validate_collector_image(skill_root: Path) -> None:
         "TRACES_AUTHORIZATION": "test",
         "METRICS_ENDPOINT": "https://example.invalid/metrics",
         "METRICS_AUTHORIZATION": "test",
+        "SELF_METRICS_ENDPOINT": "https://example.invalid/metrics",
+        "SELF_METRICS_AUTHORIZATION": "test",
         "LANGFUSE_OTEL_ENDPOINT": "https://example.invalid/langfuse",
         "LANGFUSE_AUTH_STRING": "dGVzdDp0ZXN0",
     }
@@ -653,11 +824,17 @@ def validate_one_collector_config(
         result = subprocess.run(
             command, check=False, capture_output=True, text=True
         )
+        combined_output = result.stdout + result.stderr
         require(
             result.returncode == 0,
             f"Collector image validation failed for {label}:\n"
-            + result.stdout
-            + result.stderr,
+            + combined_output,
+        )
+        require(
+            "legacy service.telemetry.resource inline map format"
+            not in combined_output.lower(),
+            f"Collector image reported deprecated self-telemetry resource schema "
+            f"for {label}:\n{combined_output}",
         )
 
 
@@ -701,15 +878,17 @@ def validate_compatibility(skill_root: Path) -> list[str]:
             f"({review_by.group(1)}); every version-sensitive example is unverified"
         )
     for required in (
-        "2026-08-10",
+        "2026-08-21",
         "1.44",
         "1.44.0",
-        "46d43c8949afb53765a202e89f4534eeb75ca3fa",
-        "1.3.14",
-        "1.2.10",
-        "0.158.0",
+        "eaefa142a94cefe5d199d47e4a73727dfbd825df",
+        "1.3.16",
+        "1.6.0",
+        "1.2.11",
+        "0.159.0",
         "opentelemetry-instrumentation-aws-lambda",
         "0.65b0",
+        "messaging.operation.name",
         'x-langfuse-ingestion-version: "4"',
     ):
         require(required in text, f"compatibility contract missing {required}")
@@ -770,7 +949,13 @@ def validate_resource_identity_contract(skill_root: Path) -> None:
     compose = (
         skill_root / "references/setup/resource_docker_compose.md"
     ).read_text(encoding="utf-8")
-    for required in ("container.id", "Compose expands", "host environment"):
+    for required in (
+        "container.id",
+        "short",
+        "Do not also set `container.id=$HOSTNAME`",
+        "Compose expands",
+        "host environment",
+    ):
         require(required in compose, f"Docker Compose identity missing {required}")
 
     ecs = (skill_root / "references/setup/resource_ecs.md").read_text(
@@ -931,6 +1116,8 @@ def validate_async_work_contract(skill_root: Path) -> None:
         "traceparent",
         "context=otel_context.Context()",
         "context=None",
+        "does not extend the already-ended producer root span",
+        "late spans",
         "untrusted metadata",
     ):
         require(required in handoffs, f"async-handoff contract missing {required}")
@@ -952,20 +1139,44 @@ def validate_async_work_contract(skill_root: Path) -> None:
     ):
         require(required in durable, f"durable-work tracing missing {required}")
 
-    queue = " ".join(
-        (skill_root / "references/tracing/queue_messaging.md")
-        .read_text(encoding="utf-8")
-        .split()
+    queue_raw = (skill_root / "references/tracing/queue_messaging.md").read_text(
+        encoding="utf-8"
     )
+    queue = " ".join(queue_raw.split())
     for required in (
         "Boto3SQSGetter",
         "Boto3SQSSetter",
         "MessageAttributeNames",
         "context=otel_context.Context()",
+        "messaging.operation.name",
         "messaging.batch.message_count",
+        "legacy 1.11 telemetry schema",
+        "use_span_links=False",
+        "use_span_links=True",
         "OTEL_PYTHON_DISABLED_INSTRUMENTATIONS=boto3",
     ):
         require(required in queue, f"queue tracing missing {required}")
+    require(
+        queue_raw.count('"messaging.operation.name"') >= 4,
+        "every manual SQS producer/consumer template must set messaging.operation.name",
+    )
+    require(
+        '"publish sqs' not in queue_raw and '"consume sqs' not in queue_raw,
+        "queue templates retain pre-1.44 messaging span names",
+    )
+
+    lambda_reference = (
+        skill_root / "references/tracing/lambda_functions.md"
+    ).read_text(encoding="utf-8")
+    require(
+        lambda_reference.count("AWS_LAMBDA_LOG_STREAM_NAME") >= 2
+        and "full `AWS_LAMBDA_LOG_STREAM_NAME`" in lambda_reference,
+        "Lambda execution-environment identity ignores the prescribed log stream",
+    )
+    require(
+        "cloud.platform = aws_lambda" in lambda_reference,
+        "Lambda resource identity omits cloud.platform",
+    )
 
     scheduled = " ".join(
         (skill_root / "references/tracing/scheduled_jobs.md")
@@ -982,7 +1193,15 @@ def validate_async_work_contract(skill_root: Path) -> None:
         .read_text(encoding="utf-8")
         .split()
     )
-    for required in ("signal.SIGTERM", "context.attach", "context.detach"):
+    for required in (
+        "signal.SIGTERM",
+        "asyncio.create_task()",
+        "asyncio.to_thread()",
+        "ThreadPoolExecutor.submit()",
+        "loop.run_in_executor()",
+        "context.attach",
+        "context.detach",
+    ):
         require(required in worker_runtime, f"worker runtime missing {required}")
 
     logging = " ".join(
@@ -1263,9 +1482,43 @@ def validate_review_regressions(skill_root: Path) -> None:
         "ls_model_type is still a model-name fallback",
     )
     require(
+        'span_name = f"chat {model}" if model else "chat"' in model
+        and "unknown_model" not in model,
+        "missing LangChain model identity is represented by an invented sentinel",
+    )
+    require(
         '"chunk_count": 0' in model and '"captured_chunks"' in model,
         "streaming count and content buffer are not independent",
     )
+    for source_label, otel_value in (
+        ("azure", "azure.ai.openai"),
+        ("amazon_bedrock", "aws.bedrock"),
+        ("mistral", "mistral_ai"),
+        ("xai", "x_ai"),
+    ):
+        require(
+            f'"{source_label}": "{otel_value}"' in model,
+            f"LangChain provider alias {source_label} is not normalized to {otel_value}",
+        )
+
+    logging = (
+        skill_root / "references/logging/structlog.md"
+    ).read_text(encoding="utf-8")
+    require(
+        logging.index("add_exception_fields,")
+        < logging.index("structlog.processors.format_exc_info,"),
+        "exception fields are extracted after format_exc_info consumes exc_info",
+    )
+    for required in (
+        '"exception.type"',
+        '"exception.message"',
+        'event_name == "gen_ai.client.operation.exception"',
+        "SeverityNumber.WARN",
+        "inject_trace_context=True",
+        "otelTraceID",
+        "OTEL_PYTHON_LOG_AUTO_INSTRUMENTATION=false",
+    ):
+        require(required in logging, f"named exception event contract missing {required}")
 
     streaming = (
         skill_root
@@ -1296,6 +1549,10 @@ def validate_review_regressions(skill_root: Path) -> None:
         "Why the span is never current across a `yield`" in provider,
         "provider_sdk.md no longer explains the generator context rule",
     )
+    require(
+        'finish_reason or ("error" if error_type else "unknown")' in provider,
+        "streaming provider output can omit its required finish reason",
+    )
     for label, text, heading in (
         ("provider_sdk.md", provider, "## Streaming"),
         ("streaming_and_agent_span.md", streaming, "### Token streaming"),
@@ -1308,6 +1565,42 @@ def validate_review_regressions(skill_root: Path) -> None:
     require(
         "agent_step(span, counters)" in streaming,
         "streaming agent wrappers do not bracket each resumption",
+    )
+
+    tools = (
+        skill_root
+        / "references/tracing/genai/langchain/tools_and_middleware.md"
+    ).read_text(encoding="utf-8")
+    require(
+        'GENAI_TOOL_CALL_ID: request.tool_call.get("id", "")' not in tools
+        and 'if tool_call_id := request.tool_call.get("id"):' in tools,
+        "optional tool-call ID is emitted as an empty string",
+    )
+
+    content = (
+        skill_root / "references/tracing/genai/content_capture.md"
+    ).read_text(encoding="utf-8")
+    require(
+        '"finish_reason": str(finish_reason or "unknown")' in content
+        and 'value.get("id", "")' not in content
+        and 'getattr(call, "id", "")' not in content,
+        "content serializer violates required finish-reason or optional-ID schema",
+    )
+    token_usage = (
+        skill_root / "references/tracing/genai/token_usage.md"
+    ).read_text(encoding="utf-8")
+    require(
+        "usage is simply zero everywhere" not in token_usage
+        and "usage attributes and observations are simply absent" in token_usage,
+        "missing streaming usage is described as zero instead of absent",
+    )
+    all_markdown = "\n".join(
+        document.read_text(encoding="utf-8") for document in skill_root.rglob("*.md")
+    )
+    require(
+        "Token counts zero on streamed calls only" not in all_markdown
+        and "token counts are zero on streamed calls only" not in all_markdown,
+        "missing streamed usage is still documented as explicit zero",
     )
 
     for relative in (
@@ -1378,6 +1671,7 @@ def main() -> int:
         validate_python(skill_root)
         validate_trace_budget_calculator(skill_root)
         validate_serializer_fixtures(skill_root)
+        validate_otlp_first_contract(skill_root)
         validate_collector_yaml(skill_root)
         validate_measured_values_are_marked(skill_root)
         notes += validate_compatibility(skill_root)

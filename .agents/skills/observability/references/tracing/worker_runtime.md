@@ -36,7 +36,12 @@ def main() -> None:
 
 ## Context loss inside the worker
 
-Context flows through normal async and sync call paths but is lost when work moves to a thread pool, executor, or independently scheduled task. Symptom: spans that should be children suddenly become roots.
+Context flows through normal calls and is copied by modern
+`asyncio.create_task()` and `asyncio.to_thread()`. It is **not** copied by a raw
+thread, `ThreadPoolExecutor.submit()`, or `loop.run_in_executor()`. Capture and
+attach it only at those non-propagating boundaries; attaching a context that
+already flows can create confusing ownership and detach errors. The symptom of
+a real loss is a span that should be a child suddenly becoming a root.
 
 ```python
 from opentelemetry import context

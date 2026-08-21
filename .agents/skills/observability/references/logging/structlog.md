@@ -4,8 +4,6 @@ Logs are the third signal: metrics detect, traces explain causality, logs carry 
 
 Logging lives in `core/logging.py`, `observability/logging.py`, or whatever shared logging module the service already has. Extend the existing one — do not add a second logging configuration.
 
----
-
 ## Trace correlation
 
 Every log emitted inside a span must carry `trace_id` and `span_id`. Without them the log is an isolated sentence with no context.
@@ -14,6 +12,8 @@ structlog does not have to route through the stdlib formatter. If stdout or a fi
 
 ```python
 # observability/logging.py
+import sys
+
 import structlog
 from opentelemetry import trace
 from opentelemetry.sdk._logs import LoggerProvider
@@ -31,12 +31,31 @@ def add_otel_trace_context(_, __, event_dict):
     return event_dict
 
 
+def add_exception_fields(_, __, event_dict):
+    """Materialize standard exception fields before format_exc_info consumes it."""
+    exc_info = event_dict.get("exc_info")
+    if not exc_info:
+        return event_dict
+    if exc_info is True:
+        exc_info = sys.exc_info()
+    elif isinstance(exc_info, BaseException):
+        exc_info = (type(exc_info), exc_info, exc_info.__traceback__)
+    if isinstance(exc_info, tuple) and len(exc_info) == 3 and exc_info[1]:
+        exc_type, exc, _ = exc_info
+        event_dict.setdefault(
+            "exception.type", f"{exc_type.__module__}.{exc_type.__qualname__}"
+        )
+        event_dict.setdefault("exception.message", str(exc))
+    return event_dict
+
+
 def configure_logging(logger_provider: LoggerProvider | None = None) -> None:
     settings = get_settings()
 
     processors = [
         structlog.processors.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
+        add_exception_fields,
         structlog.processors.format_exc_info,
     ]
     if logger_provider is not None:
@@ -85,9 +104,8 @@ The output should look like:
 
 `trace_id` is 32 lowercase hex characters, `span_id` is 16. If they are missing entirely, the call happened outside an active span. If they are present but all zeros, the span context is invalid — usually because a background task lost context (see `../tracing/worker_runtime.md`).
 
-If the service already uses stdlib `logging`, `LoggingInstrumentor().instrument(set_logging_format=True)` adds the same fields to stdlib records. Do not run both mechanisms for the same records.
-
----
+For stdlib `logging`, `LoggingInstrumentor().instrument(inject_trace_context=True)` injects `otelTraceID`, `otelSpanID`, `otelTraceSampled`, and `otelServiceName` — not the snake-case keys above. Map them to the desired JSON names in the service's existing formatter; `set_logging_format=True` also calls `logging.basicConfig()` and is the wrong owner when formatting already exists.
+On `0.65b0`, that instrumentor also installs an OpenTelemetry export handler by default. If stdout/file collection owns delivery, set `OTEL_PYTHON_LOG_AUTO_INSTRUMENTATION=false`; otherwise the same stdlib record can leave by both paths. Do not activate it for structlog records already handled by the processor above.
 
 ## Linked traces and durable workflows
 
@@ -140,8 +158,6 @@ it separate from `trace_id` and add it only for a demonstrated query need; do
 not copy it to every log. The preferred cross-trace search key remains
 `workflow_run_id`.
 
----
-
 ## Event names
 
 The `event` field names what happened, in past tense or as a state change, and stays stable. Varying values are fields.
@@ -157,8 +173,6 @@ workflow_transition_failed
 Not: `processing`, `done`, `something_failed`, `error`, `here`. An event name you cannot write a query against is not an event name.
 
 The GenAI events — model, tool, agent, retrieval, guardrail — are in `genai.md`.
-
----
 
 ## Fields
 
@@ -193,8 +207,6 @@ retrieved document text          personal data without explicit permission
 
 An LLM service is where this rule gets broken, and it has its own file: `genai.md` covers what a GenAI service must keep out of its logs, which events are worth emitting, and where the exception record goes when a model call is retried inside an agent.
 
----
-
 ## Don't mirror the trace into the logs
 
 Logs and traces overlap; duplicating one into the other doubles cost and halves signal.
@@ -208,9 +220,10 @@ Logs and traces overlap; duplicating one into the other doubles cost and halves 
 
 Emitting a log at every step of a traced pipeline recreates the trace in a worse format. Log the operational records someone would actually query on their own.
 
-Span events are not an option: they are deprecated (`../conventions/errors.md`). What used to be a span event is now a correlated log record.
-
----
+First-party span events are outside this skill's error contract. The pinned
+Trace API still supports them, but the exception-on-span semantic convention is
+deprecated and new exception events go to correlated log records
+(`../conventions/errors.md`).
 
 ## Exception logging
 
@@ -238,8 +251,6 @@ except TimeoutError as exc:
 ```
 
 Logging at every level produces one incident with six stack traces and no way to tell which one is the cause.
-
----
 
 ## Named OpenTelemetry events (optional)
 
@@ -278,6 +289,7 @@ class OtelEventProcessor:
             return event_dict
 
         level = str(event_dict.get("level", method_name)).lower()
+        event_name = str(event_name)
         attributes = {
             k: v
             for k, v in event_dict.items()
@@ -286,12 +298,22 @@ class OtelEventProcessor:
         if "exception" in event_dict:
             attributes["exception.stacktrace"] = event_dict["exception"]
 
+        # This standard event recommends WARN even when the provider failure
+        # ultimately causes an application-owned ERROR event at an outer
+        # boundary. The ownership rule prevents emitting both for one escape.
+        if event_name == "gen_ai.client.operation.exception":
+            severity_number = SeverityNumber.WARN
+            severity_text = "WARN"
+        else:
+            severity_number = self._severity.get(level, SeverityNumber.INFO)
+            severity_text = level.upper()
+
         self._logger.emit(
             timestamp=time_ns(),
-            event_name=str(event_name),
+            event_name=event_name,
             body=event_dict.get("event"),
-            severity_number=self._severity.get(level, SeverityNumber.INFO),
-            severity_text=level.upper(),
+            severity_number=severity_number,
+            severity_text=severity_text,
             attributes=attributes,
             # This is what attaches trace_id and span_id.
             context=get_current(),
@@ -317,11 +339,16 @@ and stops logging, tracing, and metrics through one idempotent lifecycle.
 
 The `DropEvent` matters: without it, a service whose stdout is also collected sends every named event twice, through two different paths, with two different schemas.
 
+`add_exception_fields` must run before `format_exc_info`: the latter consumes
+`exc_info` and leaves only rendered stack text. The earlier processor preserves
+the fully qualified `exception.type` and `exception.message` required by the
+standard GenAI exception event. Its OTel severity is always `WARN`; an outer
+application-owned failure event may still be `ERROR`, subject to the one-record
+ownership rule.
+
 Event names must be stable. Model names, request IDs, and user IDs are attributes.
 
 Named events go to a log backend or the Collector's logs pipeline — not to Langfuse, whose OTLP endpoint ingests traces only (`genai.md`).
-
----
 
 ## Trace sampling does not sample logs
 
@@ -355,8 +382,6 @@ span was sampled away — which is exactly the record you needed.
 
 And a corollary with teeth here specifically: because a tail policy keeps traces by **span status**, a failure that was logged but left its span `UNSET` is sampled away exactly when you need it — and the orphan log above is all that survives. `log.error(...)` does not set span status; see `../conventions/errors.md`, which owns that rule.
 
----
-
 ## Verify
 
 - A log emitted inside a span has 32-hex `trace_id` and 16-hex `span_id`.
@@ -367,8 +392,6 @@ And a corollary with teeth here specifically: because a tail policy keeps traces
 - No prompt, completion, token, cookie, or authorization header appears in any log line — grep a captured log sample for a canary secret to prove it.
 - An exception produces exactly one record with a stack trace, not one per frame.
 - If named events are enabled: `event_name` is populated at the top level, and the record appears exactly once.
-
----
 
 ## Then
 
