@@ -97,10 +97,12 @@ Do not copy every key. An open loop over `baggage.get_all()` turns any upstream 
 
 ## Register it once per process
 
-In the telemetry bootstrap, on the SDK provider, before the service accepts requests:
+In the telemetry bootstrap, on the SDK provider, before the service accepts
+requests. `trace_sampler` is the `AlwaysOn` or parent-aware sampler selected by
+the policy in `../setup/sdk_bootstrap.md`:
 
 ```python
-tracer_provider = TracerProvider(resource=resource)
+tracer_provider = TracerProvider(resource=resource, sampler=trace_sampler)
 tracer_provider.add_span_processor(AllowlistedBaggageSpanProcessor())
 tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(...)))
 trace.set_tracer_provider(tracer_provider)

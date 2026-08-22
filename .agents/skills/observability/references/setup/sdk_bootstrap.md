@@ -80,6 +80,7 @@ from opentelemetry.sdk.metrics.view import (
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
 from core.config import get_settings
 
@@ -170,7 +171,9 @@ def configure_observability() -> Providers:
     metrics_endpoint = settings.otel_metrics_endpoint or f"{base}/v1/metrics"
     logs_endpoint = settings.otel_logs_endpoint or f"{base}/v1/logs"
 
-    tracer_provider = TracerProvider(resource=resource)
+    # This template assumes discovery selected Collector tail sampling. If the
+    # selected policy uses head-side dropping, use the sampler documented below.
+    tracer_provider = TracerProvider(resource=resource, sampler=ALWAYS_ON)
     tracer_provider.add_span_processor(
         BatchSpanProcessor(
             OTLPSpanExporter(endpoint=traces_endpoint),
@@ -316,14 +319,25 @@ boundary with no error.
 
 ## Sampling
 
-Default to **no head sampling** in the application and let the Collector decide. Head sampling cannot know that a request will fail or be slow, which is exactly the trace you want to keep.
+When discovery selects Collector tail sampling, use **100% head recording with an explicit `AlwaysOn` sampler** in the application, which means no head-side dropping. Head sampling cannot know that a request will fail or be slow, which is exactly the trace you want to keep. Do not omit the sampler from a code-owned `TracerProvider`: omission allows `OTEL_TRACES_SAMPLER` to change the policy implicitly.
 
-If the user requires head sampling anyway, use a parent-aware ratio sampler so whole traces are kept or dropped together:
+The W3C sampled flag carries this upstream recording/propagation decision. It does **not** carry the later keep/drop result from a tail sampler. Under `AlwaysOn` it is true even for traces the Collector eventually drops, so do not publish it as `trace_sampled` in logs or interpret it as effective retention. Use Collector/backend counts to measure retained traces.
+
+If discovery instead selects head sampling, do **not** keep the hardcoded `ALWAYS_ON`. A code-owned provider receives the selected sampler explicitly, with the measured ratio coming from typed settings:
+
+```python
+from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+tracer_provider = TracerProvider(resource=resource, sampler=ParentBased(root=TraceIdRatioBased(settings.otel_trace_sample_ratio)))
+```
+
+For zero-code provider ownership, the equivalent deployment configuration is:
 
 ```bash
 export OTEL_TRACES_SAMPLER=parentbased_traceidratio
 export OTEL_TRACES_SAMPLER_ARG=0.1
 ```
+
+The ratio above is illustrative, not a default; derive it from `../tracing/production_policy.md`. Keep one configuration owner: code plus typed settings for a code-owned provider, or environment variables for a zero-code provider.
 
 Set sampling-relevant attributes at span *creation* time — a sampler cannot see attributes added later. Token counts are known only after the response, so keeping high-token traces needs tail sampling.
 

@@ -184,7 +184,13 @@ For a plain-dataclass or `os.environ`-based config, add fields in the same style
 | `CAPTURE_AI_CONTENT` | GenAI content capture switch | `false` |
 | `LOG_LEVEL` | structlog level | `INFO` |
 
-Only add `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` if head sampling is actually being used. With a Collector doing tail sampling, the application usually samples everything and lets the Collector decide.
+Sampling configuration follows the provider owner and the policy selected in
+discovery. For a code-owned provider, pass `ALWAYS_ON` directly for Collector
+tail sampling; for head sampling, add a validated ratio to the existing settings
+object and construct the parent-aware sampler shown in `sdk_bootstrap.md`. Do
+not also add `OTEL_TRACES_SAMPLER` variables to a code-owned provider. For
+zero-code setup, use `OTEL_TRACES_SAMPLER=always_on` for Collector tail sampling
+or `parentbased_traceidratio` plus `OTEL_TRACES_SAMPLER_ARG` for head sampling.
 
 Resolve namespace and version ownership using `resource_identity.md`, then
 resolve instance ownership using only the runtime reference selected by

@@ -27,7 +27,6 @@ def add_otel_trace_context(_, __, event_dict):
     if context.is_valid:
         event_dict["trace_id"] = format_trace_id(context.trace_id)
         event_dict["span_id"] = format_span_id(context.span_id)
-        event_dict["trace_sampled"] = context.trace_flags.sampled
     return event_dict
 
 
@@ -97,14 +96,15 @@ The output should look like:
   "service.name": "chat-api",
   "trace_id": "9f4a1c2b3d4e5f60718293a4b5c6d7e8",
   "span_id": "1a2b3c4d5e6f7081",
-  "trace_sampled": true,
   "returned_documents": 5
 }
 ```
 
 `trace_id` is 32 lowercase hex characters, `span_id` is 16. If they are missing entirely, the call happened outside an active span. If they are present but all zeros, the span context is invalid — usually because a background task lost context (see `../tracing/worker_runtime.md`).
 
-For stdlib `logging`, `LoggingInstrumentor().instrument(inject_trace_context=True)` injects `otelTraceID`, `otelSpanID`, `otelTraceSampled`, and `otelServiceName` — not the snake-case keys above. Map them to the desired JSON names in the service's existing formatter; `set_logging_format=True` also calls `logging.basicConfig()` and is the wrong owner when formatting already exists.
+Do **not** add `trace_sampled` to application logs when the Collector owns tail sampling. The W3C trace-flags sampled bit records the upstream SDK's head-recording/propagation decision; it does not report the later retention decision made by a tail-sampling Collector. With the explicit `AlwaysOn` application sampler required by `../setup/sdk_bootstrap.md`, that bit is always true even for a trace the Collector ultimately drops, so exposing it as a log field is misleading. Measure effective retention at the Collector/backend as described in `../tracing/production_policy.md`.
+
+For stdlib `logging`, `LoggingInstrumentor().instrument(inject_trace_context=True)` injects `otelTraceID`, `otelSpanID`, `otelTraceSampled`, and `otelServiceName` — not the snake-case keys above. Map the trace ID, span ID, and service name to the desired JSON names in the service's existing formatter. When tail sampling owns retention, deliberately omit `otelTraceSampled` for the reason above. `set_logging_format=True` also calls `logging.basicConfig()` and is the wrong owner when formatting already exists.
 On `0.65b0`, that instrumentor also installs an OpenTelemetry export handler by default. If stdout/file collection owns delivery, set `OTEL_PYTHON_LOG_AUTO_INSTRUMENTATION=false`; otherwise the same stdlib record can leave by both paths. Do not activate it for structlog records already handled by the processor above.
 
 ## Linked traces and durable workflows
